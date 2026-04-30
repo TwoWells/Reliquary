@@ -9,4 +9,4 @@ keywords = ["media", "archive", "tui"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-reliquary = { path = "../reliquary" }
+reliquary = { version = "0.1.0", path = "../reliquary" }

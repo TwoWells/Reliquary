@@ -9,4 +9,4 @@ keywords = ["media", "archive", "web"]
 categories = ["web-programming"]
 
 [dependencies]
-reliquary = { path = "../reliquary" }
+reliquary = { version = "0.1.0", path = "../reliquary" }
