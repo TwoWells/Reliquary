@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "reliquary",
+    "reliquary-cli",
+    "reliquary-tui",
+    "reliquary-web",
+]
+resolver = "2"

@@ -1,0 +1,12 @@
+[package]
+name = "reliquary-web"
+version = "0.1.0"
+edition = "2024"
+description = "Web frontend for Reliquary — browse and edit physical media collections from any device"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/TwoWells/Reliquary"
+keywords = ["media", "archive", "web"]
+categories = ["web-programming"]
+
+[dependencies]
+reliquary = { path = "../reliquary" }

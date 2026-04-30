@@ -1,0 +1,12 @@
+[package]
+name = "reliquary-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command-line interface for Reliquary — search, add, and manage physical media collections"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/TwoWells/Reliquary"
+keywords = ["media", "archive", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+reliquary = { path = "../reliquary" }
