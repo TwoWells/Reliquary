@@ -1,12 +1,19 @@
 [package]
 name = "reliquary-cli"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Command-line interface for Reliquary — search, add, and manage physical media collections"
-license = "AGPL-3.0-or-later"
-repository = "https://github.com/TwoWells/Reliquary"
 keywords = ["media", "archive", "cli"]
 categories = ["command-line-utilities"]
 
+[lints]
+workspace = true
+
 [dependencies]
 reliquary = { version = "0.1.0", path = "../reliquary" }
+
+# REMOVE when reliquary is used in code (skeleton dep)
+[package.metadata.cargo-machete]
+ignored = ["reliquary"]

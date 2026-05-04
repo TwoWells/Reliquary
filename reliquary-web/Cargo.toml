@@ -1,12 +1,19 @@
 [package]
 name = "reliquary-web"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Web frontend for Reliquary — browse and edit physical media collections from any device"
-license = "AGPL-3.0-or-later"
-repository = "https://github.com/TwoWells/Reliquary"
 keywords = ["media", "archive", "web"]
 categories = ["web-programming"]
 
+[lints]
+workspace = true
+
 [dependencies]
 reliquary = { version = "0.1.0", path = "../reliquary" }
+
+# REMOVE when reliquary is used in code (skeleton dep)
+[package.metadata.cargo-machete]
+ignored = ["reliquary"]

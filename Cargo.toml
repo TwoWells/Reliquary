@@ -5,4 +5,53 @@ members = [
     "reliquary-tui",
     "reliquary-web",
 ]
-resolver = "2"
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/TwoWells/Reliquary"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Lint groups
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Hard denials — no agent should produce these
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+wildcard_imports = "deny"
+missing_assert_message = "deny"
+
+# Force agents to justify exceptions
+allow_attributes_without_reason = "deny"
+
+# Dependencies
+multiple_crate_versions = "allow"
+
+# Publishing metadata — not a code quality concern
+cargo_common_metadata = "allow"
+
+# Documentation
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+missing_safety_doc = "warn"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = "symbols"

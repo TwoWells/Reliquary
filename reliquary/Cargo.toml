@@ -1,9 +1,12 @@
 [package]
 name = "reliquary"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Media preservation backend — tracks physical media collections, manages capture and extraction pipelines, and records processing provenance"
-license = "AGPL-3.0-or-later"
-repository = "https://github.com/TwoWells/Reliquary"
 keywords = ["media", "archive", "preservation", "metadata"]
 categories = ["multimedia", "database"]
+
+[lints]
+workspace = true
