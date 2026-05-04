@@ -2,23 +2,15 @@
 
 This file serves as the single point of truth for AI agents working on the Reliquary project.
 
-## Project Grounding
-- **Project Goal:** Physical media preservation — track collections, manage capture/extraction, record provenance.
+## Project
+- **Goal:** Physical media preservation — track collections, manage capture/extraction, record provenance.
 - **Repository:** `TwoWells/Reliquary` on GitHub.
+- **License:** AGPL-3.0-or-later with commercial license option.
 - **Config:** `@./Cargo.toml`
 - **Dependency Policy:** `@./deny.toml`
 - **Planning:** `~/Projects/ReliquaryInternal`
 
-## Workspace
-
-Four crates, all published on crates.io:
-
-- `reliquary/` — core library (data model, schema, disc analysis, indexing, deployment)
-- `reliquary-cli/` — CLI binary (`add`, `inspect`, `identify`, `scribe`, `deploy`, etc.)
-- `reliquary-tui/` — TUI frontend
-- `reliquary-web/` — web frontend
-
-The library crate produces data. CLI/TUI/web crates own presentation and interaction.
+Rust workspace. The library crate produces data. CLI/TUI/web crates own presentation and interaction.
 
 ## Coding Standards
 - **Edition:** Rust 2024.
