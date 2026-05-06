@@ -9,13 +9,14 @@
 pub mod mpls;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
-use std::{fmt, fs};
 
 use serde::Serialize;
 use thiserror::Error;
 
+use super::reader::{DiscReader, ReaderError};
 use mpls::{PTS_CLOCK_HZ, Playlist};
 
 // ── Errors ──────────────────────────────────────────────────────────────
@@ -25,15 +26,15 @@ use mpls::{PTS_CLOCK_HZ, Playlist};
 pub enum BdmvError {
     /// The `BDMV/PLAYLIST/` directory could not be read.
     #[error("failed to read playlist directory: {0}")]
-    PlaylistDir(#[source] std::io::Error),
+    PlaylistDir(#[source] ReaderError),
 
     /// An individual MPLS file could not be read.
     #[error("failed to read {path}: {source}")]
     ReadFile {
         /// Path to the MPLS file.
         path: String,
-        /// Underlying I/O error.
-        source: std::io::Error,
+        /// Underlying reader error.
+        source: ReaderError,
     },
 
     /// An MPLS file could not be parsed.
@@ -177,22 +178,22 @@ fn format_streams(s: &StreamSummary) -> String {
 
 /// Analyzes a BDMV disc structure.
 ///
-/// `bdmv_root` should point to the `BDMV/` directory (or its parent —
-/// the function looks for `BDMV/PLAYLIST/` either at `bdmv_root/PLAYLIST/`
-/// or `bdmv_root/BDMV/PLAYLIST/`).
+/// Takes a [`DiscReader`] for file access — the reader may be backed by a
+/// mounted directory or an ISO image. Looks for playlists at either
+/// `PLAYLIST/` or `BDMV/PLAYLIST/` within the reader.
 ///
 /// # Errors
 ///
 /// Returns [`BdmvError`] if the playlist directory cannot be read, any MPLS
 /// file fails to parse, or no valid playlists remain after filtering.
-pub fn analyze(bdmv_root: &Path) -> Result<BdmvAnalysis, BdmvError> {
-    let playlist_dir = if bdmv_root.join("PLAYLIST").is_dir() {
-        bdmv_root.join("PLAYLIST")
+pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
+    let playlist_dir = if reader.read_dir(Path::new("PLAYLIST")).is_ok() {
+        Path::new("PLAYLIST").to_path_buf()
     } else {
-        bdmv_root.join("BDMV").join("PLAYLIST")
+        Path::new("BDMV").join("PLAYLIST")
     };
 
-    let mut playlists = read_playlists(&playlist_dir)?;
+    let mut playlists = read_playlists(reader, &playlist_dir)?;
 
     // Filter looping menus
     playlists.retain(|pl| !is_looping(pl));
@@ -220,34 +221,33 @@ pub fn analyze(bdmv_root: &Path) -> Result<BdmvAnalysis, BdmvError> {
 }
 
 /// Reads all `.mpls` files from the playlist directory.
-fn read_playlists(dir: &Path) -> Result<Vec<Playlist>, BdmvError> {
-    let entries = fs::read_dir(dir).map_err(BdmvError::PlaylistDir)?;
+fn read_playlists(reader: &DiscReader, dir: &Path) -> Result<Vec<Playlist>, BdmvError> {
+    let entries = reader.read_dir(dir).map_err(BdmvError::PlaylistDir)?;
 
     let mut playlists = Vec::new();
-    let mut paths: Vec<_> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("mpls"))
-        })
+    let mut mpls_names: Vec<_> = entries
+        .into_iter()
+        .filter(|name| name.to_ascii_lowercase().ends_with(".mpls"))
         .collect();
-    paths.sort();
+    mpls_names.sort();
 
-    for path in paths {
-        let number = path
-            .file_stem()
-            .and_then(|s| s.to_str())
+    for name in mpls_names {
+        let number = name
+            .strip_suffix(".mpls")
+            .or_else(|| name.strip_suffix(".MPLS"))
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
 
-        let data = fs::read(&path).map_err(|e| BdmvError::ReadFile {
-            path: path.display().to_string(),
-            source: e,
-        })?;
+        let file_path = dir.join(&name);
+        let data = reader
+            .read_file(&file_path)
+            .map_err(|e| BdmvError::ReadFile {
+                path: file_path.display().to_string(),
+                source: e,
+            })?;
 
         let playlist = mpls::parse(&data, number).map_err(|e| BdmvError::Parse {
-            path: path.display().to_string(),
+            path: file_path.display().to_string(),
             source: e,
         })?;
 

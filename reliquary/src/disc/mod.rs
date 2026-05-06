@@ -4,10 +4,13 @@
 //! Disc analysis — detects disc format and dispatches to the appropriate parser.
 
 pub mod bdmv;
+pub mod reader;
 
 use std::path::Path;
 
 use thiserror::Error;
+
+use reader::{DiscReader, ReaderError};
 
 /// Errors from disc inspection.
 #[derive(Debug, Error)]
@@ -26,6 +29,10 @@ pub enum InspectError {
     /// BDMV analysis failed.
     #[error(transparent)]
     Bdmv(#[from] bdmv::BdmvError),
+
+    /// Failed to open the disc reader.
+    #[error(transparent)]
+    Reader(#[from] ReaderError),
 }
 
 /// Result of inspecting a disc.
@@ -47,22 +54,32 @@ impl std::fmt::Display for InspectResult {
 
 /// Inspects a disc at the given path.
 ///
-/// `path` should be a mounted ISO, extracted disc folder, or a path
-/// containing a `BDMV/` or `VIDEO_TS/` directory.
+/// `path` can be a mounted ISO, extracted disc folder, or an ISO image
+/// file. The reader auto-detects the source and provides unified file
+/// access to the analysis pipeline.
 ///
 /// # Errors
 ///
 /// Returns [`InspectError`] if the format is unrecognised, unsupported,
 /// or analysis fails.
 pub fn inspect(path: &Path) -> Result<InspectResult, InspectError> {
-    // Check for BDMV structure
-    if path.join("BDMV").is_dir() || path.join("PLAYLIST").is_dir() {
-        let analysis = bdmv::analyze(path)?;
+    let reader = DiscReader::open(path)?;
+    inspect_reader(&reader, path)
+}
+
+/// Inspects a disc using an already-opened reader.
+fn inspect_reader(reader: &DiscReader, path: &Path) -> Result<InspectResult, InspectError> {
+    // Check for BDMV structure by probing through the reader.
+    let has_bdmv = reader.read_dir(Path::new("BDMV")).is_ok();
+    let has_playlist = reader.read_dir(Path::new("PLAYLIST")).is_ok();
+
+    if has_bdmv || has_playlist {
+        let analysis = bdmv::analyze(reader)?;
         return Ok(InspectResult::Bdmv(analysis));
     }
 
     // Check for DVD structure
-    if path.join("VIDEO_TS").is_dir() {
+    if reader.read_dir(Path::new("VIDEO_TS")).is_ok() {
         return Err(InspectError::DvdNotSupported);
     }
 
