@@ -12,8 +12,10 @@ categories = ["command-line-utilities"]
 workspace = true
 
 [dependencies]
+clap = { workspace = true }
 reliquary = { version = "0.1.0", path = "../reliquary" }
+serde_json = { workspace = true }
 
-# REMOVE when reliquary is used in code (skeleton dep)
-[package.metadata.cargo-machete]
-ignored = ["reliquary"]
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }

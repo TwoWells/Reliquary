@@ -16,3 +16,5 @@
 //! - **Provenance** — per-output records of how files were produced,
 //!   including extraction settings, encode parameters, and experiments
 //!   tried and rejected
+
+pub mod disc;
