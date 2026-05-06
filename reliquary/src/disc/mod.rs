@@ -4,6 +4,7 @@
 //! Disc analysis — detects disc format and dispatches to the appropriate parser.
 
 pub mod bdmv;
+pub mod dvd;
 pub mod reader;
 
 use std::path::Path;
@@ -22,13 +23,13 @@ pub enum InspectError {
         path: String,
     },
 
-    /// DVD format is not yet supported.
-    #[error("DVD format detected but not yet supported")]
-    DvdNotSupported,
-
     /// BDMV analysis failed.
     #[error(transparent)]
     Bdmv(#[from] bdmv::BdmvError),
+
+    /// DVD analysis failed.
+    #[error(transparent)]
+    Dvd(#[from] dvd::DvdError),
 
     /// Failed to open the disc reader.
     #[error(transparent)]
@@ -42,12 +43,16 @@ pub enum InspectResult {
     /// Blu-ray disc (BDMV structure).
     #[serde(rename = "bdmv")]
     Bdmv(bdmv::BdmvAnalysis),
+    /// DVD disc (`VIDEO_TS` structure).
+    #[serde(rename = "dvd")]
+    Dvd(dvd::DvdAnalysis),
 }
 
 impl std::fmt::Display for InspectResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Bdmv(analysis) => write!(f, "{analysis}"),
+            Self::Dvd(analysis) => write!(f, "{analysis}"),
         }
     }
 }
@@ -80,7 +85,8 @@ fn inspect_reader(reader: &DiscReader, path: &Path) -> Result<InspectResult, Ins
 
     // Check for DVD structure
     if reader.read_dir(Path::new("VIDEO_TS")).is_ok() {
-        return Err(InspectError::DvdNotSupported);
+        let analysis = dvd::analyze(reader)?;
+        return Ok(InspectResult::Dvd(analysis));
     }
 
     Err(InspectError::UnrecognisedFormat {

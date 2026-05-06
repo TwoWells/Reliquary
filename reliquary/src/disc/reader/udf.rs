@@ -168,8 +168,7 @@ impl UdfReader {
         let partition = build_partition_info(&mut file, &mvds, &path_str)?;
 
         // 4. Read the File Set Descriptor.
-        let fsd_offset =
-            resolve_byte_offset(&partition, mvds.fsd_location, mvds.fsd_partition);
+        let fsd_offset = resolve_byte_offset(&partition, mvds.fsd_location, mvds.fsd_partition);
         let fsd = read_at(&mut file, fsd_offset, SECTOR_SIZE, &path_str)?;
         let fsd_tag = parse_tag(&fsd);
         if fsd_tag.id != TAG_FILE_SET {
@@ -342,8 +341,7 @@ impl UdfReader {
 
         for ad in &fe.alloc_descriptors {
             let extent_len = ad.length & 0x3FFF_FFFF; // Mask off the top 2 type bits.
-            let byte_offset =
-                resolve_byte_offset(&self.partition, ad.position, ad_partition);
+            let byte_offset = resolve_byte_offset(&self.partition, ad.position, ad_partition);
 
             let read_len = u64::from(extent_len).min(remaining) as usize;
             let chunk = self.read_bytes(byte_offset, read_len)?;
@@ -491,11 +489,7 @@ fn read_at(file: &mut File, offset: u64, len: usize, path: &str) -> Result<Vec<u
 }
 
 /// Parses the Main Volume Descriptor Sequence.
-fn parse_mvds(
-    file: &mut File,
-    extent: Extent,
-    path: &str,
-) -> Result<MvdsInfo, ReaderError> {
+fn parse_mvds(file: &mut File, extent: Extent, path: &str) -> Result<MvdsInfo, ReaderError> {
     let mut partition_start: Option<u32> = None;
     let mut fsd_location: Option<u32> = None;
     let mut fsd_partition: Option<u16> = None;
@@ -605,8 +599,7 @@ fn build_partition_info(
     let metadata = match mvds.metadata_file_location {
         Some((partition_ref, meta_file_block)) => {
             // Read the Metadata File Entry from the physical partition.
-            let meta_fe_sector =
-                u64::from(mvds.partition_start) + u64::from(meta_file_block);
+            let meta_fe_sector = u64::from(mvds.partition_start) + u64::from(meta_file_block);
             let meta_fe_offset = meta_fe_sector * SECTOR_SIZE as u64;
             let header = read_sector(file, meta_fe_sector, path)?;
             let tag = parse_tag(&header);
@@ -1210,7 +1203,10 @@ mod tests {
         }
 
         /// Builds the image. Each entry: (name, `file_data`, `is_dir`).
-        #[allow(clippy::too_many_lines, reason = "test builder assembles a complex image")]
+        #[allow(
+            clippy::too_many_lines,
+            reason = "test builder assembles a complex image"
+        )]
         fn build_with_root(mut self, entries: &[(&str, &[u8], bool)]) -> File {
             // ── Allocate metadata blocks ──
             let fsd_mblock = self.alloc_meta_block(); // 0
@@ -1307,20 +1303,21 @@ mod tests {
             write_fid(&mut dir_data, "", root_fe_mblock, 1, true, true);
             for (fe_mblock, _, _, is_dir) in &file_info {
                 // Look up name from entries by position.
-                let idx = file_info.iter().position(|(b, _, _, _)| b == fe_mblock).unwrap_or(0);
+                let idx = file_info
+                    .iter()
+                    .position(|(b, _, _, _)| b == fe_mblock)
+                    .unwrap_or(0);
                 let (name, _, _) = entries[idx];
                 write_fid(&mut dir_data, name, *fe_mblock, 1, *is_dir, false);
             }
 
             let root_dir_size = dir_data.len() as u32;
-            let root_fe =
-                build_file_entry(true, root_dir_size, 0, root_dir_mblock, root_dir_size);
+            let root_fe = build_file_entry(true, root_dir_size, 0, root_dir_mblock, root_dir_size);
             self.write_meta_block(root_fe_mblock, &root_fe);
             self.write_meta_block(root_dir_mblock, &dir_data);
 
             // ── File entries and data ──
-            for (i, (fe_mblock, data_phys_block, file_data, is_dir)) in
-                file_info.iter().enumerate()
+            for (i, (fe_mblock, data_phys_block, file_data, is_dir)) in file_info.iter().enumerate()
             {
                 let _ = i;
                 let size = file_data.len() as u32;
