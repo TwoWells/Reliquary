@@ -8,8 +8,9 @@
 
 pub mod mpls;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::ops::Range;
 use std::path::Path;
 use std::time::Duration;
 
@@ -28,27 +29,18 @@ pub enum BdmvError {
     #[error("failed to read playlist directory: {0}")]
     PlaylistDir(#[source] ReaderError),
 
-    /// An individual MPLS file could not be read.
-    #[error("failed to read {path}: {source}")]
-    ReadFile {
-        /// Path to the MPLS file.
-        path: String,
-        /// Underlying reader error.
-        source: ReaderError,
-    },
-
-    /// An MPLS file could not be parsed.
-    #[error("failed to parse {path}: {source}")]
-    Parse {
-        /// Path to the MPLS file.
-        path: String,
-        /// Parser error.
-        source: mpls::MplsError,
-    },
-
     /// No valid playlists found on the disc after filtering.
     #[error("no valid playlists found after filtering")]
     NoPlaylists,
+}
+
+/// A per-playlist error encountered during analysis (non-fatal).
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaylistWarning {
+    /// Playlist number that failed (from the MPLS filename).
+    pub playlist: u32,
+    /// Description of the error.
+    pub message: String,
 }
 
 // ── Analysis types ──────────────────────────────────────────────────────
@@ -60,6 +52,9 @@ pub struct BdmvAnalysis {
     pub playlists: Vec<AnalyzedPlaylist>,
     /// Playlist number of the identified main title, if any.
     pub main_title: Option<u32>,
+    /// Warnings from playlists that could not be read or parsed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<PlaylistWarning>,
 }
 
 /// An analyzed playlist with computed duration and segment grouping.
@@ -76,6 +71,24 @@ pub struct AnalyzedPlaylist {
     pub segments: Vec<Segment>,
     /// Stream summary from the first play item.
     pub streams: StreamSummary,
+    /// Playlists whose content is contained within this playlist (composite grouping).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<CompositeMember>,
+}
+
+/// A member of a composite playlist group.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompositeMember {
+    /// Playlist number of the member.
+    pub playlist: u32,
+    /// 1-based position of this member within the composite's segment list.
+    pub segment_index: u32,
+    /// Start of the range used by the composite, relative to the member's own timeline.
+    #[serde(serialize_with = "serialize_duration")]
+    pub range_start: Duration,
+    /// End of the range used by the composite, relative to the member's own timeline.
+    #[serde(serialize_with = "serialize_duration")]
+    pub range_end: Duration,
 }
 
 /// A segment within a playlist — one or more seamlessly connected play items.
@@ -110,7 +123,23 @@ fn serialize_duration<S: serde::Serializer>(
 
 impl fmt::Display for BdmvAnalysis {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Collect playlist numbers that appear as composite members
+        let member_set: HashSet<u32> = self
+            .playlists
+            .iter()
+            .flat_map(|pl| pl.members.iter().map(|m| m.playlist))
+            .collect();
+
+        // Index playlists by number for member lookups
+        let by_number: HashMap<u32, &AnalyzedPlaylist> =
+            self.playlists.iter().map(|pl| (pl.number, pl)).collect();
+
         for pl in &self.playlists {
+            // Skip playlists that only appear as composite members
+            if member_set.contains(&pl.number) {
+                continue;
+            }
+
             let is_main = self.main_title == Some(pl.number);
             let marker = if is_main { " *" } else { "" };
             writeln!(
@@ -123,7 +152,24 @@ impl fmt::Display for BdmvAnalysis {
                 marker,
             )?;
 
-            if pl.segments.len() > 1 {
+            if !pl.members.is_empty() {
+                for member in &pl.members {
+                    let (dur, chs) = by_number.get(&member.playlist).map_or_else(
+                        || (String::from("?"), String::from("?")),
+                        |m| (format_duration(m.duration), format!("{}", m.chapters)),
+                    );
+                    writeln!(
+                        f,
+                        "  {:02}: MPLS {:05}  {:>10}  {:>3} ch  {}\u{2013}{}",
+                        member.segment_index,
+                        member.playlist,
+                        dur,
+                        chs,
+                        format_duration(member.range_start),
+                        format_duration(member.range_end),
+                    )?;
+                }
+            } else if pl.segments.len() > 1 {
                 for (i, seg) in pl.segments.iter().enumerate() {
                     writeln!(
                         f,
@@ -138,6 +184,11 @@ impl fmt::Display for BdmvAnalysis {
 
         if let Some(main) = self.main_title {
             writeln!(f, "\n* main title: {main:05}")?;
+        }
+
+        // Warnings
+        for w in &self.warnings {
+            writeln!(f, "warning: MPLS {:05}: {}", w.playlist, w.message)?;
         }
 
         Ok(())
@@ -184,8 +235,10 @@ fn format_streams(s: &StreamSummary) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`BdmvError`] if the playlist directory cannot be read, any MPLS
-/// file fails to parse, or no valid playlists remain after filtering.
+/// Returns [`BdmvError`] if the playlist directory cannot be read or no
+/// valid playlists remain after filtering. Individual MPLS read/parse
+/// failures are reported as warnings in the result rather than aborting
+/// the analysis.
 pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
     let playlist_dir = if reader.read_dir(Path::new("PLAYLIST")).is_ok() {
         Path::new("PLAYLIST").to_path_buf()
@@ -193,7 +246,7 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
         Path::new("BDMV").join("PLAYLIST")
     };
 
-    let mut playlists = read_playlists(reader, &playlist_dir)?;
+    let (mut playlists, warnings) = read_playlists(reader, &playlist_dir)?;
 
     // Filter looping menus
     playlists.retain(|pl| !is_looping(pl));
@@ -201,7 +254,7 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
     // Deduplicate
     let mut playlists = dedup_playlists(&playlists);
 
-    if playlists.is_empty() {
+    if playlists.is_empty() && warnings.is_empty() {
         return Err(BdmvError::NoPlaylists);
     }
 
@@ -212,19 +265,31 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
     let main_title = identify_main_title(&playlists);
 
     // Convert to analyzed playlists
-    let analyzed: Vec<AnalyzedPlaylist> = playlists.iter().map(analyze_playlist).collect();
+    let mut analyzed: Vec<AnalyzedPlaylist> = playlists.iter().map(analyze_playlist).collect();
+
+    // Composite grouping
+    apply_composite_grouping(&playlists, &mut analyzed);
 
     Ok(BdmvAnalysis {
         playlists: analyzed,
         main_title,
+        warnings,
     })
 }
 
 /// Reads all `.mpls` files from the playlist directory.
-fn read_playlists(reader: &DiscReader, dir: &Path) -> Result<Vec<Playlist>, BdmvError> {
+///
+/// Returns the successfully parsed playlists and any per-file warnings.
+/// The playlist directory itself must be readable (fatal error), but
+/// individual file read or parse failures are collected as warnings.
+fn read_playlists(
+    reader: &DiscReader,
+    dir: &Path,
+) -> Result<(Vec<Playlist>, Vec<PlaylistWarning>), BdmvError> {
     let entries = reader.read_dir(dir).map_err(BdmvError::PlaylistDir)?;
 
     let mut playlists = Vec::new();
+    let mut warnings = Vec::new();
     let mut mpls_names: Vec<_> = entries
         .into_iter()
         .filter(|name| name.to_ascii_lowercase().ends_with(".mpls"))
@@ -239,22 +304,30 @@ fn read_playlists(reader: &DiscReader, dir: &Path) -> Result<Vec<Playlist>, Bdmv
             .unwrap_or(0);
 
         let file_path = dir.join(&name);
-        let data = reader
-            .read_file(&file_path)
-            .map_err(|e| BdmvError::ReadFile {
-                path: file_path.display().to_string(),
-                source: e,
-            })?;
 
-        let playlist = mpls::parse(&data, number).map_err(|e| BdmvError::Parse {
-            path: file_path.display().to_string(),
-            source: e,
-        })?;
+        let data = match reader.read_file(&file_path) {
+            Ok(data) => data,
+            Err(e) => {
+                warnings.push(PlaylistWarning {
+                    playlist: number,
+                    message: format!("failed to read {}: {e}", file_path.display()),
+                });
+                continue;
+            }
+        };
 
-        playlists.push(playlist);
+        match mpls::parse(&data, number) {
+            Ok(playlist) => playlists.push(playlist),
+            Err(e) => {
+                warnings.push(PlaylistWarning {
+                    playlist: number,
+                    message: format!("failed to parse {}: {e}", file_path.display()),
+                });
+            }
+        }
     }
 
-    Ok(playlists)
+    Ok((playlists, warnings))
 }
 
 /// Returns `true` if a playlist is a looping menu.
@@ -400,6 +473,7 @@ fn analyze_playlist(playlist: &Playlist) -> AnalyzedPlaylist {
         chapters,
         segments,
         streams,
+        members: Vec::new(),
     }
 }
 
@@ -476,6 +550,117 @@ fn summarize_streams(stn: &mpls::StnTable) -> StreamSummary {
         video,
         audio,
         subtitles,
+    }
+}
+
+// ── Composite grouping ────────────────────────────────────────────────
+
+/// Groups play items into segment ranges by connection condition.
+///
+/// Returns index ranges into the playlist's `play_items` vec. Each range
+/// covers one segment (a group of seamlessly connected play items).
+fn segment_ranges(playlist: &Playlist) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+
+    for (i, item) in playlist.play_items.iter().enumerate() {
+        if i > 0 && item.connection_condition < 5 {
+            ranges.push(start..i);
+            start = i;
+        }
+    }
+    ranges.push(start..playlist.play_items.len());
+    ranges
+}
+
+/// Collects clip IDs from a range of play items.
+fn clip_ids_for_range<'a>(playlist: &'a Playlist, range: &Range<usize>) -> Vec<&'a str> {
+    playlist.play_items[range.clone()]
+        .iter()
+        .map(|item| item.clip_id.as_str())
+        .collect()
+}
+
+/// Computes the member's time range as used by a composite's segment.
+///
+/// The range is relative to the member's own timeline — `range_start` is
+/// how far into the member the composite begins, `range_end` is where it
+/// ends. When the composite uses the full member, this is `0..duration`.
+fn compute_member_range(
+    composite: &Playlist,
+    seg_range: &Range<usize>,
+    member: &Playlist,
+) -> (Duration, Duration) {
+    let member_start_pts = member.play_items.first().map_or(0, |item| item.in_time);
+    let composite_start_pts = composite.play_items[seg_range.start].in_time;
+
+    let offset_pts = u64::from(composite_start_pts.saturating_sub(member_start_pts));
+    let range_start = pts_to_duration(offset_pts);
+
+    let seg_duration_pts: u64 = composite.play_items[seg_range.clone()]
+        .iter()
+        .map(|item| u64::from(item.out_time.saturating_sub(item.in_time)))
+        .sum();
+    let range_end = pts_to_duration(offset_pts + seg_duration_pts);
+
+    (range_start, range_end)
+}
+
+/// Identifies composite playlists and populates their member lists.
+///
+/// A composite is a multi-segment playlist whose segments correspond to
+/// other playlists on the disc. Matching is by clip ID list: a playlist
+/// whose full clip sequence matches one segment of the composite is a
+/// member of that composite at that segment's position.
+fn apply_composite_grouping(playlists: &[Playlist], analyzed: &mut [AnalyzedPlaylist]) {
+    // Precompute segment ranges and full clip lists for each playlist
+    let all_seg_ranges: Vec<Vec<Range<usize>>> = playlists.iter().map(segment_ranges).collect();
+    let all_clip_lists: Vec<Vec<&str>> = playlists
+        .iter()
+        .map(|pl| {
+            pl.play_items
+                .iter()
+                .map(|item| item.clip_id.as_str())
+                .collect()
+        })
+        .collect();
+
+    for (ci, composite_segs) in all_seg_ranges.iter().enumerate() {
+        if composite_segs.len() <= 1 {
+            continue;
+        }
+
+        let mut members = Vec::new();
+
+        for (seg_idx, seg_range) in composite_segs.iter().enumerate() {
+            let seg_clips = clip_ids_for_range(&playlists[ci], seg_range);
+
+            // Find a playlist whose full clip list matches this segment
+            for (mi, member_clips) in all_clip_lists.iter().enumerate() {
+                if mi == ci {
+                    continue;
+                }
+                if member_clips.as_slice() == seg_clips.as_slice() {
+                    let (range_start, range_end) =
+                        compute_member_range(&playlists[ci], seg_range, &playlists[mi]);
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "segment index fits in u32 for any real disc"
+                    )]
+                    members.push(CompositeMember {
+                        playlist: playlists[mi].number,
+                        segment_index: (seg_idx + 1) as u32,
+                        range_start,
+                        range_end,
+                    });
+                    break;
+                }
+            }
+        }
+
+        if !members.is_empty() {
+            analyzed[ci].members = members;
+        }
     }
 }
 
@@ -625,6 +810,243 @@ mod tests {
             analyzed.segments[1].clips,
             vec!["00100", "00004", "00101"],
             "episode 2 clips"
+        );
+    }
+
+    // ── Composite grouping tests ──────────────────────────────────────
+
+    #[test]
+    fn composite_groups_single_clip_members() {
+        // Play-all: 3 episodes, each a single clip with non-seamless boundaries
+        let play_all_data = MplsBuilder::new()
+            .play_item("00004", 27_000_000, 59_040_000)
+            .play_item("00005", 27_000_000, 59_175_000)
+            .play_item("00006", 27_000_000, 59_310_000)
+            .build();
+        // Individual episode playlists
+        let ep1_data = MplsBuilder::new()
+            .play_item("00004", 27_000_000, 59_040_000)
+            .build();
+        let ep2_data = MplsBuilder::new()
+            .play_item("00005", 27_000_000, 59_175_000)
+            .build();
+        let ep3_data = MplsBuilder::new()
+            .play_item("00006", 27_000_000, 59_310_000)
+            .build();
+
+        let playlists = vec![
+            build_playlist(14, &play_all_data),
+            build_playlist(4, &ep1_data),
+            build_playlist(5, &ep2_data),
+            build_playlist(6, &ep3_data),
+        ];
+        let mut analyzed: Vec<AnalyzedPlaylist> = playlists.iter().map(analyze_playlist).collect();
+
+        apply_composite_grouping(&playlists, &mut analyzed);
+
+        assert_eq!(
+            analyzed[0].members.len(),
+            3,
+            "play-all should have 3 members"
+        );
+        assert_eq!(
+            analyzed[0].members[0].playlist, 4,
+            "first member is episode 1"
+        );
+        assert_eq!(
+            analyzed[0].members[1].playlist, 5,
+            "second member is episode 2"
+        );
+        assert_eq!(
+            analyzed[0].members[2].playlist, 6,
+            "third member is episode 3"
+        );
+
+        // Episodes should not be composites themselves
+        assert!(
+            analyzed[1].members.is_empty(),
+            "episode should not be a composite"
+        );
+    }
+
+    #[test]
+    fn composite_groups_multi_clip_members() {
+        // Play-all: 2 episodes, each with intro + content + outro (seamless)
+        let play_all_data = MplsBuilder::new()
+            .play_item("00100", 27_000_000, 28_350_000)
+            .play_item_seamless("00003", 27_000_000, 85_500_000)
+            .play_item_seamless("00101", 27_000_000, 29_700_000)
+            .play_item("00100", 27_000_000, 28_350_000)
+            .play_item_seamless("00004", 27_000_000, 84_600_000)
+            .play_item_seamless("00101", 27_000_000, 29_700_000)
+            .build();
+        // Individual episode playlists with same structure
+        let ep1_data = MplsBuilder::new()
+            .play_item("00100", 27_000_000, 28_350_000)
+            .play_item_seamless("00003", 27_000_000, 85_500_000)
+            .play_item_seamless("00101", 27_000_000, 29_700_000)
+            .build();
+        let ep2_data = MplsBuilder::new()
+            .play_item("00100", 27_000_000, 28_350_000)
+            .play_item_seamless("00004", 27_000_000, 84_600_000)
+            .play_item_seamless("00101", 27_000_000, 29_700_000)
+            .build();
+
+        let playlists = vec![
+            build_playlist(14, &play_all_data),
+            build_playlist(4, &ep1_data),
+            build_playlist(5, &ep2_data),
+        ];
+        let mut analyzed: Vec<AnalyzedPlaylist> = playlists.iter().map(analyze_playlist).collect();
+
+        apply_composite_grouping(&playlists, &mut analyzed);
+
+        assert_eq!(
+            analyzed[0].members.len(),
+            2,
+            "play-all should have 2 members"
+        );
+        assert_eq!(
+            analyzed[0].members[0].playlist, 4,
+            "first member is episode 1"
+        );
+        assert_eq!(
+            analyzed[0].members[1].playlist, 5,
+            "second member is episode 2"
+        );
+    }
+
+    #[test]
+    fn composite_range_full_member() {
+        // Composite uses the full member — range should be 0..duration
+        let play_all_data = MplsBuilder::new()
+            .play_item("00004", 27_000_000, 72_000_000)
+            .play_item("00005", 27_000_000, 72_000_000)
+            .build();
+        let ep1_data = MplsBuilder::new()
+            .play_item("00004", 27_000_000, 72_000_000)
+            .build();
+
+        let playlists = vec![
+            build_playlist(14, &play_all_data),
+            build_playlist(4, &ep1_data),
+        ];
+        let mut analyzed: Vec<AnalyzedPlaylist> = playlists.iter().map(analyze_playlist).collect();
+
+        apply_composite_grouping(&playlists, &mut analyzed);
+
+        let member = &analyzed[0].members[0];
+        assert_eq!(member.range_start, Duration::ZERO, "range starts at 0");
+        assert_eq!(
+            member.range_end, analyzed[1].duration,
+            "range end equals member duration"
+        );
+    }
+
+    #[test]
+    fn no_composite_for_single_segment() {
+        // A single-segment playlist should not become a composite
+        let data = MplsBuilder::new()
+            .play_item("00004", 27_000_000, 59_040_000)
+            .build();
+
+        let playlists = vec![build_playlist(1, &data)];
+        let mut analyzed: Vec<AnalyzedPlaylist> = playlists.iter().map(analyze_playlist).collect();
+
+        apply_composite_grouping(&playlists, &mut analyzed);
+
+        assert!(
+            analyzed[0].members.is_empty(),
+            "single-segment playlist has no members"
+        );
+    }
+
+    #[test]
+    fn composite_display_suppresses_members() {
+        // Play-all with 2 episodes + an ungrouped extra
+        let play_all_data = MplsBuilder::new()
+            .play_item("00004", 27_000_000, 59_040_000)
+            .play_item("00005", 27_000_000, 59_175_000)
+            .build();
+        let ep1_data = MplsBuilder::new()
+            .play_item("00004", 27_000_000, 59_040_000)
+            .build();
+        let ep2_data = MplsBuilder::new()
+            .play_item("00005", 27_000_000, 59_175_000)
+            .build();
+        let extra_data = MplsBuilder::new()
+            .play_item("00010", 27_000_000, 30_000_000)
+            .build();
+
+        let mut playlists = vec![
+            build_playlist(14, &play_all_data),
+            build_playlist(4, &ep1_data),
+            build_playlist(5, &ep2_data),
+            build_playlist(20, &extra_data),
+        ];
+        playlists.sort_by_key(|pl| pl.number);
+        let mut analyzed: Vec<AnalyzedPlaylist> = playlists.iter().map(analyze_playlist).collect();
+
+        apply_composite_grouping(&playlists, &mut analyzed);
+
+        let analysis = BdmvAnalysis {
+            playlists: analyzed,
+            main_title: Some(14),
+            warnings: Vec::new(),
+        };
+
+        let output = format!("{analysis}");
+        // Members should not appear as top-level entries
+        assert!(
+            !output.contains("\nMPLS 00004"),
+            "member 00004 should be suppressed from top level"
+        );
+        assert!(
+            !output.contains("\nMPLS 00005"),
+            "member 00005 should be suppressed from top level"
+        );
+        // Composite and ungrouped extra should appear
+        assert!(
+            output.contains("MPLS 00014"),
+            "composite should appear at top level"
+        );
+        assert!(
+            output.contains("MPLS 00020"),
+            "ungrouped extra should appear at top level"
+        );
+        // Members should appear indented under the composite
+        assert!(
+            output.contains("  01: MPLS 00004"),
+            "member 00004 should appear indented under composite"
+        );
+        assert!(
+            output.contains("  02: MPLS 00005"),
+            "member 00005 should appear indented under composite"
+        );
+    }
+
+    // ── Warning display test ──────────────────────────────────────────
+
+    #[test]
+    fn warnings_appear_in_display() {
+        let ep_data = MplsBuilder::new()
+            .play_item("00004", 27_000_000, 59_040_000)
+            .build();
+        let analyzed = vec![analyze_playlist(&build_playlist(4, &ep_data))];
+
+        let analysis = BdmvAnalysis {
+            playlists: analyzed,
+            main_title: Some(4),
+            warnings: vec![PlaylistWarning {
+                playlist: 99,
+                message: "failed to parse PLAYLIST/00099.mpls: bad magic".into(),
+            }],
+        };
+
+        let output = format!("{analysis}");
+        assert!(
+            output.contains("warning: MPLS 00099"),
+            "warning should appear in output: {output}"
         );
     }
 }

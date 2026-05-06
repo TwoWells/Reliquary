@@ -588,3 +588,201 @@ fn inspect_dvd_missing_vmg() {
         "error should mention missing IFO: {stderr}"
     );
 }
+
+// ── BDMV composite grouping ────────────────────────────────────────────
+
+#[test]
+fn inspect_bdmv_composite_grouping() {
+    // Play-all: 3 episodes (non-seamless boundaries)
+    let play_all = build_multi_item_mpls(
+        &[
+            ("00004", 27_000_000, 59_040_000, 1),
+            ("00005", 27_000_000, 59_175_000, 1),
+            ("00006", 27_000_000, 59_310_000, 1),
+        ],
+        &[(0, 27_000_000), (1, 27_000_000), (2, 27_000_000)],
+    );
+    // Individual episode playlists matching the play-all's segments
+    let ep1 = build_mpls("00004", 27_000_000, 59_040_000, 1, &[(0, 27_000_000)]);
+    let ep2 = build_mpls("00005", 27_000_000, 59_175_000, 1, &[(0, 27_000_000)]);
+    let ep3 = build_mpls("00006", 27_000_000, 59_310_000, 1, &[(0, 27_000_000)]);
+    // Ungrouped extra
+    let extra = build_mpls("00010", 27_000_000, 30_600_000, 1, &[(0, 27_000_000)]);
+
+    let dir = setup_bdmv(&[(1, play_all), (4, ep1), (5, ep2), (6, ep3), (20, extra)]);
+
+    let output = Command::new(cli_bin())
+        .args(["inspect", &dir.path().display().to_string()])
+        .output()
+        .expect("should run inspect");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "inspect should succeed: {stdout}");
+
+    // Composite should show with indented members
+    assert!(
+        stdout.contains("MPLS 00001"),
+        "composite should appear at top level: {stdout}"
+    );
+    assert!(
+        stdout.contains("  01: MPLS 00004"),
+        "episode 1 should appear as member 01: {stdout}"
+    );
+    assert!(
+        stdout.contains("  02: MPLS 00005"),
+        "episode 2 should appear as member 02: {stdout}"
+    );
+    assert!(
+        stdout.contains("  03: MPLS 00006"),
+        "episode 3 should appear as member 03: {stdout}"
+    );
+
+    // Members should NOT appear as top-level entries
+    for line in stdout.lines() {
+        if line.starts_with("MPLS") {
+            let trimmed = line.trim();
+            assert!(
+                !trimmed.starts_with("MPLS 00004")
+                    && !trimmed.starts_with("MPLS 00005")
+                    && !trimmed.starts_with("MPLS 00006"),
+                "member playlists should be suppressed from top level: {line}"
+            );
+        }
+    }
+
+    // Ungrouped extra should still be top-level
+    assert!(
+        stdout.contains("MPLS 00020"),
+        "ungrouped extra should appear at top level: {stdout}"
+    );
+}
+
+#[test]
+fn inspect_bdmv_composite_json() {
+    let play_all = build_multi_item_mpls(
+        &[
+            ("00004", 27_000_000, 59_040_000, 1),
+            ("00005", 27_000_000, 59_175_000, 1),
+        ],
+        &[(0, 27_000_000), (1, 27_000_000)],
+    );
+    let ep1 = build_mpls("00004", 27_000_000, 59_040_000, 1, &[(0, 27_000_000)]);
+    let ep2 = build_mpls("00005", 27_000_000, 59_175_000, 1, &[(0, 27_000_000)]);
+
+    let dir = setup_bdmv(&[(1, play_all), (4, ep1), (5, ep2)]);
+
+    let output = Command::new(cli_bin())
+        .args(["inspect", "--json", &dir.path().display().to_string()])
+        .output()
+        .expect("should run inspect --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "inspect --json should succeed: {stdout}"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output should be valid JSON");
+
+    // Find the composite playlist (number 1, the multi-item one)
+    let composite = json["playlists"]
+        .as_array()
+        .expect("playlists should be an array")
+        .iter()
+        .find(|p| p["number"] == 1)
+        .expect("composite playlist 1 should exist");
+
+    let members = composite["members"]
+        .as_array()
+        .expect("members should be an array");
+    assert_eq!(members.len(), 2, "composite should have 2 members");
+    assert_eq!(
+        members[0]["playlist"], 4,
+        "first member should be playlist 4"
+    );
+    assert_eq!(
+        members[0]["segment_index"], 1,
+        "first member should be at segment 1"
+    );
+    assert_eq!(
+        members[1]["playlist"], 5,
+        "second member should be playlist 5"
+    );
+    assert_eq!(
+        members[1]["segment_index"], 2,
+        "second member should be at segment 2"
+    );
+}
+
+// ── BDMV error recovery ────────────────────────────────────────────────
+
+#[test]
+fn inspect_bdmv_corrupt_mpls_warning() {
+    // One valid playlist, one corrupt
+    let valid = build_mpls("00004", 27_000_000, 59_040_000, 1, &[(0, 27_000_000)]);
+    let corrupt = b"not a valid MPLS file".to_vec();
+
+    let dir = setup_bdmv(&[(100, valid), (200, corrupt)]);
+
+    let output = Command::new(cli_bin())
+        .args(["inspect", &dir.path().display().to_string()])
+        .output()
+        .expect("should run inspect");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "inspect should succeed despite corrupt file: {stdout}"
+    );
+
+    // Valid playlist should still appear
+    assert!(
+        stdout.contains("MPLS 00100"),
+        "valid playlist should appear: {stdout}"
+    );
+
+    // Warning for the corrupt file
+    assert!(
+        stdout.contains("warning") && stdout.contains("00200"),
+        "should warn about corrupt MPLS 00200: {stdout}"
+    );
+}
+
+#[test]
+fn inspect_bdmv_corrupt_mpls_json_warning() {
+    let valid = build_mpls("00004", 27_000_000, 59_040_000, 1, &[(0, 27_000_000)]);
+    let corrupt = b"GARB".to_vec();
+
+    let dir = setup_bdmv(&[(100, valid), (200, corrupt)]);
+
+    let output = Command::new(cli_bin())
+        .args(["inspect", "--json", &dir.path().display().to_string()])
+        .output()
+        .expect("should run inspect --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "inspect --json should succeed: {stdout}"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output should be valid JSON");
+
+    // Valid playlist present
+    assert_eq!(
+        json["playlists"][0]["number"], 100,
+        "valid playlist should be present"
+    );
+
+    // Warning present
+    let warnings = json["warnings"]
+        .as_array()
+        .expect("warnings should be an array");
+    assert_eq!(warnings.len(), 1, "should have 1 warning");
+    assert_eq!(
+        warnings[0]["playlist"], 200,
+        "warning should reference playlist 200"
+    );
+}
