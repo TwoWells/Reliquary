@@ -12,6 +12,7 @@ use aes::Aes128;
 use cbc::Decryptor as CbcDecryptor;
 use cipher::block_padding::NoPadding;
 use cipher::{BlockDecrypt, BlockDecryptMut, BlockEncrypt, KeyInit, KeyIvInit};
+use sha1::{Digest, Sha1};
 use thiserror::Error;
 
 use super::super::reader::{DiscReader, ReaderError};
@@ -96,6 +97,21 @@ pub struct DecryptStats {
     pub blocks_skipped: u64,
 }
 
+/// A disc's AACS identity — the SHA-1 hash of `AACS/Unit_Key_RO.inf`.
+///
+/// This is the disc ID used to look up the VUK in KEYDB.cfg.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscId {
+    /// SHA-1 hash as 40 lowercase hex characters.
+    pub id: String,
+}
+
+impl std::fmt::Display for DiscId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.id)
+    }
+}
+
 /// Parsed and decrypted unit keys, ready for m2ts decryption.
 ///
 /// Pre-parses `Unit_Key_RO.inf` and decrypts unit keys once, so they
@@ -107,12 +123,29 @@ pub struct AacsKeys {
 impl AacsKeys {
     /// Parse `Unit_Key_RO.inf` and decrypt unit keys with the VUK.
     ///
+    /// Reads the unit key file from the disc. To avoid re-reading when
+    /// the data is already available (e.g. from disc ID computation),
+    /// use [`Self::from_unit_key_data`].
+    ///
     /// # Errors
     ///
     /// Returns [`AacsError`] if the unit key file is missing or malformed.
     pub fn from_disc(reader: &DiscReader, vuk: &[u8; 16]) -> Result<Self, AacsError> {
-        let uk_data = read_unit_key_file(reader)?;
-        let uk_file = parse_unit_key_file(&uk_data)?;
+        let uk_data = read_unit_key_data(reader)?;
+        Self::from_unit_key_data(&uk_data, vuk)
+    }
+
+    /// Parse pre-read `Unit_Key_RO.inf` data and decrypt unit keys.
+    ///
+    /// Use this when the raw `Unit_Key_RO.inf` bytes are already
+    /// available (e.g. saved from [`read_unit_key_data`] during disc ID
+    /// computation) to avoid reading the file twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AacsError::InvalidUnitKeyFile`] if the data is malformed.
+    pub fn from_unit_key_data(uk_data: &[u8], vuk: &[u8; 16]) -> Result<Self, AacsError> {
+        let uk_file = parse_unit_key_file(uk_data)?;
         let unit_keys = decrypt_unit_keys(&uk_file, vuk);
         Ok(Self { unit_keys })
     }
@@ -252,10 +285,17 @@ pub fn decrypt_clip(
     AacsKeys::from_disc(reader, vuk)?.decrypt_clip(reader, clip_id)
 }
 
-// ── Internal functions ─────────────────────────────────────────────────────
-
-/// Reads `AACS/Unit_Key_RO.inf` from the disc, probing known paths.
-fn read_unit_key_file(reader: &DiscReader) -> Result<Vec<u8>, AacsError> {
+/// Reads `AACS/Unit_Key_RO.inf` from the disc.
+///
+/// Returns the raw file bytes. These can be passed to
+/// [`disc_id_from_data`] and [`AacsKeys::from_unit_key_data`] to avoid
+/// reading the file multiple times.
+///
+/// # Errors
+///
+/// Returns [`AacsError::NoUnitKeyFile`] if the file is not found,
+/// or [`AacsError::ReadError`] on I/O failure.
+pub fn read_unit_key_data(reader: &DiscReader) -> Result<Vec<u8>, AacsError> {
     let path = std::path::Path::new("AACS/Unit_Key_RO.inf");
     match reader.read_file(path) {
         Ok(data) => Ok(data),
@@ -263,6 +303,38 @@ fn read_unit_key_file(reader: &DiscReader) -> Result<Vec<u8>, AacsError> {
         Err(e) => Err(AacsError::ReadError(e)),
     }
 }
+
+/// Computes the disc ID from raw `Unit_Key_RO.inf` data.
+///
+/// The disc ID is the SHA-1 hash of the file, returned as 40 lowercase
+/// hex characters. This is the standard AACS identifier used to look up
+/// the VUK in KEYDB.cfg.
+#[must_use]
+pub fn disc_id_from_data(data: &[u8]) -> DiscId {
+    let hash = Sha1::digest(data);
+    let id = hash.iter().fold(String::with_capacity(40), |mut acc, b| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    });
+    DiscId { id }
+}
+
+/// Computes the disc ID (SHA-1 of `AACS/Unit_Key_RO.inf`).
+///
+/// Convenience wrapper that reads the file and hashes it. When the raw
+/// data is already available, use [`disc_id_from_data`] instead.
+///
+/// # Errors
+///
+/// Returns [`AacsError::NoUnitKeyFile`] if `AACS/Unit_Key_RO.inf` is
+/// not found, or [`AacsError::ReadError`] on I/O failure.
+pub fn disc_id(reader: &DiscReader) -> Result<DiscId, AacsError> {
+    let data = read_unit_key_data(reader)?;
+    Ok(disc_id_from_data(&data))
+}
+
+// ── Internal functions ─────────────────────────────────────────────────────
 
 /// Parses `Unit_Key_RO.inf` to extract encrypted unit keys.
 fn parse_unit_key_file(data: &[u8]) -> Result<UnitKeyFile, AacsError> {
@@ -1083,5 +1155,49 @@ pub(crate) mod tests {
 
         let new_len = file.seek(SeekFrom::End(0)).expect("should seek to end");
         assert_eq!(new_len, original_len, "file size should not change");
+    }
+
+    // ── Disc ID tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn disc_id_from_synthetic_unit_key_file() {
+        let uk_data = UnitKeyBuilder::new().unit_key([0xAA; 16]).title(1).build();
+
+        // Compute expected SHA-1
+        let expected_hash = sha1::Sha1::digest(&uk_data);
+        let expected_id: String = expected_hash.iter().fold(String::new(), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+
+        // Write to a synthetic disc
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let aacs_dir = dir.path().join("AACS");
+        std::fs::create_dir_all(&aacs_dir).expect("should create AACS dir");
+        std::fs::write(aacs_dir.join("Unit_Key_RO.inf"), &uk_data)
+            .expect("should write unit key file");
+
+        let reader = DiscReader::open(dir.path()).expect("should open disc");
+        let result = disc_id(&reader).expect("should compute disc ID");
+
+        assert_eq!(
+            result.id, expected_id,
+            "disc ID should match SHA-1 of Unit_Key_RO.inf"
+        );
+        assert_eq!(result.id.len(), 40, "disc ID should be 40 hex characters");
+    }
+
+    #[test]
+    fn disc_id_no_unit_key_file() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        std::fs::create_dir_all(dir.path().join("BDMV/STREAM")).expect("should create STREAM dir");
+
+        let reader = DiscReader::open(dir.path()).expect("should open disc");
+        let result = disc_id(&reader);
+        assert!(
+            matches!(result, Err(AacsError::NoUnitKeyFile)),
+            "should return NoUnitKeyFile when Unit_Key_RO.inf is missing"
+        );
     }
 }

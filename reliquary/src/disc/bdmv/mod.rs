@@ -10,6 +10,7 @@ pub mod aacs;
 pub mod clpi;
 pub mod cursor;
 pub mod ig;
+pub mod keydb;
 pub mod mpls;
 pub mod rle;
 pub mod ts;

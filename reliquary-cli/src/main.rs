@@ -34,13 +34,21 @@ enum Command {
         /// Path to an ISO image or extracted disc folder.
         path: PathBuf,
 
-        /// Volume Unique Key as a 32-character hex string.
+        /// Volume Unique Key as a 32-character hex string (overrides lookup).
         #[arg(long)]
-        vuk: String,
+        vuk: Option<String>,
 
         /// Decrypt a single clip instead of the whole disc (e.g. "00100").
         #[arg(long)]
         clip: Option<String>,
+
+        /// Path to `KEYDB.cfg` (default: `$XDG_CONFIG_HOME/aacs/KEYDB.cfg`).
+        #[arg(long)]
+        keydb: Option<PathBuf>,
+
+        /// Skip KEYDB.cfg lookup.
+        #[arg(long)]
+        no_keydb: bool,
 
         /// Output path (ISO/directory for whole-disc, file for per-clip).
         #[arg(short, long)]
@@ -57,8 +65,17 @@ fn main() -> ExitCode {
             path,
             vuk,
             clip,
+            keydb,
+            no_keydb,
             output,
-        } => run_decrypt(&path, &vuk, clip.as_deref(), &output),
+        } => run_decrypt(
+            &path,
+            vuk.as_deref(),
+            clip.as_deref(),
+            keydb.as_deref(),
+            no_keydb,
+            &output,
+        ),
     }
 }
 
@@ -102,36 +119,92 @@ fn run_inspect(path: &std::path::Path, json: bool) -> ExitCode {
     }
 }
 
-/// Runs the `decrypt` subcommand — dispatches to per-clip or whole-disc.
+/// Runs the `decrypt` subcommand — resolves VUK then dispatches.
+#[allow(clippy::print_stderr, reason = "CLI status and error output")]
 fn run_decrypt(
     path: &std::path::Path,
-    vuk_hex: &str,
+    vuk_hex: Option<&str>,
     clip: Option<&str>,
+    keydb: Option<&std::path::Path>,
+    no_keydb: bool,
     output: &std::path::Path,
 ) -> ExitCode {
-    let vuk = match parse_vuk(vuk_hex) {
+    let (vuk, uk_data) = match resolve_vuk(path, vuk_hex, keydb, no_keydb) {
         Ok(v) => v,
         Err(msg) => {
-            #[allow(clippy::print_stderr, reason = "CLI error output")]
-            {
-                eprintln!("error: {msg}");
-            }
+            eprintln!("error: {msg}");
             return ExitCode::FAILURE;
         }
     };
 
     clip.map_or_else(
-        || run_decrypt_disc(path, &vuk, output),
-        |clip_id| run_decrypt_clip(path, &vuk, clip_id, output),
+        || run_decrypt_disc(path, &vuk, uk_data.as_deref(), output),
+        |clip_id| run_decrypt_clip(path, &vuk, clip_id, uk_data.as_deref(), output),
     )
 }
 
-/// Decrypts a single m2ts clip (existing per-clip behavior).
+/// Resolves the VUK from the CLI flag or KEYDB.cfg lookup.
+///
+/// Returns the VUK and, when disc ID computation was needed, the raw
+/// `Unit_Key_RO.inf` bytes so callers can reuse them for key parsing.
+///
+/// Resolution order:
+/// 1. `--vuk` flag → use directly (no unit key data read).
+/// 2. Compute disc ID, search KEYDB.cfg.
+/// 3. No match → error with disc ID for manual lookup.
+#[allow(clippy::print_stderr, reason = "CLI status output")]
+fn resolve_vuk(
+    path: &std::path::Path,
+    vuk_hex: Option<&str>,
+    keydb: Option<&std::path::Path>,
+    no_keydb: bool,
+) -> Result<([u8; 16], Option<Vec<u8>>), String> {
+    // Direct VUK from --vuk flag — no need to read the disc
+    if let Some(hex) = vuk_hex {
+        return Ok((parse_vuk(hex)?, None));
+    }
+
+    // Read Unit_Key_RO.inf once and compute disc ID
+    let reader = reliquary::disc::reader::DiscReader::open(path).map_err(|e| e.to_string())?;
+    let uk_data =
+        reliquary::disc::bdmv::aacs::read_unit_key_data(&reader).map_err(|e| e.to_string())?;
+    let disc_id = reliquary::disc::bdmv::aacs::disc_id_from_data(&uk_data);
+    eprintln!("disc ID: {disc_id}");
+
+    if no_keydb {
+        return Err(format!(
+            "VUK not provided and KEYDB.cfg lookup disabled — use --vuk <hex> (disc ID: {disc_id})"
+        ));
+    }
+
+    // Determine KEYDB.cfg path
+    let keydb_path = keydb.map_or_else(
+        reliquary::disc::bdmv::keydb::default_keydb_path,
+        std::path::PathBuf::from,
+    );
+
+    match reliquary::disc::bdmv::keydb::lookup_keydb(&keydb_path, &disc_id) {
+        Ok(Some(vuk)) => {
+            eprintln!("VUK found in KEYDB.cfg");
+            Ok((vuk, Some(uk_data)))
+        }
+        Ok(None) => Err(format!(
+            "VUK not found in KEYDB.cfg — use --vuk <hex> to provide manually (disc ID: {disc_id})"
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Decrypts a single m2ts clip.
+///
+/// When `uk_data` is provided (from VUK resolution), reuses it to avoid
+/// re-reading `Unit_Key_RO.inf`.
 #[allow(clippy::print_stderr, reason = "CLI status and error output")]
 fn run_decrypt_clip(
     path: &std::path::Path,
     vuk: &[u8; 16],
     clip_id: &str,
+    uk_data: Option<&[u8]>,
     output: &std::path::Path,
 ) -> ExitCode {
     let reader = match reliquary::disc::reader::DiscReader::open(path) {
@@ -142,7 +215,18 @@ fn run_decrypt_clip(
         }
     };
 
-    match reliquary::disc::bdmv::aacs::decrypt_clip(&reader, vuk, clip_id) {
+    let keys = match uk_data.map_or_else(
+        || reliquary::disc::bdmv::aacs::AacsKeys::from_disc(&reader, vuk),
+        |data| reliquary::disc::bdmv::aacs::AacsKeys::from_unit_key_data(data, vuk),
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match keys.decrypt_clip(&reader, clip_id) {
         Ok(data) => match std::fs::write(output, &data) {
             Ok(()) => {
                 eprintln!("decrypted {} bytes to {}", data.len(), output.display());
@@ -168,8 +252,16 @@ struct M2tsTarget {
 }
 
 /// Decrypts a whole disc — copies input then decrypts m2ts files in-place.
+///
+/// When `uk_data` is provided (from VUK resolution), reuses it to avoid
+/// re-reading `Unit_Key_RO.inf` from the output copy.
 #[allow(clippy::print_stderr, reason = "CLI status and error output")]
-fn run_decrypt_disc(path: &std::path::Path, vuk: &[u8; 16], output: &std::path::Path) -> ExitCode {
+fn run_decrypt_disc(
+    path: &std::path::Path,
+    vuk: &[u8; 16],
+    uk_data: Option<&[u8]>,
+    output: &std::path::Path,
+) -> ExitCode {
     // 1. Copy input to output
     if let Err(e) = copy_input(path, output) {
         eprintln!("error: {e}");
@@ -177,7 +269,7 @@ fn run_decrypt_disc(path: &std::path::Path, vuk: &[u8; 16], output: &std::path::
     }
 
     // 2. Open the copy, parse keys, and collect targets
-    let (keys, targets, is_iso) = match prepare_targets(output, vuk) {
+    let (keys, targets, is_iso) = match prepare_targets(output, vuk, uk_data) {
         Ok(result) => result,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -256,15 +348,23 @@ fn copy_input(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String
 }
 
 /// Opens the output copy, parses AACS keys, and collects m2ts targets.
+///
+/// When `uk_data` is provided, uses it directly instead of re-reading
+/// `Unit_Key_RO.inf` from the output.
 #[allow(clippy::print_stderr, reason = "CLI status output")]
 fn prepare_targets(
     output: &std::path::Path,
     vuk: &[u8; 16],
+    uk_data: Option<&[u8]>,
 ) -> Result<(reliquary::disc::bdmv::aacs::AacsKeys, Vec<M2tsTarget>, bool), String> {
     let reader = reliquary::disc::reader::DiscReader::open(output).map_err(|e| e.to_string())?;
 
     eprintln!("parsing AACS keys...");
-    let keys = reliquary::disc::bdmv::aacs::AacsKeys::from_disc(&reader, vuk)
+    let keys = uk_data
+        .map_or_else(
+            || reliquary::disc::bdmv::aacs::AacsKeys::from_disc(&reader, vuk),
+            |data| reliquary::disc::bdmv::aacs::AacsKeys::from_unit_key_data(data, vuk),
+        )
         .map_err(|e| e.to_string())?;
 
     let stream_dir = std::path::Path::new("BDMV/STREAM");
@@ -584,7 +684,14 @@ mod tests {
         let output = tempfile::tempdir().expect("should create output dir");
         let output_path = output.path().join("decrypted");
 
-        let result = run_decrypt(disc.path(), &disc.vuk_hex(), None, &output_path);
+        let result = run_decrypt(
+            disc.path(),
+            Some(&disc.vuk_hex()),
+            None,
+            None,
+            false,
+            &output_path,
+        );
         assert_eq!(
             result,
             ExitCode::SUCCESS,
@@ -672,7 +779,14 @@ mod tests {
         let output_path = output.path().join("decrypted");
 
         let wrong_vuk = "ff".repeat(16);
-        let result = run_decrypt(disc.path(), &wrong_vuk, None, &output_path);
+        let result = run_decrypt(
+            disc.path(),
+            Some(&wrong_vuk),
+            None,
+            None,
+            false,
+            &output_path,
+        );
         assert_eq!(
             result,
             ExitCode::FAILURE,
@@ -692,7 +806,7 @@ mod tests {
         let output_path = output.path().join("decrypted");
 
         let vuk = "42".repeat(16);
-        let result = run_decrypt(dir.path(), &vuk, None, &output_path);
+        let result = run_decrypt(dir.path(), Some(&vuk), None, None, false, &output_path);
         assert_eq!(
             result,
             ExitCode::FAILURE,
@@ -706,7 +820,14 @@ mod tests {
         let output = tempfile::tempdir().expect("should create output dir");
         let output_path = output.path().join("00000.m2ts");
 
-        let result = run_decrypt(disc.path(), &disc.vuk_hex(), Some("00000"), &output_path);
+        let result = run_decrypt(
+            disc.path(),
+            Some(&disc.vuk_hex()),
+            Some("00000"),
+            None,
+            false,
+            &output_path,
+        );
         assert_eq!(result, ExitCode::SUCCESS, "per-clip decrypt should succeed");
 
         let data = std::fs::read(&output_path).expect("should read output");
@@ -716,5 +837,108 @@ mod tests {
             let offset = pkt * 192 + 4;
             assert_eq!(data[offset], 0x47, "TS sync at packet {pkt}");
         }
+    }
+
+    // ── VUK lookup integration tests ────────────────────────────────────
+
+    #[test]
+    fn decrypt_with_keydb_lookup() {
+        use sha1::{Digest, Sha1};
+
+        let disc = SyntheticDisc::new();
+
+        // Compute the disc ID from the Unit_Key_RO.inf
+        let uk_data = std::fs::read(disc.path().join("AACS/Unit_Key_RO.inf"))
+            .expect("should read unit key file");
+        let hash = Sha1::digest(&uk_data);
+        let disc_id: String = hash.iter().fold(String::new(), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+
+        // Build a synthetic KEYDB.cfg with the computed disc ID and VUK
+        let keydb_dir = tempfile::tempdir().expect("should create keydb dir");
+        let keydb_path = keydb_dir.path().join("KEYDB.cfg");
+        let keydb_content = format!(
+            "{disc_id} = Test Disc | D | 2020-01-01 | M | 00000000000000000000000000000000 | I | 00000000000000000000000000000000 | V | 0x{} | U | 00000000000000000000000000000000 ; test\n",
+            disc.vuk_hex()
+        );
+        std::fs::write(&keydb_path, keydb_content).expect("should write KEYDB.cfg");
+
+        // Decrypt without --vuk, using --keydb
+        let output = tempfile::tempdir().expect("should create output dir");
+        let output_path = output.path().join("decrypted");
+
+        let result = run_decrypt(
+            disc.path(),
+            None,
+            None,
+            Some(keydb_path.as_path()),
+            false,
+            &output_path,
+        );
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "decrypt via KEYDB.cfg lookup should succeed"
+        );
+
+        // Verify decryption worked — encrypted files should have valid TS sync
+        for name in &["00000.m2ts", "00001.m2ts"] {
+            let data = std::fs::read(output_path.join("BDMV/STREAM").join(name))
+                .expect("should read m2ts");
+            assert_eq!(
+                data[0] & 0xC0,
+                0,
+                "{name} encryption flag should be cleared"
+            );
+            for pkt in 0..4 {
+                let offset = pkt * 192 + 4;
+                assert_eq!(data[offset], 0x47, "{name} TS sync at packet {pkt}");
+            }
+        }
+    }
+
+    #[test]
+    fn decrypt_no_vuk_no_keydb_fails() {
+        let disc = SyntheticDisc::new();
+        let output = tempfile::tempdir().expect("should create output dir");
+        let output_path = output.path().join("decrypted");
+
+        let result = run_decrypt(disc.path(), None, None, None, true, &output_path);
+        assert_eq!(
+            result,
+            ExitCode::FAILURE,
+            "no VUK and --no-keydb should fail"
+        );
+    }
+
+    #[test]
+    fn decrypt_keydb_disc_id_not_found_fails() {
+        let disc = SyntheticDisc::new();
+
+        // KEYDB.cfg with a different disc ID
+        let keydb_dir = tempfile::tempdir().expect("should create keydb dir");
+        let keydb_path = keydb_dir.path().join("KEYDB.cfg");
+        let keydb_content = "ffffffffffffffffffffffffffffffffffffffff = Other Disc | D | 2020-01-01 | M | 00000000000000000000000000000000 | I | 00000000000000000000000000000000 | V | 0x00000000000000000000000000000000 | U | 00000000000000000000000000000000 ; test\n";
+        std::fs::write(&keydb_path, keydb_content).expect("should write KEYDB.cfg");
+
+        let output = tempfile::tempdir().expect("should create output dir");
+        let output_path = output.path().join("decrypted");
+
+        let result = run_decrypt(
+            disc.path(),
+            None,
+            None,
+            Some(keydb_path.as_path()),
+            false,
+            &output_path,
+        );
+        assert_eq!(
+            result,
+            ExitCode::FAILURE,
+            "disc ID not in KEYDB.cfg should fail"
+        );
     }
 }
