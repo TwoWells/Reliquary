@@ -14,6 +14,20 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+// ── Types ───────────────────────────────────────────────────────────────
+
+/// Byte range of a file within an ISO image.
+///
+/// Most files have a single extent (contiguous allocation). Files
+/// larger than the UDF allocation unit may have multiple extents.
+#[derive(Debug, Clone)]
+pub struct FileExtent {
+    /// Byte offset from the start of the ISO.
+    pub offset: u64,
+    /// Length in bytes.
+    pub length: u64,
+}
+
 // ── Errors ──────────────────────────────────────────────────────────────
 
 /// Errors from disc reader operations.
@@ -150,6 +164,24 @@ impl DiscReader {
             }
             Self::Iso9660(reader) => reader.read_dir(rel),
             Self::Udf(reader) => reader.read_dir(rel),
+        }
+    }
+
+    /// Returns the byte extents of a file within the ISO image.
+    ///
+    /// For ISO-backed readers (UDF), returns `Some(Ok(extents))` where
+    /// each extent describes a contiguous byte range in the ISO. For
+    /// directory-backed readers, returns `None` — files are regular
+    /// filesystem files that can be opened directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Some(Err(_))` if the file doesn't exist or the ISO
+    /// can't be parsed.
+    pub fn file_extents(&self, rel: &Path) -> Option<Result<Vec<FileExtent>, ReaderError>> {
+        match self {
+            Self::Directory(_) | Self::Iso9660(_) => None,
+            Self::Udf(reader) => Some(reader.file_extents(rel)),
         }
     }
 

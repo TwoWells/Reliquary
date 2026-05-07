@@ -204,6 +204,53 @@ impl UdfReader {
         self.read_file_data(&fe, icb_part)
     }
 
+    /// Returns the byte extents of a file within the ISO image.
+    ///
+    /// Each extent describes a contiguous byte range in the ISO where
+    /// the file's data lives. Most files have a single extent.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "extent lengths bounded by actual file size"
+    )]
+    pub fn file_extents(&self, rel: &Path) -> Result<Vec<super::FileExtent>, ReaderError> {
+        let (icb_loc, icb_part) = self.resolve_path(rel)?;
+        let fe = self.read_file_entry(icb_loc, icb_part)?;
+
+        if fe.is_dir {
+            return Err(ReaderError::NotFound {
+                path: rel.display().to_string(),
+            });
+        }
+
+        // Inline data has no extents within the ISO.
+        if fe.alloc_type == 3 {
+            return Ok(Vec::new());
+        }
+
+        let ad_partition = if fe.alloc_type == 1 { 0 } else { icb_part };
+
+        let mut extents = Vec::new();
+        let mut remaining = fe.info_length;
+
+        for ad in &fe.alloc_descriptors {
+            let extent_len = ad.length & 0x3FFF_FFFF;
+            let byte_offset = resolve_byte_offset(&self.partition, ad.position, ad_partition);
+            let read_len = u64::from(extent_len).min(remaining);
+
+            extents.push(super::FileExtent {
+                offset: byte_offset,
+                length: read_len,
+            });
+
+            remaining = remaining.saturating_sub(read_len);
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        Ok(extents)
+    }
+
     /// Lists entries in a directory within the UDF volume.
     pub fn read_dir(&self, rel: &Path) -> Result<Vec<String>, ReaderError> {
         let (icb_loc, icb_part) = if rel.as_os_str().is_empty() || rel == Path::new(".") {

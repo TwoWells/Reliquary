@@ -16,6 +16,9 @@ use thiserror::Error;
 
 use super::super::reader::{DiscReader, ReaderError};
 
+use std::fs::File;
+use std::io::{Read as _, Seek, SeekFrom, Write as _};
+
 // ── Constants ──────────────────────────────────────────────────────────────
 
 /// Size of one AACS aligned unit in bytes (32 × 192-byte TS packets).
@@ -68,6 +71,10 @@ pub enum AacsError {
     /// The m2ts file could not be read from the disc.
     #[error("failed to read m2ts: {0}")]
     ReadError(#[from] ReaderError),
+
+    /// An I/O error occurred during streaming decryption.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 // ── Internal types ─────────────────────────────────────────────────────────
@@ -78,14 +85,156 @@ struct UnitKeyFile {
     encrypted_keys: Vec<[u8; 16]>,
 }
 
+// ── Public types ──────────────────────────────────────────────────────────
+
+/// Statistics from a streaming decryption operation.
+#[derive(Debug, Clone, Copy)]
+pub struct DecryptStats {
+    /// Number of aligned units that were decrypted.
+    pub blocks_decrypted: u64,
+    /// Number of aligned units that were skipped (already unencrypted).
+    pub blocks_skipped: u64,
+}
+
+/// Parsed and decrypted unit keys, ready for m2ts decryption.
+///
+/// Pre-parses `Unit_Key_RO.inf` and decrypts unit keys once, so they
+/// can be reused across multiple m2ts files during whole-disc decryption.
+pub struct AacsKeys {
+    unit_keys: Vec<[u8; 16]>,
+}
+
+impl AacsKeys {
+    /// Parse `Unit_Key_RO.inf` and decrypt unit keys with the VUK.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AacsError`] if the unit key file is missing or malformed.
+    pub fn from_disc(reader: &DiscReader, vuk: &[u8; 16]) -> Result<Self, AacsError> {
+        let uk_data = read_unit_key_file(reader)?;
+        let uk_file = parse_unit_key_file(&uk_data)?;
+        let unit_keys = decrypt_unit_keys(&uk_file, vuk);
+        Ok(Self { unit_keys })
+    }
+
+    /// Decrypt a single m2ts clip using these keys.
+    ///
+    /// Reads the full m2ts into memory, decrypts, and returns the
+    /// plaintext. For large files, prefer [`Self::decrypt_stream`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AacsError`] if the clip cannot be read, is not
+    /// encrypted, or no unit key produces valid TS sync.
+    pub fn decrypt_clip(&self, reader: &DiscReader, clip_id: &str) -> Result<Vec<u8>, AacsError> {
+        let m2ts_path = format!("BDMV/STREAM/{clip_id}.m2ts");
+        let mut data = reader
+            .read_file(std::path::Path::new(&m2ts_path))
+            .map_err(AacsError::ReadError)?;
+        self.decrypt_data(&mut data, clip_id)?;
+        Ok(data)
+    }
+
+    /// Decrypt m2ts data in-place.
+    ///
+    /// The `clip_id` is used only for error messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AacsError::NotEncrypted`] if no blocks are encrypted,
+    /// or [`AacsError::DecryptionFailed`] if no unit key works.
+    pub fn decrypt_data(&self, data: &mut [u8], clip_id: &str) -> Result<(), AacsError> {
+        let first_encrypted = find_first_encrypted_block(data);
+        let Some(first_offset) = first_encrypted else {
+            return Err(AacsError::NotEncrypted {
+                clip_id: clip_id.to_owned(),
+            });
+        };
+
+        let key_index = find_unit_key(
+            &data[first_offset..first_offset + ALIGNED_UNIT_LEN],
+            &self.unit_keys,
+        )
+        .ok_or_else(|| AacsError::DecryptionFailed {
+            clip_id: clip_id.to_owned(),
+        })?;
+
+        decrypt_m2ts(data, &self.unit_keys[key_index]);
+        Ok(())
+    }
+
+    /// Decrypt m2ts content by seeking within a file.
+    ///
+    /// Reads 6144-byte aligned units from `file` starting at `offset`
+    /// for `length` bytes, decrypts encrypted blocks in-place, and
+    /// writes them back. Uses constant memory regardless of file size.
+    ///
+    /// Auto-detects the correct unit key on the first encrypted block.
+    /// If no blocks are encrypted, returns [`DecryptStats`] with zero
+    /// decrypted and all skipped (no error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AacsError::DecryptionFailed`] if encrypted blocks are
+    /// found but no unit key produces valid TS sync, or [`AacsError::Io`]
+    /// on I/O failures.
+    pub fn decrypt_stream(
+        &self,
+        file: &mut File,
+        offset: u64,
+        length: u64,
+    ) -> Result<DecryptStats, AacsError> {
+        let mut blocks_decrypted: u64 = 0;
+        let mut blocks_skipped: u64 = 0;
+        let mut unit_key_idx: Option<usize> = None;
+        let mut block = [0u8; ALIGNED_UNIT_LEN];
+        let mut pos: u64 = 0;
+
+        while pos + ALIGNED_UNIT_LEN as u64 <= length {
+            let file_offset = offset + pos;
+            file.seek(SeekFrom::Start(file_offset))?;
+            file.read_exact(&mut block)?;
+
+            if block[0] & 0xC0 != 0 {
+                let key_idx = if let Some(idx) = unit_key_idx {
+                    idx
+                } else {
+                    let idx = find_unit_key(&block, &self.unit_keys).ok_or_else(|| {
+                        AacsError::DecryptionFailed {
+                            clip_id: format!("stream at offset {file_offset:#x}"),
+                        }
+                    })?;
+                    unit_key_idx = Some(idx);
+                    idx
+                };
+
+                decrypt_block(&mut block, &self.unit_keys[key_idx]);
+
+                file.seek(SeekFrom::Start(file_offset))?;
+                file.write_all(&block)?;
+
+                blocks_decrypted += 1;
+            } else {
+                blocks_skipped += 1;
+            }
+
+            pos += ALIGNED_UNIT_LEN as u64;
+        }
+
+        Ok(DecryptStats {
+            blocks_decrypted,
+            blocks_skipped,
+        })
+    }
+}
+
 // ── Public API ─────────────────────────────────────────────────────────────
 
 /// Decrypts an m2ts clip from a Blu-ray disc.
 ///
-/// Reads `AACS/Unit_Key_RO.inf`, decrypts unit keys with the VUK,
-/// reads the m2ts from `BDMV/STREAM/{clip_id}.m2ts`, and decrypts
-/// all encrypted aligned units. Auto-detects the correct unit key
-/// via MPEG-TS sync byte verification.
+/// Convenience wrapper around [`AacsKeys::from_disc`] and
+/// [`AacsKeys::decrypt_clip`]. For decrypting multiple clips from the
+/// same disc, use [`AacsKeys`] directly to avoid re-parsing keys.
 ///
 /// # Errors
 ///
@@ -100,40 +249,7 @@ pub fn decrypt_clip(
     vuk: &[u8; 16],
     clip_id: &str,
 ) -> Result<Vec<u8>, AacsError> {
-    // 1. Read and parse Unit_Key_RO.inf
-    let uk_data = read_unit_key_file(reader)?;
-    let uk_file = parse_unit_key_file(&uk_data)?;
-
-    // 2. Decrypt all unit keys with the VUK
-    let unit_keys = decrypt_unit_keys(&uk_file, vuk);
-
-    // 3. Read the m2ts
-    let m2ts_path = format!("BDMV/STREAM/{clip_id}.m2ts");
-    let mut data = reader
-        .read_file(std::path::Path::new(&m2ts_path))
-        .map_err(AacsError::ReadError)?;
-
-    // 4. Find the first encrypted block
-    let first_encrypted = find_first_encrypted_block(&data);
-    let Some(first_offset) = first_encrypted else {
-        return Err(AacsError::NotEncrypted {
-            clip_id: clip_id.to_owned(),
-        });
-    };
-
-    // 5. Auto-detect the correct unit key
-    let key_index = find_unit_key(
-        &data[first_offset..first_offset + ALIGNED_UNIT_LEN],
-        &unit_keys,
-    )
-    .ok_or_else(|| AacsError::DecryptionFailed {
-        clip_id: clip_id.to_owned(),
-    })?;
-
-    // 6. Decrypt all encrypted aligned units in-place
-    decrypt_m2ts(&mut data, &unit_keys[key_index]);
-
-    Ok(data)
+    AacsKeys::from_disc(reader, vuk)?.decrypt_clip(reader, clip_id)
 }
 
 // ── Internal functions ─────────────────────────────────────────────────────
@@ -306,8 +422,15 @@ fn verify_ts_sync(block: &[u8]) -> bool {
 pub(crate) mod tests {
     use cbc::Encryptor as CbcEncryptor;
     use cipher::BlockEncryptMut;
+    use std::io::{Read as _, Seek, SeekFrom, Write as _};
 
     use super::*;
+
+    impl AacsKeys {
+        fn from_keys(unit_keys: Vec<[u8; 16]>) -> Self {
+            Self { unit_keys }
+        }
+    }
 
     // ── Test helpers ───────────────────────────────────────────────────
 
@@ -795,5 +918,170 @@ pub(crate) mod tests {
             matches!(result, Err(AacsError::NotEncrypted { .. })),
             "unencrypted clip should produce NotEncrypted"
         );
+    }
+
+    // ── AacsKeys tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn aacs_keys_from_disc_and_decrypt_clip() {
+        let vuk = [0x42; 16];
+        let plaintext_key = [0x77; 16];
+
+        let cipher = Aes128::new((&vuk).into());
+        let mut encrypted_uk = aes::Block::clone_from_slice(&plaintext_key);
+        cipher.encrypt_block(&mut encrypted_uk);
+        let mut stored_key = [0u8; 16];
+        stored_key.copy_from_slice(&encrypted_uk);
+
+        let uk_data = UnitKeyBuilder::new().unit_key(stored_key).title(1).build();
+        let block = EncryptedBlockBuilder::new(plaintext_key)
+            .seed([0x01; 16])
+            .build();
+
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let aacs_dir = dir.path().join("AACS");
+        let stream_dir = dir.path().join("BDMV").join("STREAM");
+        std::fs::create_dir_all(&aacs_dir).expect("should create AACS dir");
+        std::fs::create_dir_all(&stream_dir).expect("should create STREAM dir");
+        std::fs::write(aacs_dir.join("Unit_Key_RO.inf"), &uk_data)
+            .expect("should write unit key file");
+        std::fs::write(stream_dir.join("00100.m2ts"), block).expect("should write m2ts file");
+
+        let reader = DiscReader::open(dir.path()).expect("should open disc");
+        let keys = AacsKeys::from_disc(&reader, &vuk).expect("should parse keys");
+        let decrypted = keys
+            .decrypt_clip(&reader, "00100")
+            .expect("should decrypt via AacsKeys");
+
+        assert_eq!(
+            decrypted.len(),
+            ALIGNED_UNIT_LEN,
+            "output size should match input"
+        );
+        for pkt in 0..32 {
+            let offset = pkt * 192 + 4;
+            assert_eq!(
+                decrypted[offset], 0x47,
+                "TS sync at packet {pkt} should be 0x47"
+            );
+        }
+    }
+
+    // ── decrypt_stream tests ────────────────────────────────────────────
+
+    #[test]
+    fn decrypt_stream_encrypted_blocks() {
+        let unit_key = [0x55; 16];
+        let keys = AacsKeys::from_keys(vec![unit_key]);
+
+        let block1 = EncryptedBlockBuilder::new(unit_key)
+            .seed([0x01; 16])
+            .build();
+        let block2 = EncryptedBlockBuilder::new(unit_key)
+            .seed([0x02; 16])
+            .build();
+
+        let mut file = tempfile::tempfile().expect("should create temp file");
+        file.write_all(&block1).expect("should write block1");
+        file.write_all(&block2).expect("should write block2");
+
+        let length = (ALIGNED_UNIT_LEN * 2) as u64;
+        let stats = keys
+            .decrypt_stream(&mut file, 0, length)
+            .expect("should decrypt");
+
+        assert_eq!(stats.blocks_decrypted, 2, "should decrypt 2 blocks");
+        assert_eq!(stats.blocks_skipped, 0, "should skip 0 blocks");
+
+        // Verify file contents
+        file.seek(SeekFrom::Start(0)).expect("should seek");
+        let mut result = vec![0u8; ALIGNED_UNIT_LEN * 2];
+        file.read_exact(&mut result).expect("should read");
+
+        for block_idx in 0..2 {
+            let base = block_idx * ALIGNED_UNIT_LEN;
+            assert_eq!(
+                result[base] & 0xC0,
+                0,
+                "encryption flag should be cleared in block {block_idx}"
+            );
+            for pkt in 0..32 {
+                let offset = base + pkt * 192 + 4;
+                assert_eq!(
+                    result[offset], 0x47,
+                    "TS sync at block {block_idx} packet {pkt} should be 0x47"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decrypt_stream_mixed_blocks() {
+        let unit_key = [0x55; 16];
+        let keys = AacsKeys::from_keys(vec![unit_key]);
+
+        // Block 1: unencrypted
+        let mut unencrypted = [0u8; ALIGNED_UNIT_LEN];
+        for i in 0..32 {
+            unencrypted[i * 192 + 4] = 0x47;
+        }
+        // Block 2: encrypted
+        let encrypted = EncryptedBlockBuilder::new(unit_key)
+            .seed([0x01; 16])
+            .build();
+
+        let mut file = tempfile::tempfile().expect("should create temp file");
+        file.write_all(&unencrypted)
+            .expect("should write unencrypted");
+        file.write_all(&encrypted).expect("should write encrypted");
+
+        let length = (ALIGNED_UNIT_LEN * 2) as u64;
+        let stats = keys
+            .decrypt_stream(&mut file, 0, length)
+            .expect("should decrypt");
+
+        assert_eq!(stats.blocks_decrypted, 1, "should decrypt 1 block");
+        assert_eq!(stats.blocks_skipped, 1, "should skip 1 block");
+    }
+
+    #[test]
+    fn decrypt_stream_all_unencrypted() {
+        let unit_key = [0x55; 16];
+        let keys = AacsKeys::from_keys(vec![unit_key]);
+
+        let mut unencrypted = [0u8; ALIGNED_UNIT_LEN];
+        for i in 0..32 {
+            unencrypted[i * 192 + 4] = 0x47;
+        }
+
+        let mut file = tempfile::tempfile().expect("should create temp file");
+        file.write_all(&unencrypted).expect("should write block");
+
+        let stats = keys
+            .decrypt_stream(&mut file, 0, ALIGNED_UNIT_LEN as u64)
+            .expect("should not error on unencrypted");
+
+        assert_eq!(stats.blocks_decrypted, 0, "should decrypt 0 blocks");
+        assert_eq!(stats.blocks_skipped, 1, "should skip 1 block");
+    }
+
+    #[test]
+    fn decrypt_stream_file_size_unchanged() {
+        let unit_key = [0x55; 16];
+        let keys = AacsKeys::from_keys(vec![unit_key]);
+
+        let block = EncryptedBlockBuilder::new(unit_key)
+            .seed([0x01; 16])
+            .build();
+        let original_len = block.len() as u64;
+
+        let mut file = tempfile::tempfile().expect("should create temp file");
+        file.write_all(&block).expect("should write block");
+
+        keys.decrypt_stream(&mut file, 0, original_len)
+            .expect("should decrypt");
+
+        let new_len = file.seek(SeekFrom::End(0)).expect("should seek to end");
+        assert_eq!(new_len, original_len, "file size should not change");
     }
 }
