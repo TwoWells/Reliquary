@@ -6,6 +6,7 @@
 //!
 //! The public surface is [`analyze`], which returns a [`BdmvAnalysis`].
 
+pub mod clpi;
 pub mod mpls;
 
 use std::collections::{HashMap, HashSet};
@@ -18,6 +19,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use super::reader::{DiscReader, ReaderError};
+use clpi::ClipInfo;
 use mpls::{PTS_CLOCK_HZ, Playlist};
 
 // ── Errors ──────────────────────────────────────────────────────────────
@@ -32,6 +34,15 @@ pub enum BdmvError {
     /// No valid playlists found on the disc after filtering.
     #[error("no valid playlists found after filtering")]
     NoPlaylists,
+}
+
+/// A per-clip error encountered during analysis (non-fatal).
+#[derive(Debug, Clone, Serialize)]
+pub struct ClipWarning {
+    /// Clip ID that failed (from the CLPI filename).
+    pub clip_id: String,
+    /// Description of the error.
+    pub message: String,
 }
 
 /// A per-playlist error encountered during analysis (non-fatal).
@@ -52,9 +63,53 @@ pub struct BdmvAnalysis {
     pub playlists: Vec<AnalyzedPlaylist>,
     /// Playlist number of the identified main title, if any.
     pub main_title: Option<u32>,
+    /// Clips with IG streams (menu clips for `identify`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ig_clips: Vec<IgClip>,
+    /// Clips not referenced by any playlist.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unreferenced_clips: Vec<UnreferencedClip>,
     /// Warnings from playlists that could not be read or parsed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<PlaylistWarning>,
+    /// Warnings from clips that could not be read or parsed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub clip_warnings: Vec<ClipWarning>,
+}
+
+/// Clip with IG streams — a menu clip for `identify`.
+#[derive(Debug, Clone, Serialize)]
+pub struct IgClip {
+    /// Clip ID (e.g. `"00291"`).
+    pub clip_id: String,
+    /// Application type from `ClipInfo`.
+    pub application_type: u8,
+    /// Estimated m2ts file size in bytes.
+    pub file_size: u64,
+    /// IG stream PIDs and languages.
+    pub ig_streams: Vec<IgStream>,
+}
+
+/// An IG stream within a clip.
+#[derive(Debug, Clone, Serialize)]
+pub struct IgStream {
+    /// MPEG-TS PID.
+    pub pid: u16,
+    /// Three-letter ISO 639-2 language code.
+    pub language: String,
+}
+
+/// A clip present in CLIPINF but not referenced by any MPLS playlist.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnreferencedClip {
+    /// Clip ID (e.g. `"00291"`).
+    pub clip_id: String,
+    /// Whether this clip has IG streams.
+    pub has_ig: bool,
+    /// Stream summary (coding type names).
+    pub streams: Vec<String>,
+    /// Estimated m2ts file size in bytes.
+    pub file_size: u64,
 }
 
 /// An analyzed playlist with computed duration and segment grouping.
@@ -186,9 +241,44 @@ impl fmt::Display for BdmvAnalysis {
             writeln!(f, "\n* main title: {main:05}")?;
         }
 
+        // IG clips
+        if !self.ig_clips.is_empty() {
+            writeln!(f)?;
+            for ig in &self.ig_clips {
+                let langs: Vec<&str> = ig.ig_streams.iter().map(|s| s.language.as_str()).collect();
+                writeln!(
+                    f,
+                    "IG {:>5}  app_type={} {:>8}  {}",
+                    ig.clip_id,
+                    ig.application_type,
+                    format_file_size(ig.file_size),
+                    langs.join(", "),
+                )?;
+            }
+        }
+
+        // Unreferenced clips
+        if !self.unreferenced_clips.is_empty() {
+            writeln!(f)?;
+            for clip in &self.unreferenced_clips {
+                let ig_marker = if clip.has_ig { " [IG]" } else { "" };
+                writeln!(
+                    f,
+                    "unreferenced {:>5}  {:>8}  {}{}",
+                    clip.clip_id,
+                    format_file_size(clip.file_size),
+                    clip.streams.join(", "),
+                    ig_marker,
+                )?;
+            }
+        }
+
         // Warnings
         for w in &self.warnings {
             writeln!(f, "warning: MPLS {:05}: {}", w.playlist, w.message)?;
+        }
+        for w in &self.clip_warnings {
+            writeln!(f, "warning: CLPI {}: {}", w.clip_id, w.message)?;
         }
 
         Ok(())
@@ -223,6 +313,49 @@ fn format_streams(s: &StreamSummary) -> String {
     }
 
     parts.join(" | ")
+}
+
+/// Formats a byte size as a human-readable string (KB, MB, GB).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "file sizes fit well within f64 mantissa range for any real disc"
+)]
+fn format_file_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    }
+}
+
+/// Returns a human-readable name for a stream coding type.
+const fn stream_coding_name(coding_type: u8) -> &'static str {
+    match coding_type {
+        0x01 => "MPEG-1",
+        0x02 => "MPEG-2",
+        0x03 | 0x04 => "MPEG Audio",
+        0xea => "VC-1",
+        0x1b => "H.264",
+        0x24 => "HEVC",
+        0x80 => "LPCM",
+        0x81 => "AC-3",
+        0x82 => "DTS",
+        0x83 => "TrueHD",
+        0x84 => "E-AC-3",
+        0x85 => "DTS-HD HR",
+        0x86 => "DTS-HD MA",
+        0x90 => "PGS",
+        0x91 => "IG",
+        0x92 => "Text",
+        0xa1 => "E-AC-3 2nd",
+        0xa2 => "DTS-HD 2nd",
+        _ => "Unknown",
+    }
 }
 
 // ── Analysis entry point ────────────────────────────────────────────────
@@ -270,10 +403,32 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
     // Composite grouping
     apply_composite_grouping(&playlists, &mut analyzed);
 
+    // Read CLPI files
+    let clipinf_dir = if reader.read_dir(Path::new("CLIPINF")).is_ok() {
+        Some(Path::new("CLIPINF").to_path_buf())
+    } else if reader.read_dir(&Path::new("BDMV").join("CLIPINF")).is_ok() {
+        Some(Path::new("BDMV").join("CLIPINF"))
+    } else {
+        None
+    };
+
+    let (ig_clips, unreferenced_clips, clip_warnings) = clipinf_dir.map_or_else(
+        || (Vec::new(), Vec::new(), Vec::new()),
+        |dir| {
+            let (clips, clip_warns) = read_clips(reader, &dir);
+            let ig = identify_ig_clips(&clips);
+            let unreferenced = find_unreferenced_clips(&clips, &playlists);
+            (ig, unreferenced, clip_warns)
+        },
+    );
+
     Ok(BdmvAnalysis {
         playlists: analyzed,
         main_title,
+        ig_clips,
+        unreferenced_clips,
         warnings,
+        clip_warnings,
     })
 }
 
@@ -328,6 +483,128 @@ fn read_playlists(
     }
 
     Ok((playlists, warnings))
+}
+
+/// Reads all `.clpi` files from the CLIPINF directory.
+///
+/// Returns the successfully parsed clips and any per-file warnings.
+/// Individual file read or parse failures are collected as warnings
+/// rather than aborting analysis.
+fn read_clips(reader: &DiscReader, dir: &Path) -> (Vec<ClipInfo>, Vec<ClipWarning>) {
+    let Ok(entries) = reader.read_dir(dir) else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut clips = Vec::new();
+    let mut warnings = Vec::new();
+    let mut clpi_names: Vec<_> = entries
+        .into_iter()
+        .filter(|name| name.to_ascii_lowercase().ends_with(".clpi"))
+        .collect();
+    clpi_names.sort();
+
+    for name in clpi_names {
+        let clip_id = name
+            .strip_suffix(".clpi")
+            .or_else(|| name.strip_suffix(".CLPI"))
+            .unwrap_or(&name)
+            .to_string();
+
+        let file_path = dir.join(&name);
+
+        let data = match reader.read_file(&file_path) {
+            Ok(data) => data,
+            Err(e) => {
+                warnings.push(ClipWarning {
+                    clip_id,
+                    message: format!("failed to read {}: {e}", file_path.display()),
+                });
+                continue;
+            }
+        };
+
+        match clpi::parse(&data, clip_id.clone()) {
+            Ok(clip) => clips.push(clip),
+            Err(e) => {
+                warnings.push(ClipWarning {
+                    clip_id,
+                    message: format!("failed to parse {}: {e}", file_path.display()),
+                });
+            }
+        }
+    }
+
+    (clips, warnings)
+}
+
+/// Identifies clips that contain IG streams (menu clips).
+fn identify_ig_clips(clips: &[ClipInfo]) -> Vec<IgClip> {
+    let mut ig_clips = Vec::new();
+
+    for clip in clips {
+        let ig_streams: Vec<IgStream> = clip
+            .streams
+            .iter()
+            .filter(|s| s.coding_type == clpi::CODING_TYPE_IG)
+            .map(|s| {
+                let language = match &s.attrs {
+                    clpi::StreamAttrs::Ig { language } => language.clone(),
+                    _ => String::new(),
+                };
+                IgStream {
+                    pid: s.pid,
+                    language,
+                }
+            })
+            .collect();
+
+        if !ig_streams.is_empty() {
+            ig_clips.push(IgClip {
+                clip_id: clip.clip_id.clone(),
+                application_type: clip.application_type,
+                file_size: u64::from(clip.num_source_packets) * 192,
+                ig_streams,
+            });
+        }
+    }
+
+    ig_clips
+}
+
+/// Finds clips not referenced by any MPLS playlist.
+fn find_unreferenced_clips(clips: &[ClipInfo], playlists: &[Playlist]) -> Vec<UnreferencedClip> {
+    // Collect all clip IDs referenced by any playlist
+    let referenced: HashSet<&str> = playlists
+        .iter()
+        .flat_map(|pl| {
+            pl.play_items.iter().flat_map(|item| {
+                std::iter::once(item.clip_id.as_str())
+                    .chain(item.angle_clip_ids.iter().map(String::as_str))
+            })
+        })
+        .collect();
+
+    clips
+        .iter()
+        .filter(|clip| !referenced.contains(clip.clip_id.as_str()))
+        .map(|clip| {
+            let has_ig = clip
+                .streams
+                .iter()
+                .any(|s| s.coding_type == clpi::CODING_TYPE_IG);
+            let streams = clip
+                .streams
+                .iter()
+                .map(|s| stream_coding_name(s.coding_type).to_string())
+                .collect();
+            UnreferencedClip {
+                clip_id: clip.clip_id.clone(),
+                has_ig,
+                streams,
+                file_size: u64::from(clip.num_source_packets) * 192,
+            }
+        })
+        .collect()
 }
 
 /// Returns `true` if a playlist is a looping menu.
@@ -992,7 +1269,10 @@ mod tests {
         let analysis = BdmvAnalysis {
             playlists: analyzed,
             main_title: Some(14),
+            ig_clips: Vec::new(),
+            unreferenced_clips: Vec::new(),
             warnings: Vec::new(),
+            clip_warnings: Vec::new(),
         };
 
         let output = format!("{analysis}");
@@ -1037,10 +1317,13 @@ mod tests {
         let analysis = BdmvAnalysis {
             playlists: analyzed,
             main_title: Some(4),
+            ig_clips: Vec::new(),
+            unreferenced_clips: Vec::new(),
             warnings: vec![PlaylistWarning {
                 playlist: 99,
                 message: "failed to parse PLAYLIST/00099.mpls: bad magic".into(),
             }],
+            clip_warnings: Vec::new(),
         };
 
         let output = format!("{analysis}");
@@ -1048,5 +1331,108 @@ mod tests {
             output.contains("warning: MPLS 00099"),
             "warning should appear in output: {output}"
         );
+    }
+
+    // ── CLPI integration tests ───────────────────────────────────────
+
+    use crate::disc::bdmv::clpi::tests::ClpiBuilder;
+
+    #[test]
+    fn ig_clips_identified() {
+        let clip_content = ClpiBuilder::new()
+            .application_type(1)
+            .num_source_packets(1_000_000)
+            .video(0x1011, 0x1b, 6, 1)
+            .audio(0x1100, 0x81, 3, 1, *b"eng")
+            .build();
+        let clip_ig = ClpiBuilder::new()
+            .application_type(5)
+            .num_source_packets(500)
+            .ig(0x1400, *b"eng")
+            .build();
+
+        let clips = vec![
+            clpi::parse(&clip_content, "00004".into()).expect("should parse content clip"),
+            clpi::parse(&clip_ig, "00291".into()).expect("should parse IG clip"),
+        ];
+
+        let ig_clips = identify_ig_clips(&clips);
+        assert_eq!(ig_clips.len(), 1, "should find one IG clip");
+        assert_eq!(ig_clips[0].clip_id, "00291", "IG clip id");
+        assert_eq!(ig_clips[0].application_type, 5, "IG application type");
+        assert_eq!(ig_clips[0].file_size, 500 * 192, "IG file size");
+        assert_eq!(ig_clips[0].ig_streams.len(), 1, "IG stream count");
+        assert_eq!(ig_clips[0].ig_streams[0].pid, 0x1400, "IG stream PID");
+        assert_eq!(
+            ig_clips[0].ig_streams[0].language, "eng",
+            "IG stream language"
+        );
+    }
+
+    #[test]
+    fn no_ig_clips_when_absent() {
+        let clip = ClpiBuilder::new()
+            .application_type(1)
+            .num_source_packets(1_000_000)
+            .video(0x1011, 0x1b, 6, 1)
+            .audio(0x1100, 0x81, 3, 1, *b"eng")
+            .build();
+
+        let clips = vec![clpi::parse(&clip, "00004".into()).expect("should parse")];
+
+        let ig_clips = identify_ig_clips(&clips);
+        assert!(ig_clips.is_empty(), "should find no IG clips");
+    }
+
+    #[test]
+    fn unreferenced_clips_detected() {
+        let clip_content = ClpiBuilder::new()
+            .num_source_packets(1_000_000)
+            .video(0x1011, 0x1b, 6, 1)
+            .build();
+        let clip_ig = ClpiBuilder::new()
+            .application_type(5)
+            .num_source_packets(500)
+            .ig(0x1400, *b"eng")
+            .build();
+
+        let clips = vec![
+            clpi::parse(&clip_content, "00004".into()).expect("should parse content"),
+            clpi::parse(&clip_ig, "00291".into()).expect("should parse IG"),
+        ];
+
+        // Only clip 00004 is referenced by a playlist
+        let mpls_data = MplsBuilder::new()
+            .play_item("00004", 27_000_000, 59_040_000)
+            .build();
+        let playlists = vec![build_playlist(100, &mpls_data)];
+
+        let unreferenced = find_unreferenced_clips(&clips, &playlists);
+        assert_eq!(unreferenced.len(), 1, "should find one unreferenced clip");
+        assert_eq!(unreferenced[0].clip_id, "00291", "unreferenced clip id");
+        assert!(unreferenced[0].has_ig, "unreferenced clip has IG");
+        assert_eq!(
+            unreferenced[0].file_size,
+            500 * 192,
+            "unreferenced file size"
+        );
+    }
+
+    #[test]
+    fn all_clips_referenced() {
+        let clip = ClpiBuilder::new()
+            .num_source_packets(1_000_000)
+            .video(0x1011, 0x1b, 6, 1)
+            .build();
+
+        let clips = vec![clpi::parse(&clip, "00004".into()).expect("should parse")];
+
+        let mpls_data = MplsBuilder::new()
+            .play_item("00004", 27_000_000, 59_040_000)
+            .build();
+        let playlists = vec![build_playlist(100, &mpls_data)];
+
+        let unreferenced = find_unreferenced_clips(&clips, &playlists);
+        assert!(unreferenced.is_empty(), "all clips should be referenced");
     }
 }

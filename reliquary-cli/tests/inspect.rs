@@ -200,6 +200,11 @@ fn build_play_item(clip_id: &str, in_time: u32, out_time: u32, conn: u8) -> Vec<
 
 /// Creates a synthetic BDMV directory with the given MPLS files.
 fn setup_bdmv(mpls_files: &[(u32, Vec<u8>)]) -> TempDir {
+    setup_bdmv_with_clips(mpls_files, &[])
+}
+
+/// Creates a synthetic BDMV directory with MPLS and CLPI files.
+fn setup_bdmv_with_clips(mpls_files: &[(u32, Vec<u8>)], clpi_files: &[(&str, Vec<u8>)]) -> TempDir {
     let dir = TempDir::new().expect("should create temp dir");
     let playlist_dir = dir.path().join("BDMV").join("PLAYLIST");
     fs::create_dir_all(&playlist_dir).expect("should create BDMV/PLAYLIST");
@@ -207,6 +212,15 @@ fn setup_bdmv(mpls_files: &[(u32, Vec<u8>)]) -> TempDir {
     for (number, data) in mpls_files {
         let filename = format!("{number:05}.mpls");
         fs::write(playlist_dir.join(filename), data).expect("should write MPLS file");
+    }
+
+    if !clpi_files.is_empty() {
+        let clipinf_dir = dir.path().join("BDMV").join("CLIPINF");
+        fs::create_dir_all(&clipinf_dir).expect("should create BDMV/CLIPINF");
+        for (clip_id, data) in clpi_files {
+            let filename = format!("{clip_id}.clpi");
+            fs::write(clipinf_dir.join(filename), data).expect("should write CLPI file");
+        }
     }
 
     dir
@@ -784,5 +798,386 @@ fn inspect_bdmv_corrupt_mpls_json_warning() {
     assert_eq!(
         warnings[0]["playlist"], 200,
         "warning should reference playlist 200"
+    );
+}
+
+// ── CLPI test helpers ─────────────────────────────────────────────────
+
+/// Stream entry for CLPI builder.
+#[allow(
+    dead_code,
+    reason = "Subtitle kept for completeness with the CLPI format"
+)]
+enum ClpiStream {
+    Video {
+        pid: u16,
+        coding_type: u8,
+        video_format: u8,
+        frame_rate: u8,
+    },
+    Audio {
+        pid: u16,
+        coding_type: u8,
+        audio_format: u8,
+        sample_rate: u8,
+        language: [u8; 3],
+    },
+    Subtitle {
+        pid: u16,
+        coding_type: u8,
+        language: [u8; 3],
+    },
+    Ig {
+        pid: u16,
+        language: [u8; 3],
+    },
+}
+
+/// Builds a minimal CLPI binary file.
+fn build_clpi(application_type: u8, num_source_packets: u32, streams: &[ClpiStream]) -> Vec<u8> {
+    let mut buf = Vec::new();
+
+    // Header (40 bytes)
+    buf.extend_from_slice(b"HDMV");
+    buf.extend_from_slice(b"0200");
+    buf.extend_from_slice(&[0u8; 4]); // sequence_info_addr placeholder
+    buf.extend_from_slice(&[0u8; 4]); // program_info_addr placeholder
+    buf.extend_from_slice(&[0u8; 4]); // cpi_addr
+    buf.extend_from_slice(&[0u8; 4]); // clip_mark_addr
+    buf.extend_from_slice(&[0u8; 4]); // ext_data_addr
+    buf.extend_from_slice(&[0u8; 12]); // reserved
+
+    // ClipInfo section (at 0x28)
+    let clip_info_length: u32 = 144;
+    buf.extend_from_slice(&clip_info_length.to_be_bytes());
+    buf.extend_from_slice(&[0u8; 2]); // reserved
+    buf.push(1); // clip_stream_type
+    buf.push(application_type);
+    buf.extend_from_slice(&[0u8; 4]); // flags
+    buf.extend_from_slice(&6_000_000_u32.to_be_bytes()); // ts_recording_rate
+    buf.extend_from_slice(&num_source_packets.to_be_bytes());
+    buf.extend_from_slice(&[0u8; 128]); // reserved
+
+    // SequenceInfo (minimal)
+    let seq_info_addr = buf.len() as u32;
+    buf[0x08..0x0C].copy_from_slice(&seq_info_addr.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes());
+
+    // ProgramInfo
+    let program_info_addr = buf.len() as u32;
+    buf[0x0C..0x10].copy_from_slice(&program_info_addr.to_be_bytes());
+
+    let mut stream_data = Vec::new();
+    for stream in streams {
+        match stream {
+            ClpiStream::Video {
+                pid,
+                coding_type,
+                video_format,
+                frame_rate,
+            } => {
+                stream_data.extend_from_slice(&pid.to_be_bytes());
+                stream_data.push(2);
+                stream_data.push(*coding_type);
+                stream_data.push((video_format << 4) | frame_rate);
+            }
+            ClpiStream::Audio {
+                pid,
+                coding_type,
+                audio_format,
+                sample_rate,
+                language,
+            } => {
+                stream_data.extend_from_slice(&pid.to_be_bytes());
+                stream_data.push(5);
+                stream_data.push(*coding_type);
+                stream_data.push((audio_format << 4) | sample_rate);
+                stream_data.extend_from_slice(language);
+            }
+            ClpiStream::Subtitle {
+                pid,
+                coding_type,
+                language,
+            } => {
+                stream_data.extend_from_slice(&pid.to_be_bytes());
+                stream_data.push(4);
+                stream_data.push(*coding_type);
+                stream_data.extend_from_slice(language);
+            }
+            ClpiStream::Ig { pid, language } => {
+                stream_data.extend_from_slice(&pid.to_be_bytes());
+                stream_data.push(4);
+                stream_data.push(0x91);
+                stream_data.extend_from_slice(language);
+            }
+        }
+    }
+
+    let program_body_len = 1 + 1 + 4 + 2 + 1 + 1 + stream_data.len();
+    buf.extend_from_slice(&(program_body_len as u32).to_be_bytes());
+    buf.push(0); // reserved
+    buf.push(1); // num_programs
+    buf.extend_from_slice(&0u32.to_be_bytes()); // spn_program_seq_start
+    buf.extend_from_slice(&0x0100_u16.to_be_bytes()); // program_map_pid
+    buf.push(streams.len() as u8); // num_streams
+    buf.push(0); // num_groups
+    buf.extend_from_slice(&stream_data);
+
+    buf
+}
+
+// ── CLPI e2e tests ────────────────────────────────────────────────────
+
+#[test]
+fn inspect_bdmv_ig_clips_in_text() {
+    let mpls = build_mpls("00004", 27_000_000, 59_040_000, 1, &[(0, 27_000_000)]);
+    let clpi_content = build_clpi(
+        1,
+        1_000_000,
+        &[
+            ClpiStream::Video {
+                pid: 0x1011,
+                coding_type: 0x1b,
+                video_format: 6,
+                frame_rate: 1,
+            },
+            ClpiStream::Audio {
+                pid: 0x1100,
+                coding_type: 0x81,
+                audio_format: 3,
+                sample_rate: 1,
+                language: *b"eng",
+            },
+        ],
+    );
+    let clpi_ig = build_clpi(
+        5,
+        500,
+        &[ClpiStream::Ig {
+            pid: 0x1400,
+            language: *b"eng",
+        }],
+    );
+
+    let dir = setup_bdmv_with_clips(
+        &[(100, mpls)],
+        &[("00004", clpi_content), ("00291", clpi_ig)],
+    );
+
+    let output = Command::new(cli_bin())
+        .args(["inspect", &dir.path().display().to_string()])
+        .output()
+        .expect("should run inspect");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "inspect should succeed: {stdout}");
+    assert!(
+        stdout.contains("IG") && stdout.contains("00291"),
+        "should show IG clip 00291: {stdout}"
+    );
+    assert!(
+        stdout.contains("unreferenced") && stdout.contains("00291"),
+        "should show unreferenced clip 00291: {stdout}"
+    );
+}
+
+#[test]
+fn inspect_bdmv_ig_clips_in_json() {
+    let mpls = build_mpls("00004", 27_000_000, 59_040_000, 1, &[(0, 27_000_000)]);
+    let clpi_content = build_clpi(
+        1,
+        1_000_000,
+        &[ClpiStream::Video {
+            pid: 0x1011,
+            coding_type: 0x1b,
+            video_format: 6,
+            frame_rate: 1,
+        }],
+    );
+    let clpi_ig = build_clpi(
+        5,
+        500,
+        &[ClpiStream::Ig {
+            pid: 0x1400,
+            language: *b"eng",
+        }],
+    );
+
+    let dir = setup_bdmv_with_clips(
+        &[(100, mpls)],
+        &[("00004", clpi_content), ("00291", clpi_ig)],
+    );
+
+    let output = Command::new(cli_bin())
+        .args(["inspect", "--json", &dir.path().display().to_string()])
+        .output()
+        .expect("should run inspect --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "inspect --json should succeed: {stdout}"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output should be valid JSON");
+
+    // IG clips
+    let ig_clips = json["ig_clips"]
+        .as_array()
+        .expect("ig_clips should be an array");
+    assert_eq!(ig_clips.len(), 1, "should have 1 IG clip");
+    assert_eq!(ig_clips[0]["clip_id"], "00291", "IG clip id");
+    assert_eq!(ig_clips[0]["application_type"], 5, "IG application type");
+    assert_eq!(ig_clips[0]["file_size"], 500 * 192, "IG file size");
+    assert_eq!(ig_clips[0]["ig_streams"][0]["pid"], 0x1400, "IG stream PID");
+    assert_eq!(
+        ig_clips[0]["ig_streams"][0]["language"], "eng",
+        "IG stream language"
+    );
+
+    // Unreferenced clips
+    let unreferenced = json["unreferenced_clips"]
+        .as_array()
+        .expect("unreferenced_clips should be an array");
+    assert_eq!(unreferenced.len(), 1, "should have 1 unreferenced clip");
+    assert_eq!(unreferenced[0]["clip_id"], "00291", "unreferenced clip id");
+    assert_eq!(unreferenced[0]["has_ig"], true, "unreferenced clip has IG");
+}
+
+#[test]
+fn inspect_bdmv_no_ig_clips() {
+    let mpls = build_mpls("00004", 27_000_000, 59_040_000, 1, &[(0, 27_000_000)]);
+    let clpi_content = build_clpi(
+        1,
+        1_000_000,
+        &[ClpiStream::Video {
+            pid: 0x1011,
+            coding_type: 0x1b,
+            video_format: 6,
+            frame_rate: 1,
+        }],
+    );
+
+    let dir = setup_bdmv_with_clips(&[(100, mpls)], &[("00004", clpi_content)]);
+
+    let output = Command::new(cli_bin())
+        .args(["inspect", "--json", &dir.path().display().to_string()])
+        .output()
+        .expect("should run inspect --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "inspect --json should succeed: {stdout}"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output should be valid JSON");
+
+    // No IG clips or unreferenced clips in JSON (skip_serializing_if)
+    assert!(
+        json.get("ig_clips").is_none(),
+        "ig_clips should be absent when empty"
+    );
+    assert!(
+        json.get("unreferenced_clips").is_none(),
+        "unreferenced_clips should be absent when empty"
+    );
+}
+
+#[test]
+fn inspect_bdmv_corrupt_clpi_warning() {
+    // One valid playlist + one valid CLPI + one corrupt CLPI
+    let mpls = build_mpls("00004", 27_000_000, 59_040_000, 1, &[(0, 27_000_000)]);
+    let clpi_valid = build_clpi(
+        1,
+        1_000_000,
+        &[ClpiStream::Video {
+            pid: 0x1011,
+            coding_type: 0x1b,
+            video_format: 6,
+            frame_rate: 1,
+        }],
+    );
+    let clpi_corrupt = b"not a valid CLPI file".to_vec();
+
+    let dir = setup_bdmv_with_clips(
+        &[(100, mpls)],
+        &[("00004", clpi_valid), ("00099", clpi_corrupt)],
+    );
+
+    let output = Command::new(cli_bin())
+        .args(["inspect", &dir.path().display().to_string()])
+        .output()
+        .expect("should run inspect");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "inspect should succeed despite corrupt CLPI: {stdout}"
+    );
+
+    // Valid playlist should still appear
+    assert!(
+        stdout.contains("MPLS 00100"),
+        "valid playlist should appear: {stdout}"
+    );
+
+    // Warning for the corrupt CLPI
+    assert!(
+        stdout.contains("warning") && stdout.contains("CLPI") && stdout.contains("00099"),
+        "should warn about corrupt CLPI 00099: {stdout}"
+    );
+}
+
+#[test]
+fn inspect_bdmv_corrupt_clpi_json_warning() {
+    let mpls = build_mpls("00004", 27_000_000, 59_040_000, 1, &[(0, 27_000_000)]);
+    let clpi_valid = build_clpi(
+        1,
+        1_000_000,
+        &[ClpiStream::Video {
+            pid: 0x1011,
+            coding_type: 0x1b,
+            video_format: 6,
+            frame_rate: 1,
+        }],
+    );
+    let clpi_corrupt = b"GARB".to_vec();
+
+    let dir = setup_bdmv_with_clips(
+        &[(100, mpls)],
+        &[("00004", clpi_valid), ("00099", clpi_corrupt)],
+    );
+
+    let output = Command::new(cli_bin())
+        .args(["inspect", "--json", &dir.path().display().to_string()])
+        .output()
+        .expect("should run inspect --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "inspect --json should succeed: {stdout}"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output should be valid JSON");
+
+    // Valid playlist present
+    assert_eq!(
+        json["playlists"][0]["number"], 100,
+        "valid playlist should be present"
+    );
+
+    // Clip warning present
+    let clip_warnings = json["clip_warnings"]
+        .as_array()
+        .expect("clip_warnings should be an array");
+    assert_eq!(clip_warnings.len(), 1, "should have 1 clip warning");
+    assert_eq!(
+        clip_warnings[0]["clip_id"], "00099",
+        "warning should reference clip 00099"
     );
 }
