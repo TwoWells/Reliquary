@@ -21,12 +21,30 @@ struct Cli {
 enum Command {
     /// Inspect a disc — show structure, playlists, streams, and main title.
     Inspect {
-        /// Path to a mounted ISO, extracted disc folder, or BDMV root.
+        /// Path to an ISO image or extracted disc folder.
         path: PathBuf,
 
         /// Output as JSON instead of a human-readable table.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Decrypt an AACS-encrypted m2ts clip from a Blu-ray disc.
+    Decrypt {
+        /// Path to an ISO image or extracted disc folder.
+        path: PathBuf,
+
+        /// Volume Unique Key as a 32-character hex string.
+        #[arg(long)]
+        vuk: String,
+
+        /// Clip ID to decrypt (e.g. "00100").
+        #[arg(long)]
+        clip: String,
+
+        /// Output file path for the decrypted m2ts.
+        #[arg(short, long)]
+        output: PathBuf,
     },
 }
 
@@ -35,6 +53,12 @@ fn main() -> ExitCode {
 
     match cli.command {
         Command::Inspect { path, json } => run_inspect(&path, json),
+        Command::Decrypt {
+            path,
+            vuk,
+            clip,
+            output,
+        } => run_decrypt(&path, &vuk, &clip, &output),
     }
 }
 
@@ -76,4 +100,76 @@ fn run_inspect(path: &std::path::Path, json: bool) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Runs the `decrypt` subcommand.
+fn run_decrypt(
+    path: &std::path::Path,
+    vuk_hex: &str,
+    clip_id: &str,
+    output: &std::path::Path,
+) -> ExitCode {
+    let vuk = match parse_vuk(vuk_hex) {
+        Ok(v) => v,
+        Err(msg) => {
+            #[allow(clippy::print_stderr, reason = "CLI error output")]
+            {
+                eprintln!("error: {msg}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let reader = match reliquary::disc::reader::DiscReader::open(path) {
+        Ok(r) => r,
+        Err(e) => {
+            #[allow(clippy::print_stderr, reason = "CLI error output")]
+            {
+                eprintln!("error: {e}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match reliquary::disc::bdmv::aacs::decrypt_clip(&reader, &vuk, clip_id) {
+        Ok(data) => match std::fs::write(output, &data) {
+            Ok(()) => {
+                #[allow(clippy::print_stderr, reason = "CLI status output")]
+                {
+                    eprintln!("decrypted {} bytes to {}", data.len(), output.display());
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                #[allow(clippy::print_stderr, reason = "CLI error output")]
+                {
+                    eprintln!("error: failed to write output: {e}");
+                }
+                ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            #[allow(clippy::print_stderr, reason = "CLI error output")]
+            {
+                eprintln!("error: {e}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Parses a 32-character hex string into a 16-byte VUK.
+fn parse_vuk(hex: &str) -> Result<[u8; 16], String> {
+    let hex = hex.strip_prefix("0x").unwrap_or(hex);
+
+    if hex.len() != 32 {
+        return Err(format!("VUK must be 32 hex characters, got {}", hex.len()));
+    }
+
+    let mut vuk = [0u8; 16];
+    for (i, byte) in vuk.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!("invalid hex at position {}", i * 2))?;
+    }
+    Ok(vuk)
 }

@@ -6,6 +6,7 @@
 //!
 //! The public surface is [`analyze`], which returns a [`BdmvAnalysis`].
 
+pub mod aacs;
 pub mod clpi;
 pub mod mpls;
 

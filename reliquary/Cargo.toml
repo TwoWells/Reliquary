@@ -12,6 +12,9 @@ categories = ["multimedia", "database"]
 workspace = true
 
 [dependencies]
+aes = "0.8"
+cbc = "0.1"
+cipher = "0.4"
 serde = { workspace = true }
 thiserror = { workspace = true }
 
