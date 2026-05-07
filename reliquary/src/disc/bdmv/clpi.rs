@@ -8,6 +8,8 @@
 
 use thiserror::Error;
 
+use super::cursor::{Cursor, CursorError};
+
 // ── Errors ──────────────────────────────────────────────────────────────
 
 /// Errors that can occur while parsing a CLPI file.
@@ -39,87 +41,13 @@ pub enum ClpiError {
     },
 }
 
-// ── Reader helper ───────────────────────────────────────────────────────
-
-/// A cursor over a byte slice with bounds-checked reads.
-struct Reader<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-#[allow(
-    clippy::missing_const_for_fn,
-    reason = "internal helper — const adds no value"
-)]
-impl<'a> Reader<'a> {
-    const fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    const fn remaining(&self) -> usize {
-        self.data.len().saturating_sub(self.pos)
-    }
-
-    fn ensure(&self, n: usize) -> Result<(), ClpiError> {
-        if self.remaining() < n {
-            return Err(ClpiError::UnexpectedEof {
-                offset: self.pos,
-                needed: n,
-                available: self.remaining(),
-            });
+impl From<CursorError> for ClpiError {
+    fn from(e: CursorError) -> Self {
+        Self::UnexpectedEof {
+            offset: e.offset,
+            needed: e.needed,
+            available: e.available,
         }
-        Ok(())
-    }
-
-    fn skip(&mut self, n: usize) -> Result<(), ClpiError> {
-        self.ensure(n)?;
-        self.pos += n;
-        Ok(())
-    }
-
-    fn read_u8(&mut self) -> Result<u8, ClpiError> {
-        self.ensure(1)?;
-        let v = self.data[self.pos];
-        self.pos += 1;
-        Ok(v)
-    }
-
-    fn read_u16(&mut self) -> Result<u16, ClpiError> {
-        self.ensure(2)?;
-        let v = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
-        self.pos += 2;
-        Ok(v)
-    }
-
-    fn read_u32(&mut self) -> Result<u32, ClpiError> {
-        self.ensure(4)?;
-        let v = u32::from_be_bytes([
-            self.data[self.pos],
-            self.data[self.pos + 1],
-            self.data[self.pos + 2],
-            self.data[self.pos + 3],
-        ]);
-        self.pos += 4;
-        Ok(v)
-    }
-
-    fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], ClpiError> {
-        self.ensure(n)?;
-        let slice = &self.data[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(slice)
-    }
-
-    fn seek(&mut self, new_pos: usize) -> Result<(), ClpiError> {
-        if new_pos > self.data.len() {
-            return Err(ClpiError::UnexpectedEof {
-                offset: new_pos,
-                needed: 0,
-                available: 0,
-            });
-        }
-        self.pos = new_pos;
-        Ok(())
     }
 }
 
@@ -197,7 +125,7 @@ pub enum StreamAttrs {
 ///
 /// Returns [`ClpiError`] if the file is malformed or truncated.
 pub fn parse(data: &[u8], clip_id: String) -> Result<ClipInfo, ClpiError> {
-    let mut r = Reader::new(data);
+    let mut r = Cursor::new(data);
 
     // ── Header (40 bytes) ──────────────────────────────────────────
     let magic = r.read_bytes(4)?;
@@ -272,7 +200,7 @@ pub fn parse(data: &[u8], clip_id: String) -> Result<ClipInfo, ClpiError> {
 }
 
 /// Parses stream attributes for a single elementary stream.
-fn parse_stream_attrs(r: &mut Reader<'_>, pid: u16) -> Result<ClipStream, ClpiError> {
+fn parse_stream_attrs(r: &mut Cursor<'_>, pid: u16) -> Result<ClipStream, ClpiError> {
     let attr_length = r.read_u8()? as usize;
     let attr_start = r.pos;
 

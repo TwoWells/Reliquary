@@ -8,6 +8,8 @@
 
 use thiserror::Error;
 
+use super::cursor::{Cursor, CursorError};
+
 /// Clock frequency for MPEG-2 PTS timestamps (ticks per second).
 pub const PTS_CLOCK_HZ: u32 = 45_000;
 
@@ -42,87 +44,13 @@ pub enum MplsError {
     },
 }
 
-// ── Reader helper ───────────────────────────────────────────────────────
-
-/// A cursor over a byte slice with bounds-checked reads.
-struct Reader<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-#[allow(
-    clippy::missing_const_for_fn,
-    reason = "internal helper — const adds no value"
-)]
-impl<'a> Reader<'a> {
-    const fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    const fn remaining(&self) -> usize {
-        self.data.len().saturating_sub(self.pos)
-    }
-
-    fn ensure(&self, n: usize) -> Result<(), MplsError> {
-        if self.remaining() < n {
-            return Err(MplsError::UnexpectedEof {
-                offset: self.pos,
-                needed: n,
-                available: self.remaining(),
-            });
+impl From<CursorError> for MplsError {
+    fn from(e: CursorError) -> Self {
+        Self::UnexpectedEof {
+            offset: e.offset,
+            needed: e.needed,
+            available: e.available,
         }
-        Ok(())
-    }
-
-    fn skip(&mut self, n: usize) -> Result<(), MplsError> {
-        self.ensure(n)?;
-        self.pos += n;
-        Ok(())
-    }
-
-    fn read_u8(&mut self) -> Result<u8, MplsError> {
-        self.ensure(1)?;
-        let v = self.data[self.pos];
-        self.pos += 1;
-        Ok(v)
-    }
-
-    fn read_u16(&mut self) -> Result<u16, MplsError> {
-        self.ensure(2)?;
-        let v = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
-        self.pos += 2;
-        Ok(v)
-    }
-
-    fn read_u32(&mut self) -> Result<u32, MplsError> {
-        self.ensure(4)?;
-        let v = u32::from_be_bytes([
-            self.data[self.pos],
-            self.data[self.pos + 1],
-            self.data[self.pos + 2],
-            self.data[self.pos + 3],
-        ]);
-        self.pos += 4;
-        Ok(v)
-    }
-
-    fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], MplsError> {
-        self.ensure(n)?;
-        let slice = &self.data[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(slice)
-    }
-
-    fn seek(&mut self, new_pos: usize) -> Result<(), MplsError> {
-        if new_pos > self.data.len() {
-            return Err(MplsError::UnexpectedEof {
-                offset: new_pos,
-                needed: 0,
-                available: 0,
-            });
-        }
-        self.pos = new_pos;
-        Ok(())
     }
 }
 
@@ -313,7 +241,7 @@ pub const fn audio_sample_rate(sample_rate: u8) -> &'static str {
 ///
 /// Returns [`MplsError`] if the file is malformed or truncated.
 pub fn parse(data: &[u8], number: u32) -> Result<Playlist, MplsError> {
-    let mut r = Reader::new(data);
+    let mut r = Cursor::new(data);
 
     // ── Header ──────────────────────────────────────────────────────
     let magic = r.read_bytes(4)?;
@@ -368,7 +296,7 @@ pub fn parse(data: &[u8], number: u32) -> Result<Playlist, MplsError> {
 }
 
 /// Parses a single `PlayItem` entry.
-fn parse_play_item(r: &mut Reader<'_>) -> Result<PlayItem, MplsError> {
+fn parse_play_item(r: &mut Cursor<'_>) -> Result<PlayItem, MplsError> {
     let item_length = r.read_u16()? as usize;
     let item_start = r.pos;
 
@@ -432,7 +360,7 @@ fn parse_play_item(r: &mut Reader<'_>) -> Result<PlayItem, MplsError> {
     clippy::similar_names,
     reason = "field names match the MPLS binary spec"
 )]
-fn parse_stn_table(r: &mut Reader<'_>) -> Result<StnTable, MplsError> {
+fn parse_stn_table(r: &mut Cursor<'_>) -> Result<StnTable, MplsError> {
     let table_length = r.read_u16()? as usize;
     let table_start = r.pos;
 
@@ -506,7 +434,7 @@ fn parse_stn_table(r: &mut Reader<'_>) -> Result<StnTable, MplsError> {
 }
 
 /// Parses a video stream entry from the STN table.
-fn parse_video_stream(r: &mut Reader<'_>) -> Result<VideoStream, MplsError> {
+fn parse_video_stream(r: &mut Cursor<'_>) -> Result<VideoStream, MplsError> {
     // entry_length (1 byte) + entry data
     let entry_length = r.read_u8()? as usize;
     let entry_start = r.pos;
@@ -541,7 +469,7 @@ fn parse_video_stream(r: &mut Reader<'_>) -> Result<VideoStream, MplsError> {
 }
 
 /// Parses an audio stream entry from the STN table.
-fn parse_audio_stream(r: &mut Reader<'_>) -> Result<AudioStream, MplsError> {
+fn parse_audio_stream(r: &mut Cursor<'_>) -> Result<AudioStream, MplsError> {
     // entry_length (1 byte) + entry data
     let entry_length = r.read_u8()? as usize;
     let entry_start = r.pos;
@@ -575,7 +503,7 @@ fn parse_audio_stream(r: &mut Reader<'_>) -> Result<AudioStream, MplsError> {
 }
 
 /// Parses a PGS/text subtitle stream entry from the STN table.
-fn parse_subtitle_stream(r: &mut Reader<'_>) -> Result<SubtitleStream, MplsError> {
+fn parse_subtitle_stream(r: &mut Cursor<'_>) -> Result<SubtitleStream, MplsError> {
     // entry_length (1 byte) + entry data
     let entry_length = r.read_u8()? as usize;
     let entry_start = r.pos;
@@ -610,7 +538,7 @@ fn parse_subtitle_stream(r: &mut Reader<'_>) -> Result<SubtitleStream, MplsError
 }
 
 /// Skips a stream entry (entry + attributes) without parsing details.
-fn skip_stream_entry(r: &mut Reader<'_>) -> Result<(), MplsError> {
+fn skip_stream_entry(r: &mut Cursor<'_>) -> Result<(), MplsError> {
     let entry_length = r.read_u8()? as usize;
     r.skip(entry_length)?;
     let attrs_length = r.read_u8()? as usize;
@@ -619,7 +547,7 @@ fn skip_stream_entry(r: &mut Reader<'_>) -> Result<(), MplsError> {
 }
 
 /// Parses a single chapter mark entry (14 bytes).
-fn parse_mark(r: &mut Reader<'_>) -> Result<Mark, MplsError> {
+fn parse_mark(r: &mut Cursor<'_>) -> Result<Mark, MplsError> {
     // reserved (1 byte)
     r.skip(1)?;
     let mark_type = r.read_u8()?;
