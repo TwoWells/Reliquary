@@ -61,8 +61,6 @@ pub struct PlaylistWarning {
 pub struct BdmvAnalysis {
     /// Analyzed playlists after filtering and deduplication.
     pub playlists: Vec<AnalyzedPlaylist>,
-    /// Playlist number of the identified main title, if any.
-    pub main_title: Option<u32>,
     /// Clips with IG streams (menu clips for `identify`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ig_clips: Vec<IgClip>,
@@ -195,16 +193,13 @@ impl fmt::Display for BdmvAnalysis {
                 continue;
             }
 
-            let is_main = self.main_title == Some(pl.number);
-            let marker = if is_main { " *" } else { "" };
             writeln!(
                 f,
-                "MPLS {:05}  {:>10}  {:>3} ch  {}{}",
+                "MPLS {:05}  {:>10}  {:>3} ch  {}",
                 pl.number,
                 format_duration(pl.duration),
                 pl.chapters,
                 format_streams(&pl.streams),
-                marker,
             )?;
 
             if !pl.members.is_empty() {
@@ -235,10 +230,6 @@ impl fmt::Display for BdmvAnalysis {
                     )?;
                 }
             }
-        }
-
-        if let Some(main) = self.main_title {
-            writeln!(f, "\n* main title: {main:05}")?;
         }
 
         // IG clips
@@ -394,9 +385,6 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
     // Sort by playlist number for deterministic output
     playlists.sort_by_key(|pl| pl.number);
 
-    // Identify main title
-    let main_title = identify_main_title(&playlists);
-
     // Convert to analyzed playlists
     let mut analyzed: Vec<AnalyzedPlaylist> = playlists.iter().map(analyze_playlist).collect();
 
@@ -424,7 +412,6 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
 
     Ok(BdmvAnalysis {
         playlists: analyzed,
-        main_title,
         ig_clips,
         unreferenced_clips,
         warnings,
@@ -667,46 +654,6 @@ fn dedup_playlists(playlists: &[Playlist]) -> Vec<Playlist> {
     }
 
     result
-}
-
-/// Identifies the main title playlist.
-///
-/// Selects the playlist with the most play items. If all playlists have
-/// the same number of play items, falls back to the longest duration.
-fn identify_main_title(playlists: &[Playlist]) -> Option<u32> {
-    if playlists.is_empty() {
-        return None;
-    }
-
-    let max_items = playlists
-        .iter()
-        .map(|pl| pl.play_items.len())
-        .max()
-        .unwrap_or(0);
-
-    let candidates: Vec<&Playlist> = playlists
-        .iter()
-        .filter(|pl| pl.play_items.len() == max_items)
-        .collect();
-
-    if candidates.len() == 1 {
-        return Some(candidates[0].number);
-    }
-
-    // Fall back to longest duration
-    candidates
-        .iter()
-        .max_by_key(|pl| playlist_duration(pl))
-        .map(|pl| pl.number)
-}
-
-/// Computes the total duration of a raw playlist in PTS ticks.
-fn playlist_duration(playlist: &Playlist) -> u64 {
-    playlist
-        .play_items
-        .iter()
-        .map(|item| u64::from(item.out_time.saturating_sub(item.in_time)))
-        .sum()
 }
 
 /// Converts PTS ticks to a `Duration`.
@@ -1004,44 +951,6 @@ mod tests {
     }
 
     #[test]
-    fn main_title_most_items() {
-        let main_data = MplsBuilder::new()
-            .play_item("00004", 27_000_000, 59_040_000)
-            .play_item("00005", 27_000_000, 59_175_000)
-            .play_item("00006", 27_000_000, 59_310_000)
-            .build();
-        let extra_data = MplsBuilder::new()
-            .play_item("00010", 27_000_000, 30_000_000)
-            .build();
-
-        let main = build_playlist(1, &main_data);
-        let extra = build_playlist(20, &extra_data);
-
-        let result = identify_main_title(&[main, extra]);
-        assert_eq!(result, Some(1), "main title should be playlist 1");
-    }
-
-    #[test]
-    fn main_title_falls_back_to_duration() {
-        let long_data = MplsBuilder::new()
-            .play_item("00004", 27_000_000, 270_000_000)
-            .build();
-        let short_data = MplsBuilder::new()
-            .play_item("00010", 27_000_000, 30_000_000)
-            .build();
-
-        let long = build_playlist(200, &long_data);
-        let short = build_playlist(100, &short_data);
-
-        let result = identify_main_title(&[long, short]);
-        assert_eq!(
-            result,
-            Some(200),
-            "should pick longest when item counts match"
-        );
-    }
-
-    #[test]
     fn segments_grouped_by_connection() {
         let data = MplsBuilder::new()
             .play_item("00100", 188_955_000, 222_570_000)
@@ -1268,7 +1177,6 @@ mod tests {
 
         let analysis = BdmvAnalysis {
             playlists: analyzed,
-            main_title: Some(14),
             ig_clips: Vec::new(),
             unreferenced_clips: Vec::new(),
             warnings: Vec::new(),
@@ -1316,7 +1224,6 @@ mod tests {
 
         let analysis = BdmvAnalysis {
             playlists: analyzed,
-            main_title: Some(4),
             ig_clips: Vec::new(),
             unreferenced_clips: Vec::new(),
             warnings: vec![PlaylistWarning {

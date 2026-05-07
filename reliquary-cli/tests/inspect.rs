@@ -243,7 +243,6 @@ fn inspect_single_episode_disc() {
         stdout.contains("MPLS 00100"),
         "should show playlist 00100: {stdout}"
     );
-    assert!(stdout.contains('*'), "should mark main title: {stdout}");
 }
 
 #[test]
@@ -267,10 +266,9 @@ fn inspect_multi_episode_disc() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "inspect should succeed: {stdout}");
-    // Play-all (3 items) should be main title
     assert!(
-        stdout.contains("MPLS 00001") && stdout.contains('*'),
-        "playlist 00001 should be main title: {stdout}"
+        stdout.contains("MPLS 00001"),
+        "should show play-all playlist 00001: {stdout}"
     );
     assert!(
         stdout.contains("MPLS 00020"),
@@ -304,7 +302,6 @@ fn inspect_json_output() {
         serde_json::from_str(&stdout).expect("output should be valid JSON");
 
     assert_eq!(json["format"], "bdmv", "format should be bdmv");
-    assert_eq!(json["main_title"], 100, "main_title should be 100");
     assert_eq!(
         json["playlists"][0]["number"], 100,
         "playlist number should be 100"
