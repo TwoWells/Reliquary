@@ -9,6 +9,7 @@
 pub mod aacs;
 pub mod clpi;
 pub mod mpls;
+pub mod ts;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -20,6 +21,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use super::reader::{DiscReader, ReaderError};
+use aacs::AacsError;
 use clpi::ClipInfo;
 use mpls::{PTS_CLOCK_HZ, Playlist};
 
@@ -53,6 +55,50 @@ pub struct PlaylistWarning {
     pub playlist: u32,
     /// Description of the error.
     pub message: String,
+}
+
+// ── Clip reading ───────────────────────────────────────────────────────
+
+/// Errors from reading a clip (decrypted or plaintext).
+#[derive(Debug, Error)]
+pub enum ClipReadError {
+    /// AACS decryption failed.
+    #[error(transparent)]
+    Aacs(#[from] AacsError),
+
+    /// File read failed.
+    #[error(transparent)]
+    Reader(#[from] ReaderError),
+}
+
+/// Reads an m2ts clip, decrypting if a VUK is provided.
+///
+/// When `vuk` is `Some`, attempts AACS decryption first. If the clip
+/// turns out to be unencrypted ([`AacsError::NotEncrypted`]) or no
+/// `Unit_Key_RO.inf` exists ([`AacsError::NoUnitKeyFile`]), falls back
+/// to a plain read. When `vuk` is `None`, reads the file directly.
+///
+/// # Errors
+///
+/// Returns [`ClipReadError`] if both decryption and plain read fail.
+pub fn read_clip(
+    reader: &DiscReader,
+    vuk: Option<&[u8; 16]>,
+    clip_id: &str,
+) -> Result<Vec<u8>, ClipReadError> {
+    if let Some(vuk) = vuk {
+        match aacs::decrypt_clip(reader, vuk, clip_id) {
+            Ok(data) => return Ok(data),
+            Err(AacsError::NotEncrypted { .. } | AacsError::NoUnitKeyFile) => {
+                // Fall through to plain read
+            }
+            Err(e) => return Err(ClipReadError::Aacs(e)),
+        }
+    }
+
+    let m2ts_path = format!("BDMV/STREAM/{clip_id}.m2ts");
+    let data = reader.read_file(std::path::Path::new(&m2ts_path))?;
+    Ok(data)
 }
 
 // ── Analysis types ──────────────────────────────────────────────────────
@@ -1342,5 +1388,95 @@ mod tests {
 
         let unreferenced = find_unreferenced_clips(&clips, &playlists);
         assert!(unreferenced.is_empty(), "all clips should be referenced");
+    }
+
+    // ── read_clip tests ─────────────────────────────────────────────
+
+    /// Sets up a temp disc directory with a plaintext m2ts clip.
+    fn setup_plaintext_disc(clip_id: &str, content: &[u8]) -> (tempfile::TempDir, DiscReader) {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let stream_dir = dir.path().join("BDMV").join("STREAM");
+        std::fs::create_dir_all(&stream_dir).expect("should create STREAM dir");
+        std::fs::write(stream_dir.join(format!("{clip_id}.m2ts")), content)
+            .expect("should write m2ts");
+        let reader = DiscReader::open(dir.path()).expect("should open disc");
+        (dir, reader)
+    }
+
+    #[test]
+    fn read_clip_no_vuk_reads_plaintext() {
+        let content = b"plaintext m2ts data";
+        let (_dir, reader) = setup_plaintext_disc("00100", content);
+
+        let result = read_clip(&reader, None, "00100").expect("should read clip");
+        assert_eq!(result, content, "should return plaintext content");
+    }
+
+    #[test]
+    fn read_clip_vuk_falls_back_when_no_unit_key_file() {
+        // Disc has no AACS/ directory — decrypt_clip returns NoUnitKeyFile,
+        // read_clip should fall back to plain read
+        let content = b"unencrypted disc data";
+        let (_dir, reader) = setup_plaintext_disc("00100", content);
+
+        let vuk = [0x42u8; 16];
+        let result =
+            read_clip(&reader, Some(&vuk), "00100").expect("should fall back to plain read");
+        assert_eq!(
+            result, content,
+            "should return plaintext content via fallback"
+        );
+    }
+
+    #[test]
+    fn read_clip_vuk_falls_back_when_not_encrypted() {
+        // Disc has AACS/Unit_Key_RO.inf but clip isn't encrypted —
+        // decrypt_clip returns NotEncrypted, read_clip should fall back
+        use aes::Aes128;
+        use cipher::{BlockEncrypt, KeyInit};
+
+        let vuk = [0x42u8; 16];
+        let plaintext_key = [0x77u8; 16];
+        let cipher = Aes128::new((&vuk).into());
+        let mut encrypted_uk = aes::Block::clone_from_slice(&plaintext_key);
+        cipher.encrypt_block(&mut encrypted_uk);
+        let mut stored_key = [0u8; 16];
+        stored_key.copy_from_slice(&encrypted_uk);
+
+        let uk_data = aacs::tests::UnitKeyBuilder::new()
+            .unit_key(stored_key)
+            .title(1)
+            .build();
+
+        // Unencrypted m2ts (no encryption flag set)
+        let mut m2ts = vec![0u8; 6144];
+        for i in 0..32 {
+            m2ts[i * 192 + 4] = 0x47;
+        }
+
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let aacs_dir = dir.path().join("AACS");
+        let stream_dir = dir.path().join("BDMV").join("STREAM");
+        std::fs::create_dir_all(&aacs_dir).expect("should create AACS dir");
+        std::fs::create_dir_all(&stream_dir).expect("should create STREAM dir");
+        std::fs::write(aacs_dir.join("Unit_Key_RO.inf"), &uk_data)
+            .expect("should write unit key file");
+        std::fs::write(stream_dir.join("00100.m2ts"), &m2ts).expect("should write m2ts");
+
+        let reader = DiscReader::open(dir.path()).expect("should open disc");
+        let result =
+            read_clip(&reader, Some(&vuk), "00100").expect("should fall back to plain read");
+        assert_eq!(result, m2ts, "should return plaintext content via fallback");
+    }
+
+    #[test]
+    fn read_clip_missing_file_returns_error() {
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let stream_dir = dir.path().join("BDMV").join("STREAM");
+        std::fs::create_dir_all(&stream_dir).expect("should create STREAM dir");
+        let reader = DiscReader::open(dir.path()).expect("should open disc");
+
+        let result = read_clip(&reader, None, "99999");
+        assert!(result.is_err(), "missing clip should return error");
     }
 }

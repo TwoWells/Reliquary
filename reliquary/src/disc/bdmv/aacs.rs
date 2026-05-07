@@ -303,7 +303,7 @@ fn verify_ts_sync(block: &[u8]) -> bool {
     clippy::expect_used,
     reason = "tests use expect() for assertions per project rules"
 )]
-mod tests {
+pub(crate) mod tests {
     use cbc::Encryptor as CbcEncryptor;
     use cipher::BlockEncryptMut;
 
@@ -312,7 +312,7 @@ mod tests {
     // ── Test helpers ───────────────────────────────────────────────────
 
     /// Builds a valid `Unit_Key_RO.inf` binary.
-    struct UnitKeyBuilder {
+    pub struct UnitKeyBuilder {
         keys: Vec<[u8; 16]>,
         first_play_unit: u16,
         top_menu_unit: u16,
@@ -320,7 +320,7 @@ mod tests {
     }
 
     impl UnitKeyBuilder {
-        fn new() -> Self {
+        pub fn new() -> Self {
             Self {
                 keys: Vec::new(),
                 first_play_unit: 1,
@@ -329,22 +329,22 @@ mod tests {
             }
         }
 
-        fn unit_key(mut self, key: [u8; 16]) -> Self {
+        pub fn unit_key(mut self, key: [u8; 16]) -> Self {
             self.keys.push(key);
             self
         }
 
-        fn first_play(mut self, unit: u16) -> Self {
+        pub fn first_play(mut self, unit: u16) -> Self {
             self.first_play_unit = unit;
             self
         }
 
-        fn top_menu(mut self, unit: u16) -> Self {
+        pub fn top_menu(mut self, unit: u16) -> Self {
             self.top_menu_unit = unit;
             self
         }
 
-        fn title(mut self, cps_unit: u16) -> Self {
+        pub fn title(mut self, cps_unit: u16) -> Self {
             self.title_units.push(cps_unit);
             self
         }
@@ -353,7 +353,7 @@ mod tests {
             clippy::cast_possible_truncation,
             reason = "test builder — values are always small"
         )]
-        fn build(&self) -> Vec<u8> {
+        pub fn build(&self) -> Vec<u8> {
             // Title mapping section size
             let title_section_size = 6 + self.title_units.len() * 4;
             // uk_pos is after: 20-byte header + title mapping section
