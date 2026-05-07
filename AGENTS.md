@@ -22,6 +22,17 @@ Rust workspace. The library crate produces data. CLI/TUI/web crates own presenta
 - **Formatting:** Code must be formatted with `rustfmt`.
 - **Linting:** Must pass `cargo clippy` with `pedantic`, `nursery`, and `cargo` groups enabled. Every `#[allow(...)]` must include a `reason` string.
 
+## Commit Convention
+- **Format:** [Conventional Commits](https://www.conventionalcommits.org/) (enforced by commit-msg hook).
+- **Pattern:** `type(scope): description` or `type: description`
+- **Types:** `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`
+- **Breaking changes:** append `!` before colon, e.g. `feat(api)!: remove legacy endpoint`
+- **Examples:**
+  - `feat(aacs): add AACS decryption module`
+  - `fix(cli): correct VUK hex parsing`
+  - `test(clpi): add multi-program parser test`
+  - `chore: bump version to 0.2.0`
+
 ## Quality Standards
 - **License Compliance:** All new dependencies MUST have permissive licenses (MIT, Apache-2.0, etc.) as specified in `@./deny.toml`. Reliquary is dual-licensed under AGPL-3.0-or-later and a commercial license.
 - **Copyright Headers:** Every `.rs` file must start with the SPDX header (enforced by pre-commit hook):
