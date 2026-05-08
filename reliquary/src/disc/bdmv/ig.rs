@@ -119,17 +119,48 @@ pub struct Button {
 }
 
 /// An HDMV navigation command on a button.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// Instruction encoding from libbluray `hdmv_insn.h` / `mobj_parse.c`:
+/// - bits 31-29: `op_cnt` (3 bits)
+/// - bits 28-27: `grp` (2 bits) — 0=BRANCH, 1=CMP, 2=SET
+/// - bits 26-24: `sub_grp` (3 bits)
+/// - bit 23: `imm_op1` (destination operand is immediate)
+/// - bit 22: `imm_op2` (source operand is immediate)
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavigationCommand {
-    /// Play a playlist (the mapping we care about).
+    /// Play a playlist — `grp=0` (BRANCH), `sub_grp=2` (PLAY).
+    ///
+    /// Playlist number from the destination operand.
     PlayPl {
         /// Playlist number (e.g. 203 → `00203.mpls`).
         playlist: u16,
     },
-    /// Any other command (opaque, not parsed further).
+    /// Set a general-purpose register — `grp=2` (SET), `sub_grp=0`.
+    ///
+    /// Only emitted when `imm_op2=1` (source is an immediate value).
+    /// Register-to-register moves fall through to [`Other`](Self::Other).
+    SetGpr {
+        /// GPR index (destination operand).
+        register: u32,
+        /// Immediate value to store (source operand).
+        value: u32,
+    },
+    /// Jump to a movie object — `grp=0` (BRANCH), `sub_grp=1` (JUMP).
+    ///
+    /// Only emitted when `imm_op1=1` (destination is an immediate object
+    /// index). Register-based jumps fall through to [`Other`](Self::Other).
+    GotoMobj {
+        /// Movie object index (0-based).
+        object_id: u32,
+    },
+    /// Any command not decoded into a typed variant.
     Other {
-        /// Raw opcode word.
+        /// Raw instruction word (opcode + flags).
         opcode: u32,
+        /// Raw destination operand.
+        dst: u32,
+        /// Raw source operand.
+        src: u32,
     },
 }
 
@@ -639,29 +670,47 @@ fn parse_button(r: &mut Cursor<'_>) -> Result<Button, IgError> {
 /// - Bytes 4-7: destination operand
 /// - Bytes 8-11: source operand
 ///
-/// `PlayPL`: `group=0x2`, `sub_group=0x1`. The playlist number is in the
-/// source operand (bytes 8-11).
+/// Instruction word layout (from libbluray `hdmv_insn.h` / `mobj_parse.c`):
+/// - bits 31-29: `op_cnt` (3 bits)
+/// - bits 28-27: `grp` (2 bits) — 0=BRANCH, 1=CMP, 2=SET
+/// - bits 26-24: `sub_grp` (3 bits)
+/// - bit 23: `imm_op1` (destination operand is immediate)
+/// - bit 22: `imm_op2` (source operand is immediate)
+/// - bits 21-18: `branch_opt` (4 bits)
+/// - bits 15-12: `cmp_opt` (4 bits)
+/// - bits 7-4: `set_opt` (4 bits)
 fn parse_navigation_command(r: &mut Cursor<'_>) -> Result<NavigationCommand, IgError> {
     let insn = r.read_u32()?;
-    let _dst = r.read_u32()?;
+    let dst = r.read_u32()?;
     let src = r.read_u32()?;
 
-    // Instruction word layout:
-    //   bits 31-28: group
-    //   bits 27-24: sub_group
-    let group = (insn >> 28) & 0x0F;
-    let sub_group = (insn >> 24) & 0x0F;
+    let grp = (insn >> 27) & 0x03;
+    let sub_grp = (insn >> 24) & 0x07;
+    let imm_op1 = (insn >> 23) & 1 != 0;
+    let imm_op2 = (insn >> 22) & 1 != 0;
 
-    if group == 0x02 && sub_group == 0x01 {
-        // PlayPL — playlist number from source operand (low 16 bits)
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "playlist numbers are u16 values"
-        )]
-        let playlist = (src & 0xFFFF) as u16;
-        Ok(NavigationCommand::PlayPl { playlist })
-    } else {
-        Ok(NavigationCommand::Other { opcode: insn })
+    match (grp, sub_grp) {
+        // BRANCH group, PLAY sub-group — PlayPL
+        (0, 2) => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "playlist numbers are u16 values"
+            )]
+            let playlist = (dst & 0xFFFF) as u16;
+            Ok(NavigationCommand::PlayPl { playlist })
+        }
+        // BRANCH group, JUMP sub-group — jump to movie object
+        (0, 1) if imm_op1 => Ok(NavigationCommand::GotoMobj { object_id: dst }),
+        // SET group, basic set — SetGPR (only immediate values)
+        (2, 0) if imm_op2 => Ok(NavigationCommand::SetGpr {
+            register: dst,
+            value: src,
+        }),
+        _ => Ok(NavigationCommand::Other {
+            opcode: insn,
+            dst,
+            src,
+        }),
     }
 }
 
@@ -853,6 +902,10 @@ pub(crate) mod tests {
     pub(crate) enum CommandSpec {
         /// `PlayPL` command with a playlist number.
         PlayPl(u16),
+        /// `SetGPR` command — set register to immediate value.
+        SetGpr(u32, u32),
+        /// `GotoMobj` command — jump to movie object by index.
+        GotoMobj(u32),
         /// Some other command with an arbitrary opcode.
         Other(u32),
     }
@@ -928,18 +981,38 @@ pub(crate) mod tests {
     }
 
     fn build_command(buf: &mut Vec<u8>, cmd: &CommandSpec) {
+        // Instruction word layout (libbluray hdmv_insn.h / mobj_parse.c):
+        //   bits 31-29: op_cnt  (3 bits)
+        //   bits 28-27: grp     (2 bits) — 0=BRANCH, 1=CMP, 2=SET
+        //   bits 26-24: sub_grp (3 bits)
+        //   bit 23:     imm_op1 (dst is immediate)
+        //   bit 22:     imm_op2 (src is immediate)
         match cmd {
             CommandSpec::PlayPl(playlist) => {
-                // group=0x2, sub_group=0x1 → insn = 0x2100_0000
-                // plus operand count bits: we need imm operand mode
-                // From hdmv_insn.h: PlayPL uses branch group (0x2), sub=0x1
-                // op_cnt=1 (one source operand)
-                // bit layout: group(4) sub(4) op_cnt(3) ...
-                // Full instruction: 0x2110_0000 (group=2, sub=1, op_cnt=1, imm=1)
-                let insn: u32 = 0x2110_0000;
+                // BRANCH group (grp=0), PLAY sub-group (sub_grp=2), op_cnt=1, imm_op1=1
+                // byte 0: 001_00_010 = 0x22
+                // byte 1: 1_0_000000 = 0x80
+                let insn: u32 = 0x2280_0000;
                 buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&0u32.to_be_bytes()); // dst
-                buf.extend_from_slice(&u32::from(*playlist).to_be_bytes()); // src
+                buf.extend_from_slice(&u32::from(*playlist).to_be_bytes()); // dst = playlist
+                buf.extend_from_slice(&0u32.to_be_bytes()); // src unused
+            }
+            CommandSpec::SetGpr(register, value) => {
+                // SET group (grp=2), sub_grp=0, op_cnt=2, imm_op1=0, imm_op2=1,
+                // set_opt=0 (move)
+                let insn: u32 = 0x5040_0000;
+                buf.extend_from_slice(&insn.to_be_bytes());
+                buf.extend_from_slice(&register.to_be_bytes()); // dst = GPR index
+                buf.extend_from_slice(&value.to_be_bytes()); // src = immediate value
+            }
+            CommandSpec::GotoMobj(object_id) => {
+                // BRANCH group (grp=0), JUMP sub-group (sub_grp=1), op_cnt=1, imm_op1=1
+                // byte 0: 001_00_001 = 0x21
+                // byte 1: 1_0_000000 = 0x80
+                let insn: u32 = 0x2180_0000;
+                buf.extend_from_slice(&insn.to_be_bytes());
+                buf.extend_from_slice(&object_id.to_be_bytes()); // dst = MOBJ index
+                buf.extend_from_slice(&0u32.to_be_bytes()); // src unused
             }
             CommandSpec::Other(opcode) => {
                 buf.extend_from_slice(&opcode.to_be_bytes());
@@ -1171,7 +1244,8 @@ pub(crate) mod tests {
 
     #[test]
     fn button_with_non_play_pl_commands() {
-        let other_opcode: u32 = 0x1000_0000; // some non-PlayPL opcode
+        // grp=0 (BRANCH), sub_grp=0 (GOTO), op_cnt=0 — no typed variant
+        let other_opcode: u32 = 0x0000_0000;
         let data = IgBuilder::new()
             .composition(
                 1920,
@@ -1196,9 +1270,48 @@ pub(crate) mod tests {
         assert_eq!(
             button.commands,
             vec![NavigationCommand::Other {
-                opcode: other_opcode
+                opcode: other_opcode,
+                dst: 0,
+                src: 0,
             }],
             "command wrapped as Other"
+        );
+    }
+
+    #[test]
+    fn button_with_set_gpr_and_goto_mobj() {
+        let data = IgBuilder::new()
+            .composition(
+                1920,
+                1080,
+                &[PageSpec {
+                    page_id: 0,
+                    buttons: vec![ButtonSpec {
+                        button_id: 7,
+                        x: 100,
+                        y: 200,
+                        normal_object_id: 0,
+                        selected_object_id: 1,
+                        commands: vec![CommandSpec::SetGpr(0, 5), CommandSpec::GotoMobj(2)],
+                    }],
+                }],
+            )
+            .end_of_display()
+            .build();
+
+        let stream = parse(&data).expect("should parse SetGpr + GotoMobj");
+        let button = &stream.display_sets[0].compositions[0].pages[0].buttons[0];
+        assert_eq!(button.button_id, 7, "button id");
+        assert_eq!(
+            button.commands,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 0,
+                    value: 5,
+                },
+                NavigationCommand::GotoMobj { object_id: 2 },
+            ],
+            "SetGpr + GotoMobj commands"
         );
     }
 

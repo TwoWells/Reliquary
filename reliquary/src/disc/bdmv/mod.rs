@@ -11,6 +11,7 @@ pub mod clpi;
 pub mod cursor;
 pub mod ig;
 pub mod keydb;
+pub mod mobj;
 pub mod mpls;
 pub mod rle;
 pub mod ts;

@@ -344,8 +344,8 @@ fn resolve_vuk_for_identify(
 /// Extracts all buttons with decoded bitmaps from IG clips.
 ///
 /// Runs the full pipeline for each IG clip: read → demux → parse PES →
-/// parse IG segments → decode RLE bitmaps. Returns all buttons with their
-/// bitmaps and optional `PlayPl` playlist targets.
+/// parse IG segments → decode RLE bitmaps. Then resolves indirect
+/// button→playlist mappings via `MovieObject.bdmv` tracing.
 #[allow(clippy::print_stderr, reason = "CLI warning output")]
 fn extract_buttons(
     reader: &reliquary::disc::reader::DiscReader,
@@ -354,7 +354,11 @@ fn extract_buttons(
 ) -> Result<Vec<ExtractedButton>, String> {
     use reliquary::disc::bdmv::{ig, read_clip, rle, ts};
 
+    use reliquary::disc::bdmv::mobj::PlayerContext;
+
     let mut buttons = Vec::new();
+    // Collect raw IG buttons with player context for MOBJ resolution
+    let mut ig_buttons: Vec<(ig::Button, PlayerContext)> = Vec::new();
 
     for ig_clip in &analysis.ig_clips {
         // Read clip (decrypting if VUK available)
@@ -436,13 +440,98 @@ fn extract_buttons(
                             height: bitmap.height,
                             rgba: bitmap.data,
                         });
+
+                        // Clone the IG button for MOBJ resolution (only if
+                        // no direct PlayPl — avoids unnecessary cloning)
+                        if playlist.is_none() {
+                            ig_buttons.push((
+                                ig::Button {
+                                    button_id: button.button_id,
+                                    x: button.x,
+                                    y: button.y,
+                                    normal_object_id: button.normal_object_id,
+                                    selected_object_id: button.selected_object_id,
+                                    commands: button.commands.clone(),
+                                },
+                                PlayerContext {
+                                    ig_stream: ig_pid,
+                                    page_id: page.page_id,
+                                },
+                            ));
+                        }
                     }
                 }
             }
         }
     }
 
+    // Resolve indirect button → playlist mappings via MovieObject.bdmv
+    if !ig_buttons.is_empty() {
+        let valid_playlists: HashSet<u32> = analysis.playlists.iter().map(|p| p.number).collect();
+        resolve_mobj_buttons(reader, &ig_buttons, &mut buttons, &valid_playlists);
+    }
+
     Ok(buttons)
+}
+
+/// Resolves indirect button→playlist mappings via `MovieObject.bdmv`.
+///
+/// Reads and parses the MOBJ file, runs the resolver, and fills in
+/// `playlist` fields on `ExtractedButton`s that were `None`.
+#[allow(clippy::print_stderr, reason = "CLI status output")]
+fn resolve_mobj_buttons(
+    reader: &reliquary::disc::reader::DiscReader,
+    ig_buttons: &[(
+        reliquary::disc::bdmv::ig::Button,
+        reliquary::disc::bdmv::mobj::PlayerContext,
+    )],
+    buttons: &mut [ExtractedButton],
+    valid_playlists: &HashSet<u32>,
+) {
+    use reliquary::disc::bdmv::mobj;
+
+    // Try both paths for MovieObject.bdmv
+    let mobj_path = std::path::Path::new("BDMV/MovieObject.bdmv");
+    let mobj_alt = std::path::Path::new("MovieObject.bdmv");
+
+    let mobj_data = match reader.read_file(mobj_path) {
+        Ok(data) => data,
+        Err(_) => {
+            if let Ok(data) = reader.read_file(mobj_alt) {
+                data
+            } else {
+                eprintln!("warning: MovieObject.bdmv not found — skipping MOBJ resolution");
+                return;
+            }
+        }
+    };
+
+    let mobj_file = match mobj::parse(&mobj_data) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("warning: failed to parse MovieObject.bdmv: {e}");
+            return;
+        }
+    };
+
+    let resolved = mobj::resolve_buttons(ig_buttons, &mobj_file, valid_playlists);
+
+    if !resolved.is_empty() {
+        eprintln!(
+            "resolved {} button playlist mappings via MovieObject.bdmv",
+            resolved.len()
+        );
+    }
+
+    // Fill in resolved playlists on the extracted buttons
+    for rb in &resolved {
+        if let Some(eb) = buttons
+            .iter_mut()
+            .find(|b| b.button_id == rb.button_id && b.playlist.is_none())
+        {
+            eb.playlist = Some(rb.playlist);
+        }
+    }
 }
 
 /// Presents content buttons (with `PlayPl`) and prompts for names.

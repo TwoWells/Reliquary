@@ -343,9 +343,10 @@ fn build_composition_body(playlists: &[u16]) -> Vec<u8> {
         // Commands
         body.extend_from_slice(&1u16.to_be_bytes()); // num_commands=1
         // PlayPl command (12 bytes)
-        body.extend_from_slice(&0x2100_0000u32.to_be_bytes()); // insn: group=2, sub_group=1
-        body.extend_from_slice(&0u32.to_be_bytes()); // dst
-        body.extend_from_slice(&u32::from(playlist).to_be_bytes()); // src: playlist number
+        // grp=0 (BRANCH), sub_grp=2 (PLAY), op_cnt=1, imm_op1=1
+        body.extend_from_slice(&0x2280_0000u32.to_be_bytes()); // insn
+        body.extend_from_slice(&u32::from(playlist).to_be_bytes()); // dst: playlist number
+        body.extend_from_slice(&0u32.to_be_bytes()); // src: unused
     }
 
     body
