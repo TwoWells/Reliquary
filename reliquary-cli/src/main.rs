@@ -552,8 +552,25 @@ fn resolve_mobj_buttons(
         );
     }
 
-    let resolved =
-        mobj::resolve_buttons(ig_buttons, &mobj_file, valid_playlists, &dispatch_entries);
+    // Extract dispatch table from central dispatch MOBJ (SET_BUTTON_PAGE pattern)
+    let dispatch_table = mobj::extract_dispatch_table(&mobj_file);
+
+    if let Some(ref table) = dispatch_table {
+        eprintln!(
+            "extracted dispatch table from MOBJ[{}]: {} cases on GPR[{}]",
+            table.mobj_index,
+            table.cases.len(),
+            table.dispatch_register
+        );
+    }
+
+    let resolved = mobj::resolve_buttons(
+        ig_buttons,
+        &mobj_file,
+        valid_playlists,
+        &dispatch_entries,
+        dispatch_table.as_ref(),
+    );
 
     if !resolved.is_empty() {
         eprintln!(
@@ -776,24 +793,47 @@ fn trace_mobj_structure(
                 // Show 5 instructions before and after for context
                 let start = pc.saturating_sub(5);
                 let end = instrs.len().min(pc + 6);
-                for ctx_pc in start..end {
-                    let ci = &instrs[ctx_pc];
+                for (ctx_pc, ci) in instrs.iter().enumerate().take(end).skip(start) {
                     let desc = match (ci.group, ci.sub_group) {
                         (2, 0) => {
                             let op = match ci.set_opt {
-                                0 => "=", 8 => "&=", 9 => "|=", 0xA => "^=", _ => "?=",
+                                0 => "=",
+                                8 => "&=",
+                                9 => "|=",
+                                0xA => "^=",
+                                _ => "?=",
                             };
-                            let s = if ci.imm_op2 { format!("{}", ci.src) } else if ci.src >= 0x8000_0000 { format!("PSR[{}]", ci.src & 0x7FFF_FFFF) } else { format!("GPR[{}]", ci.src) };
+                            let s = if ci.imm_op2 {
+                                format!("{}", ci.src)
+                            } else if ci.src >= 0x8000_0000 {
+                                format!("PSR[{}]", ci.src & 0x7FFF_FFFF)
+                            } else {
+                                format!("GPR[{}]", ci.src)
+                            };
                             format!("SET GPR[{}] {op} {s}", ci.dst)
                         }
                         (1, _) => {
-                            let d = if ci.imm_op1 { format!("{}", ci.dst) } else { format!("GPR[{}]", ci.dst) };
-                            let s = if ci.imm_op2 { format!("{}", ci.src) } else { format!("GPR[{}]", ci.src) };
+                            let d = if ci.imm_op1 {
+                                format!("{}", ci.dst)
+                            } else {
+                                format!("GPR[{}]", ci.dst)
+                            };
+                            let s = if ci.imm_op2 {
+                                format!("{}", ci.src)
+                            } else {
+                                format!("GPR[{}]", ci.src)
+                            };
                             format!("CMP {d} ?? {s}")
                         }
                         (0, 0) => format!("GOTO(opt={}) → {}", ci.branch_opt, ci.dst),
                         (0, 1) => format!("JUMP → MOBJ[{}]", ci.dst),
-                        (0, 2) => if ci.imm_op1 { format!("PlayPl({})", ci.dst) } else { format!("PlayPl(GPR[{}])", ci.dst) },
+                        (0, 2) => {
+                            if ci.imm_op1 {
+                                format!("PlayPl({})", ci.dst)
+                            } else {
+                                format!("PlayPl(GPR[{}])", ci.dst)
+                            }
+                        }
                         _ => format!("grp={} sub={}", ci.group, ci.sub_group),
                     };
                     let marker = if ctx_pc == pc { " ★" } else { "" };
@@ -873,21 +913,22 @@ fn trace_mobj_structure(
                         let dst_val = gprs.get(&dst_reg).copied().unwrap_or(0);
 
                         let result = match insn.set_opt {
-                            0x01 => Some(src_val),                          // MOVE
-                            0x02 => {                                       // SWAP
+                            0x01 => Some(src_val), // MOVE
+                            0x02 => {
+                                // SWAP
                                 gprs.insert(insn.src, dst_val);
                                 Some(src_val)
                             }
-                            0x03 => Some(dst_val.wrapping_add(src_val)),    // ADD
-                            0x04 => Some(dst_val.wrapping_sub(src_val)),    // SUB
-                            0x05 => Some(dst_val.wrapping_mul(src_val)),    // MUL
-                            0x09 => Some(dst_val & src_val),                // AND
-                            0x0A => Some(dst_val | src_val),                // OR
-                            0x0B => Some(dst_val ^ src_val),                // XOR
-                            0x0C => Some(dst_val | (1 << src_val)),         // BITSET
-                            0x0D => Some(dst_val & !(1 << src_val)),        // BITCLR
-                            0x0E => Some(dst_val << src_val),               // SHL
-                            0x0F => Some(dst_val >> src_val),               // SHR
+                            0x03 => Some(dst_val.wrapping_add(src_val)), // ADD
+                            0x04 => Some(dst_val.wrapping_sub(src_val)), // SUB
+                            0x05 => Some(dst_val.wrapping_mul(src_val)), // MUL
+                            0x09 => Some(dst_val & src_val),             // AND
+                            0x0A => Some(dst_val | src_val),             // OR
+                            0x0B => Some(dst_val ^ src_val),             // XOR
+                            0x0C => Some(dst_val | (1 << src_val)),      // BITSET
+                            0x0D => Some(dst_val & !(1 << src_val)),     // BITCLR
+                            0x0E => Some(dst_val << src_val),            // SHL
+                            0x0F => Some(dst_val >> src_val),            // SHR
                             _ => None,
                         };
 
@@ -898,7 +939,10 @@ fn trace_mobj_structure(
                                 format!("GPR[{dst_reg}]")
                             };
                             let op = match insn.set_opt {
-                                1 => "=", 9 => "&=", 0xA => "|=", 0xB => "^=",
+                                1 => "=",
+                                9 => "&=",
+                                0xA => "|=",
+                                0xB => "^=",
                                 _ => "?=",
                             };
                             let src_desc = if insn.imm_op2 {
@@ -920,17 +964,14 @@ fn trace_mobj_structure(
 
                             // Highlight GPR[3002] writes
                             let marker = if dst_reg == 3002 { " ★★★" } else { "" };
-                            eprintln!(
-                                "  [{old_pc:4}] {reg_name} {op} {src_desc} → {val}{marker}"
-                            );
+                            eprintln!("  [{old_pc:4}] {reg_name} {op} {src_desc} → {val}{marker}");
                         } else {
                             eprintln!("  [{old_pc:4}] SET(opt={}) GPR[{}]", insn.set_opt, dst_reg);
                         }
-                        pc += 1;
                     } else {
                         eprintln!("  [{old_pc:4}] SET sub={}", insn.sub_group);
-                        pc += 1;
                     }
+                    pc += 1;
                 }
                 1 => {
                     // CMP — skip next instruction if condition is false
@@ -953,9 +994,7 @@ fn trace_mobj_structure(
                         7 => dst_val < src_val,
                         _ => false,
                     };
-                    eprintln!(
-                        "  [{old_pc:4}] CMP {dst_val} vs {src_val} → {condition}"
-                    );
+                    eprintln!("  [{old_pc:4}] CMP {dst_val} vs {src_val} → {condition}");
                     if condition {
                         pc += 1;
                     } else {
@@ -975,9 +1014,7 @@ fn trace_mobj_structure(
                                     } else {
                                         gprs.get(&insn.dst).copied().unwrap_or(0) as usize
                                     };
-                                    eprintln!(
-                                        "  [{old_pc:4}] GOTO → {target} (taken)"
-                                    );
+                                    eprintln!("  [{old_pc:4}] GOTO → {target} (taken)");
                                     pc = target;
                                 }
                                 0x02 => {
@@ -997,9 +1034,7 @@ fn trace_mobj_structure(
                             } else {
                                 gprs.get(&insn.dst).copied().unwrap_or(0)
                             };
-                            eprintln!(
-                                "  [{old_pc:4}] PlayPl({pl}) — stopping trace"
-                            );
+                            eprintln!("  [{old_pc:4}] PlayPl({pl}) — stopping trace");
                             break;
                         }
                         _ => {
@@ -1016,10 +1051,7 @@ fn trace_mobj_structure(
         if steps >= max_steps {
             eprintln!("  (trace limit reached at pc={pc})");
         }
-        eprintln!(
-            "  GPR[3002] = {}",
-            gprs.get(&3002).copied().unwrap_or(0)
-        );
+        eprintln!("  GPR[3002] = {}", gprs.get(&3002).copied().unwrap_or(0));
         eprintln!("--- END VM TRACE ---");
     }
 
@@ -1078,17 +1110,39 @@ fn trace_mobj_structure(
                             7 => "POPUP_OFF",
                             _ => "?",
                         };
-                        let d = if imm1 { format!("{dst}") } else { format!("GPR[{dst}]") };
-                        let s = if imm2 { format!("{src}") } else { format!("GPR[{src}]") };
+                        let d = if imm1 {
+                            format!("{dst}")
+                        } else {
+                            format!("GPR[{dst}]")
+                        };
+                        let s = if imm2 {
+                            format!("{src}")
+                        } else {
+                            format!("GPR[{src}]")
+                        };
                         format!("SETSYSTEM({op}/{set_opt}, {d}, {s})")
                     } else if grp == 2 && sub == 0 {
                         // SET (non-immediate, not parsed as SetGpr)
                         let op = match set_opt {
-                            1 => "=", 2 => "<=>", 3 => "+=", 4 => "-=",
-                            9 => "&=", 0xA => "|=", 0xB => "^=", _ => "?=",
+                            1 => "=",
+                            2 => "<=>",
+                            3 => "+=",
+                            4 => "-=",
+                            9 => "&=",
+                            0xA => "|=",
+                            0xB => "^=",
+                            _ => "?=",
                         };
-                        let d = if imm1 { format!("{dst}") } else { format!("GPR[{dst}]") };
-                        let s = if imm2 { format!("{src}") } else { format!("GPR[{src}]") };
+                        let d = if imm1 {
+                            format!("{dst}")
+                        } else {
+                            format!("GPR[{dst}]")
+                        };
+                        let s = if imm2 {
+                            format!("{src}")
+                        } else {
+                            format!("GPR[{src}]")
+                        };
                         format!("SET {d} {op} {s}")
                     } else {
                         format!("Other(grp={grp},sub={sub},dst={dst},src={src})")
