@@ -116,6 +116,12 @@ pub struct BdmvAnalysis {
     /// Clips with IG streams (menu clips for `identify`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ig_clips: Vec<IgClip>,
+    /// Playlist numbers that reference IG clips (menu playlists).
+    ///
+    /// Used for GPR dispatch resolution — these are the playlists played
+    /// by MOBJs before suspending for button input.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub menu_playlists: Vec<u32>,
     /// Clips not referenced by any playlist.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unreferenced_clips: Vec<UnreferencedClip>,
@@ -422,10 +428,14 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
         Path::new("BDMV").join("PLAYLIST")
     };
 
-    let (mut playlists, warnings) = read_playlists(reader, &playlist_dir)?;
+    let (all_playlists, warnings) = read_playlists(reader, &playlist_dir)?;
 
-    // Filter looping menus
-    playlists.retain(|pl| !is_looping(pl));
+    // Filter looping menus for content analysis
+    let playlists: Vec<Playlist> = all_playlists
+        .iter()
+        .filter(|pl| !is_looping(pl))
+        .cloned()
+        .collect();
 
     // Deduplicate
     let mut playlists = dedup_playlists(&playlists);
@@ -462,9 +472,15 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
         },
     );
 
+    // Find menu playlists — playlists that reference IG clips.
+    // Uses all_playlists (before filtering) because menu playlists are
+    // typically the looping playlists that content filtering removes.
+    let menu_playlists = find_menu_playlists(&all_playlists, &ig_clips);
+
     Ok(BdmvAnalysis {
         playlists: analyzed,
         ig_clips,
+        menu_playlists,
         unreferenced_clips,
         warnings,
         clip_warnings,
@@ -608,6 +624,29 @@ fn identify_ig_clips(clips: &[ClipInfo]) -> Vec<IgClip> {
     }
 
     ig_clips
+}
+
+/// Finds playlist numbers that reference IG clips (menu playlists).
+///
+/// A menu playlist is one whose play items reference a clip that contains
+/// IG streams. These playlists are played by MOBJs before suspending for
+/// button input (`PlayPl` suspend/resume lifecycle).
+fn find_menu_playlists(playlists: &[Playlist], ig_clips: &[IgClip]) -> Vec<u32> {
+    let ig_clip_ids: HashSet<&str> = ig_clips.iter().map(|c| c.clip_id.as_str()).collect();
+
+    let mut menu_playlists: Vec<u32> = playlists
+        .iter()
+        .filter(|pl| {
+            pl.play_items
+                .iter()
+                .any(|item| ig_clip_ids.contains(item.clip_id.as_str()))
+        })
+        .map(|pl| pl.number)
+        .collect();
+
+    menu_playlists.sort_unstable();
+    menu_playlists.dedup();
+    menu_playlists
 }
 
 /// Finds clips not referenced by any MPLS playlist.
@@ -1230,6 +1269,7 @@ mod tests {
         let analysis = BdmvAnalysis {
             playlists: analyzed,
             ig_clips: Vec::new(),
+            menu_playlists: Vec::new(),
             unreferenced_clips: Vec::new(),
             warnings: Vec::new(),
             clip_warnings: Vec::new(),
@@ -1277,6 +1317,7 @@ mod tests {
         let analysis = BdmvAnalysis {
             playlists: analyzed,
             ig_clips: Vec::new(),
+            menu_playlists: Vec::new(),
             unreferenced_clips: Vec::new(),
             warnings: vec![PlaylistWarning {
                 playlist: 99,

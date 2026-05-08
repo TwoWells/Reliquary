@@ -108,6 +108,21 @@ pub struct ResolvedButton {
     pub playlist: u16,
 }
 
+/// A dispatch entry point found in an MOBJ for GPR dispatch resolution.
+///
+/// In the GPR dispatch pattern (Warner Bros. authoring), the MOBJ calls
+/// `PlayPl(menu_playlist)` which suspends the MOBJ. After a button is
+/// activated, the MOBJ resumes at `dispatch_pc` (the instruction after
+/// the menu `PlayPl`) and reads the button's GPR to dispatch to the
+/// correct content playlist.
+#[derive(Debug, Clone)]
+pub struct DispatchEntry {
+    /// Index of the MOBJ containing the dispatch logic.
+    pub mobj_index: usize,
+    /// Instruction index where dispatch resumes (pc+1 after the menu `PlayPl`).
+    pub dispatch_pc: usize,
+}
+
 // ── Instruction group constants ─────────────────────────────────────────
 
 /// BRANCH group — goto, jump to MOBJ, play playlist.
@@ -217,6 +232,55 @@ fn parse_instruction(r: &mut Cursor<'_>) -> Result<Instruction, MobjError> {
     })
 }
 
+// ── Dispatch entry detection ───────────────────────────────────────────
+
+/// Finds dispatch entry points for GPR dispatch resolution.
+///
+/// Scans all MOBJs for immediate `PlayPl` instructions whose operand
+/// matches a menu playlist number. The dispatch entry point is `pc + 1`
+/// — where the MOBJ resumes after the menu playlist completes and a
+/// button has been activated (`PlayPl` suspend/resume lifecycle).
+///
+/// For discs where IG clips aren't referenced by any MPLS playlist
+/// (e.g. Warner Bros. authoring), this returns empty and the resolver
+/// falls through to [`resolve_via_vm_probing`] which finds entry points
+/// per-button by probing register-based `PlayPl` locations.
+///
+/// Reference: libbluray `hdmv_vm.c` — `_suspend_for_play_pl` (line 440)
+/// saves the MOBJ and PC when `PlayPl` executes; `_resume_from_play_pl`
+/// (line 455) resumes at `playing_pc + 1`.
+#[must_use]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "only called from CLI with std HashMap"
+)]
+pub fn find_dispatch_entries(
+    mobj_file: &MovieObjectFile,
+    menu_playlists: &std::collections::HashSet<u32>,
+) -> Vec<DispatchEntry> {
+    let mut entries = Vec::new();
+
+    for (mobj_idx, mobj) in mobj_file.objects.iter().enumerate() {
+        for (pc, insn) in mobj.instructions.iter().enumerate() {
+            if insn.group == GRP_BRANCH
+                && insn.sub_group == BRANCH_PLAY
+                && insn.imm_op1
+                && menu_playlists.contains(&insn.dst)
+            {
+                let dispatch_pc = pc + 1;
+                if dispatch_pc < mobj.instructions.len() {
+                    entries.push(DispatchEntry {
+                        mobj_index: mobj_idx,
+                        dispatch_pc,
+                    });
+                }
+            }
+        }
+    }
+
+    entries
+}
+
 // ── Button resolver ─────────────────────────────────────────────────────
 
 /// Resolves button → playlist mappings by tracing through movie objects.
@@ -230,6 +294,12 @@ fn parse_instruction(r: &mut Cursor<'_>) -> Result<Instruction, MobjError> {
 /// GPR dispatch patterns, only playlist numbers in this set are accepted.
 /// Pass an empty set to accept any non-zero playlist number.
 ///
+/// `dispatch_entries` provides entry points for GPR dispatch resolution
+/// (from [`find_dispatch_entries`]). When non-empty, GPR dispatch buttons
+/// are resolved by executing the MOBJ from the dispatch entry point
+/// rather than from instruction 0. Pass an empty slice to use the
+/// fallback (execute from instruction 0).
+///
 /// Returns only the buttons that were successfully resolved. Buttons with
 /// direct `PlayPl`, missing commands, or unresolvable control flow are
 /// omitted.
@@ -242,6 +312,7 @@ pub fn resolve_buttons(
     buttons: &[(Button, PlayerContext)],
     mobj_file: &MovieObjectFile,
     valid_playlists: &std::collections::HashSet<u32>,
+    dispatch_entries: &[DispatchEntry],
 ) -> Vec<ResolvedButton> {
     let mut resolved = Vec::new();
 
@@ -255,7 +326,9 @@ pub fn resolve_buttons(
             continue;
         }
 
-        if let Some(playlist) = trace_button(button, mobj_file, valid_playlists, ctx) {
+        if let Some(playlist) =
+            trace_button(button, mobj_file, valid_playlists, ctx, dispatch_entries)
+        {
             resolved.push(ResolvedButton {
                 button_id: button.button_id,
                 playlist,
@@ -268,17 +341,20 @@ pub fn resolve_buttons(
 
 /// Traces a single button's commands through the movie object file.
 ///
-/// Two patterns:
+/// Three resolution strategies:
 /// 1. **`GotoMobj` pattern:** button has `SetGpr` + `GotoMobj` → look up
 ///    the target MOBJ and scan for matching `PlayPl`.
-/// 2. **GPR dispatch pattern:** button has `SetGpr` but no `GotoMobj` →
-///    run the mini-VM on candidate MOBJs with the button's register
-///    state.
+/// 2. **GPR dispatch via entry points:** button has `SetGpr` but no
+///    `GotoMobj`, and dispatch entries are available → execute the MOBJ
+///    from the dispatch entry point (`PlayPl` suspend/resume lifecycle).
+/// 3. **GPR dispatch fallback:** no dispatch entries → run the mini-VM
+///    on candidate MOBJs from instruction 0.
 fn trace_button(
     button: &Button,
     mobj_file: &MovieObjectFile,
     valid_playlists: &std::collections::HashSet<u32>,
     ctx: &PlayerContext,
+    dispatch_entries: &[DispatchEntry],
 ) -> Option<u16> {
     // Collect all SetGpr assignments and optional GotoMobj
     let mut gpr_assignments: Vec<(u32, u32)> = Vec::new();
@@ -308,9 +384,40 @@ fn trace_button(
         return resolve_in_mobj_static(mobj, register, value);
     }
 
-    // Pattern 2: GPR dispatch — button sets registers and returns.
-    // Try the mini-VM on each MOBJ that has a register-based PlayPl.
-    resolve_via_vm(mobj_file, &gpr_assignments, valid_playlists, ctx)
+    // Pattern 2: GPR dispatch via known entry points (PlayPl suspend/resume)
+    if let Some(result) = resolve_via_dispatch(
+        mobj_file,
+        &gpr_assignments,
+        valid_playlists,
+        ctx,
+        dispatch_entries,
+    ) {
+        return Some(result);
+    }
+
+    // Pattern 3: GPR dispatch via lifecycle simulation — execute from
+    // instruction 0 with PlayPl suspend/resume, comparing against a
+    // baseline to find the dispatch result.
+    if let Some(result) = resolve_via_lifecycle(mobj_file, &gpr_assignments, valid_playlists, ctx) {
+        return Some(result);
+    }
+
+    // Pattern 4: direct execution from instruction 0 — works for simple
+    // MOBJs without initialization that clobbers the dispatch register.
+    for mobj in &mobj_file.objects {
+        let instrs = &mobj.instructions;
+        let has_reg_play_pl = instrs
+            .iter()
+            .any(|i| i.group == GRP_BRANCH && i.sub_group == BRANCH_PLAY && !i.imm_op1);
+        if !has_reg_play_pl {
+            continue;
+        }
+        if let Some(playlist) = execute_from(instrs, 0, &gpr_assignments, valid_playlists, ctx) {
+            return Some(playlist);
+        }
+    }
+
+    None
 }
 
 /// Static resolution: scans a MOBJ for an immediate `PlayPl` matching
@@ -351,32 +458,32 @@ fn resolve_in_mobj_static(mobj: &MovieObject, register: u32, value: u32) -> Opti
     None
 }
 
-// ── Mini-VM for GPR dispatch resolution ─────────────────────────────────
+// ── GPR dispatch via entry points ──────────────────────────────────────
 
-/// Resolves a button's playlist by executing candidate MOBJs with the
-/// button's register state.
+/// Resolves a button's playlist using dispatch entry points.
 ///
-/// Finds MOBJs that contain register-based `PlayPl` instructions, seeds
-/// the VM with the button's `SetGpr` assignments, and executes each MOBJ
-/// until `PlayPl` is reached or the step limit is hit.
-fn resolve_via_vm(
+/// Executes the MOBJ from each dispatch entry point (the instruction
+/// after the menu `PlayPl`) with the button's register state. Returns
+/// the first valid playlist number reached.
+fn resolve_via_dispatch(
     mobj_file: &MovieObjectFile,
     gpr_assignments: &[(u32, u32)],
     valid_playlists: &std::collections::HashSet<u32>,
     ctx: &PlayerContext,
+    dispatch_entries: &[DispatchEntry],
 ) -> Option<u16> {
-    // Find candidate MOBJs: those with PlayPl(register) instructions
-    for mobj in &mobj_file.objects {
-        let has_reg_play_pl = mobj
-            .instructions
-            .iter()
-            .any(|i| i.group == GRP_BRANCH && i.sub_group == BRANCH_PLAY && !i.imm_op1);
-
-        if !has_reg_play_pl {
+    for entry in dispatch_entries {
+        let Some(mobj) = mobj_file.objects.get(entry.mobj_index) else {
             continue;
-        }
+        };
 
-        if let Some(playlist) = execute_mobj(mobj, gpr_assignments, valid_playlists, ctx) {
+        if let Some(playlist) = execute_from(
+            &mobj.instructions,
+            entry.dispatch_pc,
+            gpr_assignments,
+            valid_playlists,
+            ctx,
+        ) {
             return Some(playlist);
         }
     }
@@ -384,24 +491,126 @@ fn resolve_via_vm(
     None
 }
 
-/// Executes a movie object with the given initial register state.
+// ── Mini-VM for GPR dispatch resolution ─────────────────────────────────
+
+/// Resolves a button's playlist by simulating the `PlayPl` suspend/resume
+/// lifecycle and comparing against a baseline.
 ///
-/// A minimal HDMV interpreter supporting SET, CMP+GOTO, and `PlayPl`.
-/// Returns the playlist number if `PlayPl` is reached within the step
-/// limit, or `None` if execution falls through or times out.
-fn execute_mobj(
-    mobj: &MovieObject,
+/// Runs each candidate MOBJ twice: once with the button's GPR values,
+/// once without (baseline). Both simulate the suspend/resume lifecycle
+/// — on every `PlayPl`, GPR values are re-applied and execution
+/// continues. The first valid `PlayPl` where the button run diverges
+/// from the baseline is the dispatch result.
+fn resolve_via_lifecycle(
+    mobj_file: &MovieObjectFile,
     gpr_assignments: &[(u32, u32)],
     valid_playlists: &std::collections::HashSet<u32>,
     ctx: &PlayerContext,
 ) -> Option<u16> {
-    let instrs = &mobj.instructions;
-    if instrs.is_empty() {
-        return None;
+    for mobj in &mobj_file.objects {
+        let instrs = &mobj.instructions;
+
+        // Skip MOBJs without register-based PlayPl
+        let has_reg_play_pl = instrs
+            .iter()
+            .any(|i| i.group == GRP_BRANCH && i.sub_group == BRANCH_PLAY && !i.imm_op1);
+        if !has_reg_play_pl {
+            continue;
+        }
+
+        // Trace with button's GPR values
+        let with_button = trace_play_pls(instrs, gpr_assignments, valid_playlists, ctx);
+        // Trace with no button GPR values (baseline)
+        let baseline = trace_play_pls(instrs, &[], valid_playlists, ctx);
+
+        // Find first divergence — that's the dispatch result
+        for (btn_pl, base_pl) in with_button.iter().zip(baseline.iter()) {
+            if btn_pl != base_pl {
+                return Some(*btn_pl);
+            }
+        }
+
+        // No divergence — button trace has more entries than baseline
+        if with_button.len() > baseline.len() {
+            return with_button.get(baseline.len()).copied();
+        }
     }
 
-    // VM execution from instruction 0 with PSR context.
-    execute_from(instrs, 0, gpr_assignments, valid_playlists, ctx)
+    None
+}
+
+/// Traces all valid `PlayPl` playlists encountered during lifecycle
+/// simulation of an MOBJ.
+///
+/// On every `PlayPl`, the provided GPR assignments are re-applied
+/// (simulating button activation during a suspended playlist) and
+/// execution continues. Returns the ordered list of valid playlist
+/// numbers encountered.
+fn trace_play_pls(
+    instrs: &[Instruction],
+    gpr_assignments: &[(u32, u32)],
+    valid_playlists: &std::collections::HashSet<u32>,
+    ctx: &PlayerContext,
+) -> Vec<u16> {
+    let mut gprs = std::collections::HashMap::<u32, u32>::new();
+    for &(reg, val) in gpr_assignments {
+        gprs.insert(reg, val);
+    }
+    gprs.insert(PSR_FLAG, u32::from(ctx.ig_stream));
+    gprs.insert(PSR_FLAG | 0x0A, u32::from(ctx.page_id));
+
+    let mut pc: usize = 0;
+    let mut cmp_flag = false;
+    let mut steps: u32 = 0;
+    let mut playlists = Vec::new();
+
+    while pc < instrs.len() && steps < VM_STEP_LIMIT {
+        steps += 1;
+        let insn = &instrs[pc];
+
+        match insn.group {
+            GRP_SET => {
+                execute_set(insn, &mut gprs);
+                pc += 1;
+            }
+            GRP_CMP => {
+                cmp_flag = execute_cmp(insn, &gprs);
+                pc += 1;
+            }
+            GRP_BRANCH => match insn.sub_group {
+                BRANCH_PLAY => {
+                    let playlist = fetch_operand(insn.imm_op1, insn.dst, &gprs);
+                    let is_valid = playlist != 0
+                        && playlist != 0xFFFF
+                        && (valid_playlists.is_empty() || valid_playlists.contains(&playlist));
+                    if is_valid {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            reason = "playlist numbers are u16 values"
+                        )]
+                        playlists.push((playlist & 0xFFFF) as u16);
+                    }
+                    for &(reg, val) in gpr_assignments {
+                        gprs.insert(reg, val);
+                    }
+                    pc += 1;
+                }
+                BRANCH_GOTO => {
+                    if !execute_goto(insn, cmp_flag, &mut pc) {
+                        pc += 1;
+                    }
+                }
+                _ => {
+                    pc += 1;
+                }
+            },
+            _ => {
+                pc += 1;
+            }
+        }
+    }
+
+    playlists
 }
 
 /// Executes MOBJ instructions starting at `start_pc` with the given
@@ -961,6 +1170,7 @@ mod tests {
             &[(button, PlayerContext::default())],
             &mobj_file,
             &std::collections::HashSet::new(),
+            &[],
         );
         assert_eq!(resolved.len(), 1, "one button resolved");
         assert_eq!(resolved[0].button_id, 7, "button id");
@@ -999,6 +1209,7 @@ mod tests {
             &[(button, PlayerContext::default())],
             &mobj_file,
             &std::collections::HashSet::new(),
+            &[],
         );
         assert_eq!(resolved.len(), 1, "one button resolved");
         assert_eq!(resolved[0].playlist, 205, "resolved to playlist 205");
@@ -1015,6 +1226,7 @@ mod tests {
             &[(button, PlayerContext::default())],
             &mobj_file,
             &std::collections::HashSet::new(),
+            &[],
         );
         assert!(resolved.is_empty(), "direct PlayPl button skipped");
     }
@@ -1041,6 +1253,7 @@ mod tests {
             &[(button, PlayerContext::default())],
             &mobj_file,
             &std::collections::HashSet::new(),
+            &[],
         );
         assert!(resolved.is_empty(), "unresolvable button not in output");
     }
@@ -1102,6 +1315,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             &mobj_file,
             &std::collections::HashSet::new(),
+            &[],
         );
         assert_eq!(resolved.len(), 3, "all three buttons resolved");
 
@@ -1136,6 +1350,7 @@ mod tests {
             &[(button, PlayerContext::default())],
             &mobj_file,
             &std::collections::HashSet::new(),
+            &[],
         );
         assert_eq!(resolved.len(), 1, "resolved via unconditional fallback");
         assert_eq!(resolved[0].playlist, 500, "playlist 500");
@@ -1161,6 +1376,7 @@ mod tests {
             &[(button, PlayerContext::default())],
             &mobj_file,
             &std::collections::HashSet::new(),
+            &[],
         );
         assert!(resolved.is_empty(), "out-of-bounds MOBJ not resolved");
     }
@@ -1207,6 +1423,7 @@ mod tests {
             &[(button, PlayerContext::default())],
             &mobj_file,
             &std::collections::HashSet::new(),
+            &[],
         );
         assert_eq!(resolved.len(), 1, "one button resolved");
         assert_eq!(resolved[0].playlist, 205, "resolved to playlist 205");
@@ -1218,27 +1435,30 @@ mod tests {
         // the same MOBJ.
         let mobj_data = MobjBuilder::new()
             .object(&[
-                InsnSpec::SetGpr(4076, 1),
-                InsnSpec::CmpEqReg(4075, 4076),
-                InsnSpec::GotoIf(9),
-                InsnSpec::SetGpr(4076, 2),
-                InsnSpec::CmpEqReg(4075, 4076),
-                InsnSpec::GotoIf(12),
-                InsnSpec::SetGpr(4076, 3),
-                InsnSpec::CmpEqReg(4075, 4076),
-                InsnSpec::GotoIf(15),
-                InsnSpec::SetGpr(4075, 201),
-                InsnSpec::PlayPlReg(4075),
-                InsnSpec::Nop,
-                InsnSpec::SetGpr(4075, 202),
-                InsnSpec::PlayPlReg(4075),
-                InsnSpec::Nop,
-                InsnSpec::SetGpr(4075, 203),
-                InsnSpec::PlayPlReg(4075),
+                InsnSpec::SetGpr(4076, 1),      // 0
+                InsnSpec::CmpEqReg(4075, 4076), // 1
+                InsnSpec::GotoIf(10),           // 2: → handler 1
+                InsnSpec::SetGpr(4076, 2),      // 3
+                InsnSpec::CmpEqReg(4075, 4076), // 4
+                InsnSpec::GotoIf(13),           // 5: → handler 2
+                InsnSpec::SetGpr(4076, 3),      // 6
+                InsnSpec::CmpEqReg(4075, 4076), // 7
+                InsnSpec::GotoIf(16),           // 8: → handler 3
+                InsnSpec::Goto(18),             // 9: no match → end
+                InsnSpec::SetGpr(4075, 201),    // 10: handler 1
+                InsnSpec::PlayPlReg(4075),      // 11
+                InsnSpec::Goto(18),             // 12: → end
+                InsnSpec::SetGpr(4075, 202),    // 13: handler 2
+                InsnSpec::PlayPlReg(4075),      // 14
+                InsnSpec::Goto(18),             // 15: → end
+                InsnSpec::SetGpr(4075, 203),    // 16: handler 3
+                InsnSpec::PlayPlReg(4075),      // 17
+                InsnSpec::Nop,                  // 18: end
             ])
             .build();
 
         let mobj_file = parse(&mobj_data).expect("should parse");
+        let valid_playlists: std::collections::HashSet<u32> = [201, 202, 203].into();
 
         let buttons = vec![
             make_button(
@@ -1270,7 +1490,8 @@ mod tests {
                 .map(|b| (b, PlayerContext::default()))
                 .collect::<Vec<_>>(),
             &mobj_file,
-            &std::collections::HashSet::new(),
+            &valid_playlists,
+            &[],
         );
         assert_eq!(resolved.len(), 3, "all three buttons resolved");
         assert_eq!(resolved[0].playlist, 201, "button 10 → 201");
@@ -1310,6 +1531,7 @@ mod tests {
             &[(button, PlayerContext::default())],
             &mobj_file,
             &std::collections::HashSet::new(),
+            &[],
         );
         assert_eq!(resolved.len(), 1, "resolved via MOBJ 1");
         assert_eq!(resolved[0].playlist, 300, "playlist 300");
@@ -1345,6 +1567,7 @@ mod tests {
             &[(button, PlayerContext::default())],
             &mobj_file,
             &std::collections::HashSet::new(),
+            &[],
         );
         assert!(resolved.is_empty(), "unmatched dispatch key not resolved");
     }
@@ -1373,8 +1596,346 @@ mod tests {
             &[(button, PlayerContext::default())],
             &mobj_file,
             &std::collections::HashSet::new(),
+            &[],
         );
         assert_eq!(resolved.len(), 1, "resolved via register copy");
         assert_eq!(resolved[0].playlist, 203, "playlist 203");
+    }
+
+    // ── Dispatch entry detection tests ─────────────────────────────
+
+    #[test]
+    fn find_dispatch_entries_finds_menu_play_pl() {
+        // MOBJ 0: PlayPl(800) at index 2, where 800 is a menu playlist.
+        // Dispatch entry should be (mobj=0, pc=3).
+        let mobj_data = MobjBuilder::new()
+            .object(&[
+                InsnSpec::Nop,             // 0: init
+                InsnSpec::Nop,             // 1: init
+                InsnSpec::PlayPl(800),     // 2: play menu playlist
+                InsnSpec::Nop,             // 3: dispatch starts here
+                InsnSpec::PlayPlReg(4075), // 4: content PlayPl
+            ])
+            .build();
+
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let menu_playlists: std::collections::HashSet<u32> = [800].into();
+
+        let entries = find_dispatch_entries(&mobj_file, &menu_playlists);
+        assert_eq!(entries.len(), 1, "one dispatch entry");
+        assert_eq!(entries[0].mobj_index, 0, "mobj index");
+        assert_eq!(entries[0].dispatch_pc, 3, "dispatch pc is 3");
+    }
+
+    #[test]
+    fn find_dispatch_entries_ignores_non_menu_play_pl() {
+        // MOBJ has PlayPl(201) but 201 is not a menu playlist.
+        let mobj_data = MobjBuilder::new()
+            .object(&[InsnSpec::PlayPl(201), InsnSpec::Nop])
+            .build();
+
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let menu_playlists: std::collections::HashSet<u32> = [800].into();
+
+        let entries = find_dispatch_entries(&mobj_file, &menu_playlists);
+        assert!(entries.is_empty(), "no entries for non-menu PlayPl");
+    }
+
+    #[test]
+    fn find_dispatch_entries_ignores_last_instruction() {
+        // PlayPl(800) is the last instruction — no room for dispatch_pc.
+        let mobj_data = MobjBuilder::new().object(&[InsnSpec::PlayPl(800)]).build();
+
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let menu_playlists: std::collections::HashSet<u32> = [800].into();
+
+        let entries = find_dispatch_entries(&mobj_file, &menu_playlists);
+        assert!(
+            entries.is_empty(),
+            "no entry when PlayPl is last instruction"
+        );
+    }
+
+    #[test]
+    fn find_dispatch_entries_multiple_mobjs() {
+        // Two MOBJs each with a menu PlayPl.
+        let mobj_data = MobjBuilder::new()
+            .object(&[
+                InsnSpec::PlayPl(800), // 0: menu
+                InsnSpec::Nop,         // 1: dispatch
+            ])
+            .object(&[
+                InsnSpec::Nop,         // 0: init
+                InsnSpec::PlayPl(801), // 1: menu
+                InsnSpec::Nop,         // 2: dispatch
+            ])
+            .build();
+
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let menu_playlists: std::collections::HashSet<u32> = [800, 801].into();
+
+        let entries = find_dispatch_entries(&mobj_file, &menu_playlists);
+        assert_eq!(entries.len(), 2, "two dispatch entries");
+        assert_eq!(entries[0].mobj_index, 0, "first entry: mobj 0");
+        assert_eq!(entries[0].dispatch_pc, 1, "first entry: pc 1");
+        assert_eq!(entries[1].mobj_index, 1, "second entry: mobj 1");
+        assert_eq!(entries[1].dispatch_pc, 2, "second entry: pc 2");
+    }
+
+    // ── GPR dispatch via entry points tests ────────────────────────
+
+    #[test]
+    fn dispatch_entry_resolves_warner_bros_pattern() {
+        // Simulates the Warner Bros. authoring pattern:
+        // - Initialization code (instructions 0–4) that clobbers GPR[4075]
+        // - PlayPl(800) at instruction 5 (menu playlist, suspends MOBJ)
+        // - Dispatch logic at instruction 6+ (resumes after button press)
+        let mobj_data = MobjBuilder::new()
+            .object(&[
+                // Initialization — clobbers GPR[4075]
+                InsnSpec::SetGpr(4075, 0), // 0: clear dispatch key
+                InsnSpec::SetGpr(4076, 0), // 1: clear scratch
+                InsnSpec::SetGpr(4077, 0), // 2: clear scratch
+                InsnSpec::Nop,             // 3: init
+                InsnSpec::Nop,             // 4: init
+                InsnSpec::PlayPl(800),     // 5: play menu (suspends)
+                // Dispatch logic — resumes here after button activation
+                InsnSpec::SetGpr(4076, 1),      // 6: case key = 1
+                InsnSpec::CmpEqReg(4075, 4076), // 7: GPR[4075] == 1?
+                InsnSpec::GotoIf(17),           // 8: → handler 1
+                InsnSpec::SetGpr(4076, 2),      // 9: case key = 2
+                InsnSpec::CmpEqReg(4075, 4076), // 10: GPR[4075] == 2?
+                InsnSpec::GotoIf(20),           // 11: → handler 2
+                InsnSpec::SetGpr(4076, 3),      // 12: case key = 3
+                InsnSpec::CmpEqReg(4075, 4076), // 13: GPR[4075] == 3?
+                InsnSpec::GotoIf(23),           // 14: → handler 3
+                InsnSpec::Goto(25),             // 15: no match → end
+                InsnSpec::Nop,                  // 16: pad
+                InsnSpec::SetGpr(4075, 201),    // 17: handler 1
+                InsnSpec::PlayPlReg(4075),      // 18: play
+                InsnSpec::Goto(25),             // 19: → end
+                InsnSpec::SetGpr(4075, 202),    // 20: handler 2
+                InsnSpec::PlayPlReg(4075),      // 21: play
+                InsnSpec::Goto(25),             // 22: → end
+                InsnSpec::SetGpr(4075, 203),    // 23: handler 3
+                InsnSpec::PlayPlReg(4075),      // 24: play
+                InsnSpec::Nop,                  // 25: end
+            ])
+            .build();
+
+        let mobj_file = parse(&mobj_data).expect("should parse");
+
+        // Only content playlists are valid — menu playlist 800 is excluded.
+        let valid_playlists: std::collections::HashSet<u32> = [201, 202, 203].into();
+
+        // Without dispatch entries, the lifecycle simulation still works:
+        // it executes from instruction 0, hits PlayPl(800) (non-valid),
+        // re-applies button GPR[4075]=2, and continues to the dispatch.
+        let button_lifecycle = make_button(
+            1,
+            vec![NavigationCommand::SetGpr {
+                register: 4075,
+                value: 2,
+            }],
+        );
+        let lifecycle_result = resolve_buttons(
+            &[(button_lifecycle, PlayerContext::default())],
+            &mobj_file,
+            &valid_playlists,
+            &[], // no dispatch entries — lifecycle simulation handles it
+        );
+        assert_eq!(
+            lifecycle_result.len(),
+            1,
+            "lifecycle simulation resolves without dispatch entries"
+        );
+        assert_eq!(
+            lifecycle_result[0].playlist, 202,
+            "lifecycle: button key=2 → playlist 202"
+        );
+
+        // With dispatch entries (PlayPl(800) is the menu playlist),
+        // the VM starts at instruction 6, skipping initialization.
+        let dispatch_entries = vec![DispatchEntry {
+            mobj_index: 0,
+            dispatch_pc: 6,
+        }];
+
+        let button = make_button(
+            1,
+            vec![NavigationCommand::SetGpr {
+                register: 4075,
+                value: 2,
+            }],
+        );
+
+        let resolved = resolve_buttons(
+            &[(button, PlayerContext::default())],
+            &mobj_file,
+            &valid_playlists,
+            &dispatch_entries,
+        );
+        assert_eq!(resolved.len(), 1, "resolved with dispatch entry");
+        assert_eq!(resolved[0].playlist, 202, "button key=2 → playlist 202");
+    }
+
+    #[test]
+    fn dispatch_entry_resolves_multiple_buttons() {
+        // Three buttons with different dispatch keys, resolved via the
+        // same dispatch entry point.
+        let mobj_data = MobjBuilder::new()
+            .object(&[
+                InsnSpec::SetGpr(4075, 0), // 0: init clobbers
+                InsnSpec::PlayPl(800),     // 1: menu
+                // Dispatch at pc=2
+                InsnSpec::SetGpr(4076, 10),     // 2: case 10
+                InsnSpec::CmpEqReg(4075, 4076), // 3
+                InsnSpec::GotoIf(11),           // 4: → handler 10
+                InsnSpec::SetGpr(4076, 20),     // 5: case 20
+                InsnSpec::CmpEqReg(4075, 4076), // 6
+                InsnSpec::GotoIf(14),           // 7: → handler 20
+                InsnSpec::SetGpr(4076, 30),     // 8: case 30
+                InsnSpec::CmpEqReg(4075, 4076), // 9
+                InsnSpec::GotoIf(17),           // 10: → handler 30
+                InsnSpec::SetGpr(4075, 301),    // 11: handler 10
+                InsnSpec::PlayPlReg(4075),      // 12
+                InsnSpec::Goto(19),             // 13: → end
+                InsnSpec::SetGpr(4075, 302),    // 14: handler 20
+                InsnSpec::PlayPlReg(4075),      // 15
+                InsnSpec::Goto(19),             // 16: → end
+                InsnSpec::SetGpr(4075, 303),    // 17: handler 30
+                InsnSpec::PlayPlReg(4075),      // 18
+                InsnSpec::Nop,                  // 19: end
+            ])
+            .build();
+
+        let mobj_file = parse(&mobj_data).expect("should parse");
+
+        let dispatch_entries = vec![DispatchEntry {
+            mobj_index: 0,
+            dispatch_pc: 2,
+        }];
+
+        let buttons = vec![
+            make_button(
+                1,
+                vec![NavigationCommand::SetGpr {
+                    register: 4075,
+                    value: 10,
+                }],
+            ),
+            make_button(
+                2,
+                vec![NavigationCommand::SetGpr {
+                    register: 4075,
+                    value: 20,
+                }],
+            ),
+            make_button(
+                3,
+                vec![NavigationCommand::SetGpr {
+                    register: 4075,
+                    value: 30,
+                }],
+            ),
+        ];
+
+        let resolved = resolve_buttons(
+            &buttons
+                .into_iter()
+                .map(|b| (b, PlayerContext::default()))
+                .collect::<Vec<_>>(),
+            &mobj_file,
+            &std::collections::HashSet::new(),
+            &dispatch_entries,
+        );
+        assert_eq!(resolved.len(), 3, "all three buttons resolved");
+        assert_eq!(resolved[0].playlist, 301, "key 10 → 301");
+        assert_eq!(resolved[1].playlist, 302, "key 20 → 302");
+        assert_eq!(resolved[2].playlist, 303, "key 30 → 303");
+    }
+
+    #[test]
+    fn dispatch_entry_end_to_end_with_find() {
+        // End-to-end: build an MOBJ, find dispatch entries, resolve buttons.
+        let mobj_data = MobjBuilder::new()
+            .object(&[
+                InsnSpec::SetGpr(4075, 0), // 0: init
+                InsnSpec::PlayPl(800),     // 1: menu playlist
+                // Dispatch at pc=2
+                InsnSpec::SetGpr(4076, 5),      // 2
+                InsnSpec::CmpEqReg(4075, 4076), // 3
+                InsnSpec::GotoIf(7),            // 4
+                InsnSpec::Nop,                  // 5
+                InsnSpec::Nop,                  // 6
+                InsnSpec::SetGpr(4075, 205),    // 7
+                InsnSpec::PlayPlReg(4075),      // 8
+            ])
+            .build();
+
+        let mobj_file = parse(&mobj_data).expect("should parse");
+
+        // Find dispatch entries using the menu playlist set
+        let menu_playlists: std::collections::HashSet<u32> = [800].into();
+        let dispatch_entries = find_dispatch_entries(&mobj_file, &menu_playlists);
+        assert_eq!(dispatch_entries.len(), 1, "one dispatch entry found");
+        assert_eq!(dispatch_entries[0].dispatch_pc, 2, "dispatch_pc = 2");
+
+        let button = make_button(
+            7,
+            vec![NavigationCommand::SetGpr {
+                register: 4075,
+                value: 5,
+            }],
+        );
+
+        let resolved = resolve_buttons(
+            &[(button, PlayerContext::default())],
+            &mobj_file,
+            &std::collections::HashSet::new(),
+            &dispatch_entries,
+        );
+        assert_eq!(resolved.len(), 1, "resolved via dispatch entry");
+        assert_eq!(resolved[0].playlist, 205, "key 5 → playlist 205");
+    }
+
+    #[test]
+    fn dispatch_entry_goto_mobj_unaffected() {
+        // GotoMobj buttons should still work when dispatch entries exist.
+        let mobj_data = MobjBuilder::new()
+            .object(&[
+                InsnSpec::PlayPl(800), // 0: menu PlayPl
+                InsnSpec::Nop,         // 1: dispatch
+            ])
+            .object(&[InsnSpec::PlayPl(201)]) // MOBJ 1: target
+            .build();
+
+        let mobj_file = parse(&mobj_data).expect("should parse");
+
+        let dispatch_entries = vec![DispatchEntry {
+            mobj_index: 0,
+            dispatch_pc: 1,
+        }];
+
+        // GotoMobj button — should resolve via static path, not dispatch
+        let button = make_button(
+            1,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 0,
+                    value: 1,
+                },
+                NavigationCommand::GotoMobj { object_id: 1 },
+            ],
+        );
+
+        let resolved = resolve_buttons(
+            &[(button, PlayerContext::default())],
+            &mobj_file,
+            &std::collections::HashSet::new(),
+            &dispatch_entries,
+        );
+        assert_eq!(resolved.len(), 1, "GotoMobj still works");
+        assert_eq!(resolved[0].playlist, 201, "resolved via GotoMobj");
     }
 }

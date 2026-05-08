@@ -54,6 +54,10 @@ enum Command {
         /// Skip bitmap rendering (text-only mode).
         #[arg(long)]
         no_images: bool,
+
+        /// Dump MOBJ instruction trace for debugging GPR dispatch resolution.
+        #[arg(long)]
+        trace: bool,
     },
 
     /// Decrypt an AACS-encrypted Blu-ray disc or single clip.
@@ -95,6 +99,7 @@ fn main() -> ExitCode {
             no_keydb,
             json,
             no_images,
+            trace,
         } => run_identify(
             &path,
             vuk.as_deref(),
@@ -102,6 +107,7 @@ fn main() -> ExitCode {
             no_keydb,
             json,
             no_images,
+            trace,
         ),
         Command::Decrypt {
             path,
@@ -191,6 +197,10 @@ struct NamedItem {
     clippy::too_many_lines,
     reason = "pipeline orchestration is inherently sequential"
 )]
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "CLI flag pass-through, not a public API"
+)]
 fn run_identify(
     path: &std::path::Path,
     vuk_hex: Option<&str>,
@@ -198,6 +208,7 @@ fn run_identify(
     no_keydb: bool,
     json: bool,
     no_images: bool,
+    trace: bool,
 ) -> ExitCode {
     // Auto-disable images when stderr is not a terminal (images render to stderr)
     let no_images = no_images || !std::io::IsTerminal::is_terminal(&std::io::stderr());
@@ -247,7 +258,7 @@ fn run_identify(
         clip_summary.join(", ")
     );
 
-    let buttons = match extract_buttons(&reader, &analysis, vuk.as_ref()) {
+    let buttons = match extract_buttons(&reader, &analysis, vuk.as_ref(), trace) {
         Ok(b) => b,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -351,6 +362,7 @@ fn extract_buttons(
     reader: &reliquary::disc::reader::DiscReader,
     analysis: &reliquary::disc::bdmv::BdmvAnalysis,
     vuk: Option<&[u8; 16]>,
+    trace: bool,
 ) -> Result<Vec<ExtractedButton>, String> {
     use reliquary::disc::bdmv::{ig, read_clip, rle, ts};
 
@@ -468,7 +480,14 @@ fn extract_buttons(
     // Resolve indirect button → playlist mappings via MovieObject.bdmv
     if !ig_buttons.is_empty() {
         let valid_playlists: HashSet<u32> = analysis.playlists.iter().map(|p| p.number).collect();
-        resolve_mobj_buttons(reader, &ig_buttons, &mut buttons, &valid_playlists);
+        resolve_mobj_buttons(
+            reader,
+            &ig_buttons,
+            &mut buttons,
+            &valid_playlists,
+            &analysis.menu_playlists,
+            trace,
+        );
     }
 
     Ok(buttons)
@@ -476,8 +495,9 @@ fn extract_buttons(
 
 /// Resolves indirect button→playlist mappings via `MovieObject.bdmv`.
 ///
-/// Reads and parses the MOBJ file, runs the resolver, and fills in
-/// `playlist` fields on `ExtractedButton`s that were `None`.
+/// Reads and parses the MOBJ file, finds dispatch entry points from
+/// menu playlist references, runs the resolver, and fills in `playlist`
+/// fields on `ExtractedButton`s that were `None`.
 #[allow(clippy::print_stderr, reason = "CLI status output")]
 fn resolve_mobj_buttons(
     reader: &reliquary::disc::reader::DiscReader,
@@ -487,6 +507,8 @@ fn resolve_mobj_buttons(
     )],
     buttons: &mut [ExtractedButton],
     valid_playlists: &HashSet<u32>,
+    menu_playlists: &[u32],
+    trace: bool,
 ) {
     use reliquary::disc::bdmv::mobj;
 
@@ -514,7 +536,23 @@ fn resolve_mobj_buttons(
         }
     };
 
-    let resolved = mobj::resolve_buttons(ig_buttons, &mobj_file, valid_playlists);
+    if trace {
+        trace_mobj_structure(&mobj_file, valid_playlists, ig_buttons);
+    }
+
+    // Find dispatch entry points for GPR dispatch resolution
+    let menu_set: HashSet<u32> = menu_playlists.iter().copied().collect();
+    let dispatch_entries = mobj::find_dispatch_entries(&mobj_file, &menu_set);
+
+    if !dispatch_entries.is_empty() {
+        eprintln!(
+            "found {} MOBJ dispatch entry points from menu playlists",
+            dispatch_entries.len()
+        );
+    }
+
+    let resolved =
+        mobj::resolve_buttons(ig_buttons, &mobj_file, valid_playlists, &dispatch_entries);
 
     if !resolved.is_empty() {
         eprintln!(
@@ -532,6 +570,223 @@ fn resolve_mobj_buttons(
             eb.playlist = Some(rb.playlist);
         }
     }
+}
+
+/// Dumps MOBJ structure and instruction trace for debugging.
+#[allow(clippy::print_stderr, reason = "diagnostic trace output")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "diagnostic dump with inline formatting"
+)]
+fn trace_mobj_structure(
+    mobj_file: &reliquary::disc::bdmv::mobj::MovieObjectFile,
+    valid_playlists: &HashSet<u32>,
+    ig_buttons: &[(
+        reliquary::disc::bdmv::ig::Button,
+        reliquary::disc::bdmv::mobj::PlayerContext,
+    )],
+) {
+    use reliquary::disc::bdmv::ig::NavigationCommand;
+
+    eprintln!("\n=== MOBJ TRACE ===");
+    eprintln!("{} movie objects", mobj_file.objects.len());
+
+    for (idx, mobj) in mobj_file.objects.iter().enumerate() {
+        let instrs = &mobj.instructions;
+        let play_pls: Vec<(usize, bool)> = instrs
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.group == 0 && i.sub_group == 2) // BRANCH_PLAY
+            .map(|(pc, i)| (pc, i.imm_op1))
+            .collect();
+
+        if play_pls.is_empty() {
+            continue;
+        }
+
+        let imm_count = play_pls.iter().filter(|(_, imm)| *imm).count();
+        let reg_count = play_pls.len() - imm_count;
+
+        eprintln!(
+            "\nMOBJ[{idx}]: {} instructions, {} PlayPl ({} immediate, {} register)",
+            instrs.len(),
+            play_pls.len(),
+            imm_count,
+            reg_count
+        );
+
+        // Show all PlayPl instructions with surrounding context
+        for &(pc, is_imm) in &play_pls {
+            let insn = &instrs[pc];
+            if is_imm {
+                let valid = valid_playlists.contains(&insn.dst);
+                eprintln!(
+                    "  [{pc:4}] PlayPl(imm={}) {}",
+                    insn.dst,
+                    if valid { "VALID" } else { "non-valid" }
+                );
+            } else {
+                // Show what SET precedes this PlayPl
+                let prev_info = if pc > 0 {
+                    let prev = &instrs[pc - 1];
+                    if prev.group == 2 && prev.sub_group == 0 {
+                        // SET
+                        if prev.imm_op2 {
+                            format!("preceded by SET GPR[{}] = {}", prev.dst, prev.src)
+                        } else {
+                            format!("preceded by SET GPR[{}] = GPR[{}]", prev.dst, prev.src)
+                        }
+                    } else {
+                        format!("preceded by group={} sub={}", prev.group, prev.sub_group)
+                    }
+                } else {
+                    "first instruction".to_string()
+                };
+                eprintln!("  [{pc:4}] PlayPl(GPR[{}]) — {prev_info}", insn.dst);
+            }
+        }
+
+        // Show first 30 instructions for MOBJs with register-based PlayPl
+        // For the MOBJ with the most PlayPl (dispatch table), show more
+        if reg_count > 0 {
+            let show = if play_pls.len() > 5 {
+                instrs.len().min(400)
+            } else {
+                instrs.len().min(30)
+            };
+            eprintln!("  First {show} instructions:");
+            for (pc, insn) in instrs.iter().enumerate().take(show) {
+                let desc = match (insn.group, insn.sub_group) {
+                    (0, 0) => {
+                        // GOTO
+                        let cond = match insn.branch_opt {
+                            0 => "if_true",
+                            1 => "if_false",
+                            _ => "uncond",
+                        };
+                        format!("GOTO({cond}) → {}", insn.dst)
+                    }
+                    (0, 1) => format!("JUMP(mobj={})", insn.dst), // GotoMobj
+                    (0, 2) => {
+                        // PlayPl
+                        if insn.imm_op1 {
+                            format!("PlayPl(imm={})", insn.dst)
+                        } else {
+                            format!("PlayPl(GPR[{}])", insn.dst)
+                        }
+                    }
+                    (1, _) => {
+                        // CMP
+                        let op = match insn.cmp_opt {
+                            1 => "==",
+                            2 => "!=",
+                            3 => ">=",
+                            4 => ">",
+                            5 => "<=",
+                            6 => "<",
+                            _ => "??",
+                        };
+                        let dst = if insn.imm_op1 {
+                            format!("{}", insn.dst)
+                        } else {
+                            format!("GPR[{}]", insn.dst)
+                        };
+                        let src = if insn.imm_op2 {
+                            format!("{}", insn.src)
+                        } else {
+                            format!("GPR[{}]", insn.src)
+                        };
+                        format!("CMP {dst} {op} {src}")
+                    }
+                    (2, 0) => {
+                        // SET
+                        let op = match insn.set_opt {
+                            0 => "=",
+                            1 => "<=>",
+                            2 => "+=",
+                            3 => "-=",
+                            8 => "&=",
+                            9 => "|=",
+                            0xA => "^=",
+                            _ => "??=",
+                        };
+                        let src = if insn.imm_op2 {
+                            format!("{}", insn.src)
+                        } else {
+                            format!("GPR[{}]", insn.src)
+                        };
+                        format!("SET GPR[{}] {op} {src}", insn.dst)
+                    }
+                    (2, 1) => {
+                        // SETSYSTEM
+                        format!(
+                            "SETSYSTEM opt={} dst={} src={}",
+                            insn.set_opt, insn.dst, insn.src
+                        )
+                    }
+                    _ => format!(
+                        "??? grp={} sub={} dst={} src={}",
+                        insn.group, insn.sub_group, insn.dst, insn.src
+                    ),
+                };
+                eprintln!("    [{pc:4}] {desc}");
+            }
+        }
+    }
+
+    // Show button command summary
+    let mut gpr_regs: HashSet<u32> = HashSet::new();
+    let mut gpr_values: Vec<u32> = Vec::new();
+    for (button, _ctx) in ig_buttons {
+        for cmd in &button.commands {
+            if let NavigationCommand::SetGpr { register, value } = cmd {
+                gpr_regs.insert(*register);
+                if !gpr_values.contains(value) {
+                    gpr_values.push(*value);
+                }
+            }
+        }
+    }
+    gpr_values.sort_unstable();
+    eprintln!(
+        "\nButtons: {} total, dispatch registers: {:?}, sample keys: {:?}",
+        ig_buttons.len(),
+        gpr_regs,
+        &gpr_values[..gpr_values.len().min(20)]
+    );
+
+    // Show first 10 buttons with their full command lists
+    eprintln!("\nSample button commands:");
+    for (button, ctx) in ig_buttons.iter().take(10) {
+        let cmds: Vec<String> = button
+            .commands
+            .iter()
+            .map(|c| match c {
+                NavigationCommand::SetGpr { register, value } => {
+                    format!("SetGpr({register}, {value})")
+                }
+                NavigationCommand::GotoMobj { object_id } => {
+                    format!("GotoMobj({object_id})")
+                }
+                NavigationCommand::PlayPl { playlist } => {
+                    format!("PlayPl({playlist})")
+                }
+                NavigationCommand::Other { opcode, dst, src } => {
+                    let grp = (opcode >> 27) & 0x03;
+                    let sub = (opcode >> 24) & 0x07;
+                    format!("Other(grp={grp},sub={sub},dst={dst},src={src})")
+                }
+            })
+            .collect();
+        eprintln!(
+            "  btn[{}] page={} ig={}: {}",
+            button.button_id,
+            ctx.page_id,
+            ctx.ig_stream,
+            cmds.join("; ")
+        );
+    }
+    eprintln!("=== END TRACE ===\n");
 }
 
 /// Presents content buttons (with `PlayPl`) and prompts for names.
