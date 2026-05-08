@@ -676,9 +676,9 @@ fn parse_button(r: &mut Cursor<'_>) -> Result<Button, IgError> {
 /// - bits 26-24: `sub_grp` (3 bits)
 /// - bit 23: `imm_op1` (destination operand is immediate)
 /// - bit 22: `imm_op2` (source operand is immediate)
-/// - bits 21-18: `branch_opt` (4 bits)
-/// - bits 15-12: `cmp_opt` (4 bits)
-/// - bits 7-4: `set_opt` (4 bits)
+/// - bits 19-16: `branch_opt` (4 bits)
+/// - bits 11-8: `cmp_opt` (4 bits)
+/// - bits 4-0: `set_opt` (5 bits)
 fn parse_navigation_command(r: &mut Cursor<'_>) -> Result<NavigationCommand, IgError> {
     let insn = r.read_u32()?;
     let dst = r.read_u32()?;

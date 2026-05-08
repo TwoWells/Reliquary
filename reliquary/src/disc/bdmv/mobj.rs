@@ -150,7 +150,9 @@ const PSR_FLAG: u32 = 0x8000_0000;
 pub struct PlayerContext {
     /// IG stream number (PSR 0).
     pub ig_stream: u16,
-    /// Current page ID (PSR 10).
+    /// Selected button ID (PSR 10).
+    pub selected_button_id: u16,
+    /// Current page ID (PSR 11).
     pub page_id: u8,
 }
 
@@ -216,7 +218,7 @@ fn parse_instruction(r: &mut Cursor<'_>) -> Result<Instruction, MobjError> {
 
     #[allow(
         clippy::cast_possible_truncation,
-        reason = "bit fields are small known widths (2-4 bits)"
+        reason = "bit fields are small known widths (2-5 bits)"
     )]
     Ok(Instruction {
         op_cnt: ((insn >> 29) & 0x07) as u8,
@@ -224,9 +226,9 @@ fn parse_instruction(r: &mut Cursor<'_>) -> Result<Instruction, MobjError> {
         sub_group: ((insn >> 24) & 0x07) as u8,
         imm_op1: (insn >> 23) & 1 != 0,
         imm_op2: (insn >> 22) & 1 != 0,
-        branch_opt: ((insn >> 18) & 0x0F) as u8,
-        cmp_opt: ((insn >> 12) & 0x0F) as u8,
-        set_opt: ((insn >> 4) & 0x0F) as u8,
+        branch_opt: ((insn >> 16) & 0x0F) as u8,
+        cmp_opt: ((insn >> 8) & 0x0F) as u8,
+        set_opt: (insn & 0x1F) as u8,
         dst,
         src,
     })
@@ -556,11 +558,11 @@ fn trace_play_pls(
     for &(reg, val) in gpr_assignments {
         gprs.insert(reg, val);
     }
-    gprs.insert(PSR_FLAG, u32::from(ctx.ig_stream));
-    gprs.insert(PSR_FLAG | 0x0A, u32::from(ctx.page_id));
+    gprs.insert(PSR_FLAG, u32::from(ctx.ig_stream)); // PSR[0]
+    gprs.insert(PSR_FLAG | 0x0A, u32::from(ctx.selected_button_id)); // PSR[10]
+    gprs.insert(PSR_FLAG | 0x0B, u32::from(ctx.page_id)); // PSR[11]
 
     let mut pc: usize = 0;
-    let mut cmp_flag = false;
     let mut steps: u32 = 0;
     let mut playlists = Vec::new();
 
@@ -574,8 +576,12 @@ fn trace_play_pls(
                 pc += 1;
             }
             GRP_CMP => {
-                cmp_flag = execute_cmp(insn, &gprs);
-                pc += 1;
+                // libbluray CMP model: if condition is false, skip next instruction
+                if execute_cmp(insn, &gprs) {
+                    pc += 1;
+                } else {
+                    pc += 2;
+                }
             }
             GRP_BRANCH => match insn.sub_group {
                 BRANCH_PLAY => {
@@ -596,7 +602,7 @@ fn trace_play_pls(
                     pc += 1;
                 }
                 BRANCH_GOTO => {
-                    if !execute_goto(insn, cmp_flag, &mut pc) {
+                    if !execute_goto(insn, &gprs, &mut pc) {
                         pc += 1;
                     }
                 }
@@ -630,10 +636,10 @@ fn execute_from(
     }
     // Seed known PSR values from player context
     gprs.insert(PSR_FLAG, u32::from(ctx.ig_stream)); // PSR[0]
-    gprs.insert(PSR_FLAG | 0x0A, u32::from(ctx.page_id)); // PSR[10]
+    gprs.insert(PSR_FLAG | 0x0A, u32::from(ctx.selected_button_id)); // PSR[10]
+    gprs.insert(PSR_FLAG | 0x0B, u32::from(ctx.page_id)); // PSR[11]
 
     let mut pc: usize = start_pc;
-    let mut cmp_flag = false;
     let mut steps: u32 = 0;
 
     while pc < instrs.len() && steps < VM_STEP_LIMIT {
@@ -646,8 +652,12 @@ fn execute_from(
                 pc += 1;
             }
             GRP_CMP => {
-                cmp_flag = execute_cmp(insn, &gprs);
-                pc += 1;
+                // libbluray CMP model: if condition is false, skip next instruction
+                if execute_cmp(insn, &gprs) {
+                    pc += 1;
+                } else {
+                    pc += 2;
+                }
             }
             GRP_BRANCH => {
                 match insn.sub_group {
@@ -673,10 +683,7 @@ fn execute_from(
                         pc += 1;
                     }
                     BRANCH_GOTO => {
-                        // Conditional or unconditional goto
-                        if execute_goto(insn, cmp_flag, &mut pc) {
-                            // Took the branch — pc already updated
-                        } else {
+                        if !execute_goto(insn, &gprs, &mut pc) {
                             pc += 1;
                         }
                     }
@@ -722,21 +729,26 @@ fn execute_set(insn: &Instruction, gprs: &mut std::collections::HashMap<u32, u32
     let dst_val = gprs.get(&dst_reg).copied().unwrap_or(0);
 
     let result = match insn.set_opt {
-        0x00 => src_val, // move (assignment)
-        0x01 => {
-            // swap
+        0x01 => src_val, // MOVE (assignment)
+        0x02 => {
+            // SWAP
             gprs.insert(insn.src, dst_val);
             src_val
         }
-        0x02 => dst_val.wrapping_add(src_val),     // add
-        0x03 => dst_val.wrapping_sub(src_val),     // sub
-        0x04 => dst_val.wrapping_mul(src_val),     // mul
-        0x05 if src_val != 0 => dst_val / src_val, // div
-        0x06 if src_val != 0 => dst_val % src_val, // mod
-        0x08 => dst_val & src_val,                 // and
-        0x09 => dst_val | src_val,                 // or
-        0x0A => dst_val ^ src_val,                 // xor
-        _ => return, // Unknown or unsafe (div/mod by zero, rnd) — skip
+        0x03 => dst_val.wrapping_add(src_val),     // ADD
+        0x04 => dst_val.wrapping_sub(src_val),     // SUB
+        0x05 => dst_val.wrapping_mul(src_val),     // MUL
+        0x06 if src_val != 0 => dst_val / src_val, // DIV
+        0x07 if src_val != 0 => dst_val % src_val, // MOD
+        0x08 if src_val != 0 => 1,                 // RND: deterministic (always 1)
+        0x09 => dst_val & src_val,                 // AND
+        0x0A => dst_val | src_val,                 // OR
+        0x0B => dst_val ^ src_val,                 // XOR
+        0x0C => dst_val | (1 << src_val),          // BITSET
+        0x0D => dst_val & !(1 << src_val),         // BITCLR
+        0x0E => dst_val << src_val,                // SHL
+        0x0F => dst_val >> src_val,                // SHR
+        _ => return, // Unknown or unsafe (div/mod by zero) — skip
     };
 
     gprs.insert(dst_reg, result);
@@ -748,39 +760,47 @@ fn execute_cmp(insn: &Instruction, gprs: &std::collections::HashMap<u32, u32>) -
     let src_val = fetch_operand(insn.imm_op2, insn.src, gprs);
 
     match insn.cmp_opt {
-        0x01 => dst_val == src_val, // EQ (==)
-        0x02 => dst_val != src_val, // NE (!=)
-        0x03 => dst_val >= src_val, // GE (>=)
-        0x04 => dst_val > src_val,  // GT (>)
-        0x05 => dst_val <= src_val, // LE (<=)
-        0x06 => dst_val < src_val,  // LT (<)
-        _ => false,                 // 0x00 or unknown — no match
+        0x02 => dst_val == src_val, // EQ (==)
+        0x03 => dst_val != src_val, // NE (!=)
+        0x04 => dst_val >= src_val, // GE (>=)
+        0x05 => dst_val > src_val,  // GT (>)
+        0x06 => dst_val <= src_val, // LE (<=)
+        0x07 => dst_val < src_val,  // LT (<)
+        _ => false,                 // 0x00/0x01 or unknown — no match
     }
 }
 
 /// Executes a GOTO instruction. Returns `true` if the branch was taken
 /// (and `pc` was updated), `false` if execution should fall through.
 ///
-/// `branch_opt` encoding (observed from real disc data):
-/// - `0x00`: conditional — branch if last CMP was true
-/// - `0x01`: conditional — branch if last CMP was false (inverted)
+/// `branch_opt` encoding (libbluray `hdmv_insn.h`):
+/// - `0x00`: NOP — no operation
+/// - `0x01`: GOTO — unconditional jump to destination
+/// - `0x02`: BREAK — terminate execution
 ///
-/// All 3231 GOTO instructions on a WB Blu-ray title use `branch_opt=0`.
-/// These are the conditional branches in the switch/case dispatch.
-#[allow(clippy::missing_const_for_fn, reason = "mutates pc via &mut")]
-fn execute_goto(insn: &Instruction, cmp_flag: bool, pc: &mut usize) -> bool {
-    let should_branch = match insn.branch_opt {
-        0x00 => cmp_flag,  // branch if comparison was true
-        0x01 => !cmp_flag, // branch if comparison was false
-        _ => true,         // other values — treat as unconditional
-    };
-
-    if should_branch && insn.imm_op1 {
-        *pc = insn.dst as usize;
-        return true;
+/// Conditional branching is handled by CMP, which skips the next
+/// instruction when the comparison is false. A CMP+GOTO pair gives
+/// conditional behavior: CMP true → GOTO executes → jump; CMP false
+/// → GOTO is skipped → fall through.
+fn execute_goto(
+    insn: &Instruction,
+    gprs: &std::collections::HashMap<u32, u32>,
+    pc: &mut usize,
+) -> bool {
+    match insn.branch_opt {
+        0x01 => {
+            // GOTO — unconditional jump
+            let target = fetch_operand(insn.imm_op1, insn.dst, gprs);
+            *pc = target as usize;
+            true
+        }
+        0x02 => {
+            // BREAK — terminate execution
+            *pc = usize::MAX;
+            true
+        }
+        _ => false, // NOP (0x00) and unknown — no branch
     }
-
-    false
 }
 
 // ── Static resolution helpers (GotoMobj pattern) ────────────────────────
@@ -972,16 +992,16 @@ mod tests {
                 buf.extend_from_slice(&0u32.to_be_bytes()); // src
             }
             InsnSpec::SetGpr(register, value) => {
-                // grp=2 (SET), sub_grp=0, op_cnt=2, imm_op2=1, set_opt=0 (move)
-                let insn: u32 = 0x5040_0000;
+                // grp=2 (SET), sub_grp=0, op_cnt=2, imm_op2=1, set_opt=1 (MOVE)
+                let insn: u32 = 0x5040_0001;
                 buf.extend_from_slice(&insn.to_be_bytes());
                 buf.extend_from_slice(&register.to_be_bytes());
                 buf.extend_from_slice(&value.to_be_bytes());
             }
             InsnSpec::CmpEq(register, value) => {
                 // grp=1 (CMP), sub_grp=0, op_cnt=2, imm_op1=0 (dst=GPR),
-                // imm_op2=1 (src=immediate), cmp_opt=1 (EQ)
-                let insn: u32 = 0x4840_1000;
+                // imm_op2=1 (src=immediate), cmp_opt=2 (EQ)
+                let insn: u32 = 0x4840_0200;
                 buf.extend_from_slice(&insn.to_be_bytes());
                 buf.extend_from_slice(&register.to_be_bytes()); // dst = GPR ref
                 buf.extend_from_slice(&value.to_be_bytes()); // src = immediate
@@ -994,31 +1014,31 @@ mod tests {
                 buf.extend_from_slice(&0u32.to_be_bytes());
             }
             InsnSpec::SetGprReg(dst_reg, src_reg) => {
-                // grp=2 (SET), sub_grp=0, op_cnt=2, imm_op1=0, imm_op2=0, set_opt=0 (move)
-                let insn: u32 = 0x5000_0000;
+                // grp=2 (SET), sub_grp=0, op_cnt=2, imm_op1=0, imm_op2=0, set_opt=1 (MOVE)
+                let insn: u32 = 0x5000_0001;
                 buf.extend_from_slice(&insn.to_be_bytes());
                 buf.extend_from_slice(&dst_reg.to_be_bytes());
                 buf.extend_from_slice(&src_reg.to_be_bytes());
             }
             InsnSpec::CmpEqReg(dst_reg, src_reg) => {
-                // grp=1 (CMP), sub_grp=0, op_cnt=2, imm_op1=0, imm_op2=0, cmp_opt=1 (EQ)
-                let insn: u32 = 0x4800_1000;
+                // grp=1 (CMP), sub_grp=0, op_cnt=2, imm_op1=0, imm_op2=0, cmp_opt=2 (EQ)
+                let insn: u32 = 0x4800_0200;
                 buf.extend_from_slice(&insn.to_be_bytes());
                 buf.extend_from_slice(&dst_reg.to_be_bytes());
                 buf.extend_from_slice(&src_reg.to_be_bytes());
             }
             InsnSpec::Goto(target) => {
                 // grp=0 (BRANCH), sub_grp=0 (GOTO), op_cnt=1, imm_op1=1,
-                // branch_opt=2 (unconditional in our handler)
-                let insn: u32 = 0x2088_0000;
+                // branch_opt=1 (GOTO — unconditional jump)
+                let insn: u32 = 0x2081_0000;
                 buf.extend_from_slice(&insn.to_be_bytes());
                 buf.extend_from_slice(&target.to_be_bytes());
                 buf.extend_from_slice(&0u32.to_be_bytes());
             }
             InsnSpec::GotoIf(target) => {
                 // grp=0 (BRANCH), sub_grp=0 (GOTO), op_cnt=1, imm_op1=1,
-                // branch_opt=0 (conditional — branch if last CMP true)
-                let insn: u32 = 0x2080_0000;
+                // branch_opt=1 (GOTO — conditionality comes from CMP skip)
+                let insn: u32 = 0x2081_0000;
                 buf.extend_from_slice(&insn.to_be_bytes());
                 buf.extend_from_slice(&target.to_be_bytes());
                 buf.extend_from_slice(&0u32.to_be_bytes());
