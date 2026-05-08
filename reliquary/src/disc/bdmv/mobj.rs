@@ -131,8 +131,11 @@ pub struct DispatchEntry {
 /// ending with `PlayPl(playlist)`. This table maps case values directly
 /// to playlist numbers, bypassing the player runtime.
 ///
-/// Buttons set `GPR[4075]` to a dispatch key via `SetGpr`. That key
-/// corresponds to a case value in this table.
+/// The dispatch case is `button_id + key`, where `button_id` is the
+/// button's IG identifier and `key` is the `SetGpr(4075, N)` value.
+/// The button bytecode computes `(PSR[10] & 0xFFFF) + GPR[4075]` and
+/// passes it to `SET_BUTTON_PAGE`; `PSR[10]` at activation time equals
+/// the button's own `button_id`.
 #[derive(Debug)]
 pub struct DispatchTable {
     /// MOBJ index containing the dispatch table.
@@ -662,11 +665,14 @@ fn trace_button(
         return Some(result);
     }
 
-    // Pattern 3: Dispatch table lookup — match SetGpr values against the
-    // statically extracted case→playlist table.
+    // Pattern 3: Dispatch table lookup — match button_id + key (composite
+    // dispatch case) against the statically extracted case→playlist table.
+    // The button bytecode computes (PSR[10] & 0xFFFF) + GPR[4075] and
+    // passes it to SET_BUTTON_PAGE; PSR[10] at activation = button_id.
     if let Some(table) = dispatch_table {
         for &(_, value) in &gpr_assignments {
-            if let Some(&(_, playlist)) = table.cases.iter().find(|(cv, _)| *cv == value) {
+            let composite = u32::from(button.button_id) + value;
+            if let Some(&(_, playlist)) = table.cases.iter().find(|(cv, _)| *cv == composite) {
                 return Some(playlist);
             }
         }
@@ -2397,34 +2403,39 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_table_resolves_buttons() {
-        // Build a dispatch table MOBJ and resolve buttons via table lookup.
-        let dispatch_mobj = build_dispatch_mobj(&[(0, 201), (5, 205), (10, 210)]);
+    fn dispatch_table_resolves_buttons_composite() {
+        // Composite dispatch: case = button_id + key.
+        // button_id=6, key=5 → case 11; button_id=3, key=5 → case 8;
+        // button_id=0, key=5 → case 5 (backwards compatible with raw key).
+        let dispatch_mobj = build_dispatch_mobj(&[(5, 205), (8, 208), (11, 211)]);
         let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
 
         let mobj_file = parse(&mobj_data).expect("should parse");
         let table = extract_dispatch_table(&mobj_file).expect("should extract table");
 
         let buttons = vec![
+            // button_id=6, key=5 → composite 11 → playlist 211
             make_button(
-                1,
+                6,
                 vec![NavigationCommand::SetGpr {
                     register: 4075,
                     value: 5,
                 }],
             ),
-            make_button(
-                2,
-                vec![NavigationCommand::SetGpr {
-                    register: 4075,
-                    value: 10,
-                }],
-            ),
+            // button_id=3, key=5 → composite 8 → playlist 208
             make_button(
                 3,
                 vec![NavigationCommand::SetGpr {
                     register: 4075,
-                    value: 0,
+                    value: 5,
+                }],
+            ),
+            // button_id=0, key=5 → composite 5 → playlist 205
+            make_button(
+                0,
+                vec![NavigationCommand::SetGpr {
+                    register: 4075,
+                    value: 5,
                 }],
             ),
         ];
@@ -2440,22 +2451,31 @@ mod tests {
             Some(&table),
         );
         assert_eq!(resolved.len(), 3, "all three buttons resolved via table");
-        assert_eq!(resolved[0].playlist, 205, "key 5 → 205");
-        assert_eq!(resolved[1].playlist, 210, "key 10 → 210");
-        assert_eq!(resolved[2].playlist, 201, "key 0 → 201");
+        assert_eq!(
+            resolved[0].playlist, 211,
+            "button_id=6, key=5 → case 11 → 211"
+        );
+        assert_eq!(
+            resolved[1].playlist, 208,
+            "button_id=3, key=5 → case 8 → 208"
+        );
+        assert_eq!(
+            resolved[2].playlist, 205,
+            "button_id=0, key=5 → case 5 → 205"
+        );
     }
 
     #[test]
-    fn dispatch_table_unmatched_key_not_resolved() {
-        // Cases start at 10 so uninitialized GPR[200]=0 doesn't
-        // accidentally match, and the exit GOTO skips all handlers.
+    fn dispatch_table_composite_outside_range_not_resolved() {
+        // Cases are 10–12. Button composite = button_id(1) + key(99) = 100,
+        // which is outside the table range.
         let dispatch_mobj = build_dispatch_mobj(&[(10, 201), (11, 202), (12, 203)]);
         let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
 
         let mobj_file = parse(&mobj_data).expect("should parse");
         let table = extract_dispatch_table(&mobj_file).expect("should extract table");
 
-        // Button sets key=99 which is not in the table
+        // Composite 1 + 99 = 100, not in {10, 11, 12}
         let button = make_button(
             1,
             vec![NavigationCommand::SetGpr {
@@ -2478,9 +2498,9 @@ mod tests {
     fn dispatch_table_coexists_with_goto_mobj() {
         // Mixed disc: MOBJ 0 is a simple GotoMobj target, MOBJ 1 is a
         // dispatch table. GotoMobj buttons use pattern 1, dispatch buttons
-        // use the table.
+        // use the table. Composite = button_id(20) + key(2) = 22.
         let goto_target = vec![InsnSpec::PlayPl(500)];
-        let dispatch_mobj = build_dispatch_mobj(&[(1, 301), (2, 302), (3, 303)]);
+        let dispatch_mobj = build_dispatch_mobj(&[(20, 301), (22, 302), (24, 303)]);
 
         let mobj_data = MobjBuilder::new()
             .object(&goto_target)
@@ -2502,7 +2522,7 @@ mod tests {
             ],
         );
 
-        // Dispatch table button
+        // Dispatch table button: composite = 20 + 2 = 22 → case 22 → 302
         let dispatch_button = make_button(
             20,
             vec![NavigationCommand::SetGpr {
@@ -2525,6 +2545,35 @@ mod tests {
         assert_eq!(resolved[0].button_id, 10, "GotoMobj button");
         assert_eq!(resolved[0].playlist, 500, "GotoMobj → 500");
         assert_eq!(resolved[1].button_id, 20, "dispatch table button");
-        assert_eq!(resolved[1].playlist, 302, "dispatch key 2 → 302");
+        assert_eq!(resolved[1].playlist, 302, "composite 20+2=22 → 302");
+    }
+
+    #[test]
+    fn dispatch_table_button_id_zero_matches_raw_key() {
+        // button_id=0 means composite = 0 + key = key, so the lookup is
+        // backwards compatible with the raw-key case.
+        let dispatch_mobj = build_dispatch_mobj(&[(0, 201), (5, 205), (10, 210)]);
+        let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
+
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let table = extract_dispatch_table(&mobj_file).expect("should extract table");
+
+        let button = make_button(
+            0,
+            vec![NavigationCommand::SetGpr {
+                register: 4075,
+                value: 10,
+            }],
+        );
+
+        let resolved = resolve_buttons(
+            &[(button, PlayerContext::default())],
+            &mobj_file,
+            &std::collections::HashSet::new(),
+            &[],
+            Some(&table),
+        );
+        assert_eq!(resolved.len(), 1, "button_id=0 resolved");
+        assert_eq!(resolved[0].playlist, 210, "composite 0+10=10 → 210");
     }
 }
