@@ -646,11 +646,12 @@ fn trace_mobj_structure(
             }
         }
 
-        // Show first 30 instructions for MOBJs with register-based PlayPl
-        // For the MOBJ with the most PlayPl (dispatch table), show more
-        if reg_count > 0 {
+        // Show instructions for MOBJs with register-based PlayPl.
+        // For the dispatch table MOBJ, show init + first handler.
+        if reg_count > 0 || idx == 0 {
+            let first_play_pc = play_pls.first().map_or(30, |(pc, _)| *pc);
             let show = if play_pls.len() > 5 {
-                instrs.len().min(400)
+                (first_play_pc + 5).min(instrs.len())
             } else {
                 instrs.len().min(30)
             };
@@ -719,10 +720,31 @@ fn trace_mobj_structure(
                     }
                     (2, 1) => {
                         // SETSYSTEM
-                        format!(
-                            "SETSYSTEM opt={} dst={} src={}",
-                            insn.set_opt, insn.dst, insn.src
-                        )
+                        let op_name = match insn.set_opt {
+                            0x01 => "SET_STREAM",
+                            0x02 => "SET_NV_TIMER",
+                            0x03 => "SET_BUTTON_PAGE",
+                            0x04 => "ENABLE_BUTTON",
+                            0x05 => "DISABLE_BUTTON",
+                            0x06 => "SET_SEC_STREAM",
+                            0x07 => "POPUP_OFF",
+                            0x08 => "STILL_ON",
+                            0x09 => "STILL_OFF",
+                            0x0A => "SET_OUTPUT_MODE",
+                            0x0B => "SET_STREAM_SS",
+                            _ => "UNKNOWN",
+                        };
+                        let dst_s = if insn.imm_op1 {
+                            format!("{}", insn.dst)
+                        } else {
+                            format!("GPR[{}]", insn.dst)
+                        };
+                        let src_s = if insn.imm_op2 {
+                            format!("{}", insn.src)
+                        } else {
+                            format!("GPR[{}]", insn.src)
+                        };
+                        format!("SETSYSTEM {op_name} dst={dst_s} src={src_s}")
                     }
                     _ => format!(
                         "??? grp={} sub={} dst={} src={}",
@@ -732,6 +754,255 @@ fn trace_mobj_structure(
                 eprintln!("    [{pc:4}] {desc}");
             }
         }
+    }
+
+    // Search for instructions that write to GPR[3002] and dump context
+    eprintln!("\nSearching all MOBJs for writes to GPR[3002]:");
+    for (idx, mobj) in mobj_file.objects.iter().enumerate() {
+        let instrs = &mobj.instructions;
+        for (pc, insn) in instrs.iter().enumerate() {
+            if insn.group == 2 && insn.sub_group == 0 && insn.dst == 3002 {
+                let src_desc = if insn.imm_op2 {
+                    format!("{}", insn.src)
+                } else {
+                    format!("GPR[{}]", insn.src)
+                };
+                eprintln!("  MOBJ[{idx}][{pc}]: GPR[3002] = {src_desc} — context:");
+                // Show 5 instructions before and after for context
+                let start = pc.saturating_sub(5);
+                let end = instrs.len().min(pc + 6);
+                for ctx_pc in start..end {
+                    let ci = &instrs[ctx_pc];
+                    let desc = match (ci.group, ci.sub_group) {
+                        (2, 0) => {
+                            let op = match ci.set_opt {
+                                0 => "=", 8 => "&=", 9 => "|=", 0xA => "^=", _ => "?=",
+                            };
+                            let s = if ci.imm_op2 { format!("{}", ci.src) } else if ci.src >= 0x8000_0000 { format!("PSR[{}]", ci.src & 0x7FFF_FFFF) } else { format!("GPR[{}]", ci.src) };
+                            format!("SET GPR[{}] {op} {s}", ci.dst)
+                        }
+                        (1, _) => {
+                            let d = if ci.imm_op1 { format!("{}", ci.dst) } else { format!("GPR[{}]", ci.dst) };
+                            let s = if ci.imm_op2 { format!("{}", ci.src) } else { format!("GPR[{}]", ci.src) };
+                            format!("CMP {d} ?? {s}")
+                        }
+                        (0, 0) => format!("GOTO(opt={}) → {}", ci.branch_opt, ci.dst),
+                        (0, 1) => format!("JUMP → MOBJ[{}]", ci.dst),
+                        (0, 2) => if ci.imm_op1 { format!("PlayPl({})", ci.dst) } else { format!("PlayPl(GPR[{}])", ci.dst) },
+                        _ => format!("grp={} sub={}", ci.group, ci.sub_group),
+                    };
+                    let marker = if ctx_pc == pc { " ★" } else { "" };
+                    eprintln!("      [{ctx_pc:4}] {desc}{marker}");
+                }
+            }
+        }
+    }
+
+    // Step-by-step VM trace of the dispatch MOBJ with a sample button's state.
+    // Find the dispatch MOBJ (most PlayPl) and a non-trivial button.
+    let dispatch_mobj_idx = mobj_file
+        .objects
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, m)| {
+            m.instructions
+                .iter()
+                .filter(|i| i.group == 0 && i.sub_group == 2)
+                .count()
+        })
+        .map(|(i, _)| i);
+
+    // Find a button with SetGpr commands
+    let sample_button = ig_buttons.iter().find(|(b, _)| {
+        b.commands
+            .iter()
+            .any(|c| matches!(c, NavigationCommand::SetGpr { .. }))
+    });
+
+    if let (Some(mobj_idx), Some((button, ctx))) = (dispatch_mobj_idx, sample_button) {
+        let instrs = &mobj_file.objects[mobj_idx].instructions;
+
+        // Simulate button command execution to get register state
+        let mut gprs = std::collections::HashMap::<u32, u32>::new();
+        for cmd in &button.commands {
+            if let NavigationCommand::SetGpr { register, value } = cmd {
+                gprs.insert(*register, *value);
+            }
+            // We can't simulate the Other commands (register-to-register SET)
+            // but we seed what we can
+        }
+        // Seed PSR context
+        gprs.insert(0x8000_0000, u32::from(ctx.ig_stream)); // PSR[0]
+        gprs.insert(0x8000_000A, u32::from(ctx.page_id)); // PSR[10]
+
+        eprintln!(
+            "\n--- VM TRACE: MOBJ[{mobj_idx}] with btn[{}] (GPR seeds: {:?}) ---",
+            button.button_id,
+            gprs.iter()
+                .filter(|&(&k, _)| k < 0x8000_0000)
+                .map(|(&k, &v)| format!("GPR[{k}]={v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let mut pc: usize = 0;
+        let mut cmp_flag = false;
+        let mut steps: u32 = 0;
+        let max_steps = 150;
+
+        while pc < instrs.len() && steps < max_steps {
+            steps += 1;
+            let insn = &instrs[pc];
+            let old_pc = pc;
+
+            match insn.group {
+                2 => {
+                    // SET or SETSYSTEM
+                    if insn.sub_group <= 1 {
+                        let dst_reg = insn.dst;
+                        let src_val = if insn.imm_op2 {
+                            insn.src
+                        } else {
+                            gprs.get(&insn.src).copied().unwrap_or(0)
+                        };
+                        let dst_val = gprs.get(&dst_reg).copied().unwrap_or(0);
+
+                        let result = match insn.set_opt {
+                            0x00 => Some(src_val),
+                            0x01 => {
+                                gprs.insert(insn.src, dst_val);
+                                Some(src_val)
+                            }
+                            0x02 => Some(dst_val.wrapping_add(src_val)),
+                            0x03 => Some(dst_val.wrapping_sub(src_val)),
+                            0x08 => Some(dst_val & src_val),
+                            0x09 => Some(dst_val | src_val),
+                            0x0A => Some(dst_val ^ src_val),
+                            _ => None,
+                        };
+
+                        if let Some(val) = result {
+                            let reg_name = if dst_reg >= 0x8000_0000 {
+                                format!("PSR[{}]", dst_reg & 0x7FFF_FFFF)
+                            } else {
+                                format!("GPR[{dst_reg}]")
+                            };
+                            let op = match insn.set_opt {
+                                0 => "=", 8 => "&=", 9 => "|=", 0xA => "^=",
+                                _ => "?=",
+                            };
+                            let src_desc = if insn.imm_op2 {
+                                format!("{}", insn.src)
+                            } else if insn.src >= 0x8000_0000 {
+                                format!(
+                                    "PSR[{}] (={})",
+                                    insn.src & 0x7FFF_FFFF,
+                                    gprs.get(&insn.src).copied().unwrap_or(0)
+                                )
+                            } else {
+                                format!(
+                                    "GPR[{}] (={})",
+                                    insn.src,
+                                    gprs.get(&insn.src).copied().unwrap_or(0)
+                                )
+                            };
+                            gprs.insert(dst_reg, val);
+
+                            // Highlight GPR[3002] writes
+                            let marker = if dst_reg == 3002 { " ★★★" } else { "" };
+                            eprintln!(
+                                "  [{old_pc:4}] {reg_name} {op} {src_desc} → {val}{marker}"
+                            );
+                        } else {
+                            eprintln!("  [{old_pc:4}] SET(opt={}) GPR[{}]", insn.set_opt, dst_reg);
+                        }
+                        pc += 1;
+                    } else {
+                        eprintln!("  [{old_pc:4}] SET sub={}", insn.sub_group);
+                        pc += 1;
+                    }
+                }
+                1 => {
+                    // CMP
+                    let dst_val = if insn.imm_op1 {
+                        insn.dst
+                    } else {
+                        gprs.get(&insn.dst).copied().unwrap_or(0)
+                    };
+                    let src_val = if insn.imm_op2 {
+                        insn.src
+                    } else {
+                        gprs.get(&insn.src).copied().unwrap_or(0)
+                    };
+                    cmp_flag = match insn.cmp_opt {
+                        1 => dst_val == src_val,
+                        2 => dst_val != src_val,
+                        3 => dst_val >= src_val,
+                        4 => dst_val > src_val,
+                        5 => dst_val <= src_val,
+                        6 => dst_val < src_val,
+                        _ => false,
+                    };
+                    eprintln!(
+                        "  [{old_pc:4}] CMP {dst_val} vs {src_val} → {cmp_flag}"
+                    );
+                    pc += 1;
+                }
+                0 => {
+                    // BRANCH
+                    match insn.sub_group {
+                        0 => {
+                            // GOTO
+                            let should_branch = match insn.branch_opt {
+                                0 => cmp_flag,
+                                1 => !cmp_flag,
+                                _ => true,
+                            };
+                            if should_branch && insn.imm_op1 {
+                                eprintln!(
+                                    "  [{old_pc:4}] GOTO → {} (taken)",
+                                    insn.dst
+                                );
+                                pc = insn.dst as usize;
+                            } else {
+                                eprintln!(
+                                    "  [{old_pc:4}] GOTO → {} (not taken)",
+                                    insn.dst
+                                );
+                                pc += 1;
+                            }
+                        }
+                        2 => {
+                            // PlayPl
+                            let pl = if insn.imm_op1 {
+                                insn.dst
+                            } else {
+                                gprs.get(&insn.dst).copied().unwrap_or(0)
+                            };
+                            eprintln!(
+                                "  [{old_pc:4}] PlayPl({pl}) — stopping trace"
+                            );
+                            break;
+                        }
+                        _ => {
+                            eprintln!("  [{old_pc:4}] BRANCH sub={}", insn.sub_group);
+                            pc += 1;
+                        }
+                    }
+                }
+                _ => {
+                    pc += 1;
+                }
+            }
+        }
+        if steps >= max_steps {
+            eprintln!("  (trace limit reached at pc={pc})");
+        }
+        eprintln!(
+            "  GPR[3002] = {}",
+            gprs.get(&3002).copied().unwrap_or(0)
+        );
+        eprintln!("--- END VM TRACE ---");
     }
 
     // Show button command summary
@@ -774,7 +1045,36 @@ fn trace_mobj_structure(
                 NavigationCommand::Other { opcode, dst, src } => {
                     let grp = (opcode >> 27) & 0x03;
                     let sub = (opcode >> 24) & 0x07;
-                    format!("Other(grp={grp},sub={sub},dst={dst},src={src})")
+                    let set_opt = (opcode >> 4) & 0x0F;
+                    let imm1 = (opcode >> 23) & 1 != 0;
+                    let imm2 = (opcode >> 22) & 1 != 0;
+                    if grp == 2 && sub == 1 {
+                        // SETSYSTEM
+                        let op = match set_opt {
+                            1 => "SET_STREAM",
+                            2 => "SET_NV_TIMER",
+                            3 => "SET_BUTTON_PAGE",
+                            4 => "ENABLE_BUTTON",
+                            5 => "DISABLE_BUTTON",
+                            6 => "SET_SEC_STREAM",
+                            7 => "POPUP_OFF",
+                            _ => "?",
+                        };
+                        let d = if imm1 { format!("{dst}") } else { format!("GPR[{dst}]") };
+                        let s = if imm2 { format!("{src}") } else { format!("GPR[{src}]") };
+                        format!("SETSYSTEM({op}/{set_opt}, {d}, {s})")
+                    } else if grp == 2 && sub == 0 {
+                        // SET (non-immediate, not parsed as SetGpr)
+                        let op = match set_opt {
+                            0 => "=", 1 => "<=>", 2 => "+=", 3 => "-=",
+                            8 => "&=", 9 => "|=", 0xA => "^=", _ => "?=",
+                        };
+                        let d = if imm1 { format!("{dst}") } else { format!("GPR[{dst}]") };
+                        let s = if imm2 { format!("{src}") } else { format!("GPR[{src}]") };
+                        format!("SET {d} {op} {s}")
+                    } else {
+                        format!("Other(grp={grp},sub={sub},dst={dst},src={src})")
+                    }
                 }
             })
             .collect();
