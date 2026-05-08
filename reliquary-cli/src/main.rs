@@ -358,6 +358,7 @@ fn resolve_vuk_for_identify(
 /// parse IG segments → decode RLE bitmaps. Then resolves indirect
 /// button→playlist mappings via `MovieObject.bdmv` tracing.
 #[allow(clippy::print_stderr, reason = "CLI warning output")]
+#[allow(clippy::too_many_lines, reason = "per-clip trace adds lines")]
 fn extract_buttons(
     reader: &reliquary::disc::reader::DiscReader,
     analysis: &reliquary::disc::bdmv::BdmvAnalysis,
@@ -407,6 +408,10 @@ fn extract_buttons(
         // Parse IG segments
         let ig_stream = ig::parse(&ig_payload)
             .map_err(|e| format!("failed to parse IG in clip {}: {e}", ig_clip.clip_id))?;
+
+        if trace {
+            trace_ig_clip(&ig_clip.clip_id, &ig_stream);
+        }
 
         // Collect buttons from all display sets
         for ds in &ig_stream.display_sets {
@@ -564,6 +569,10 @@ fn resolve_mobj_buttons(
         );
     }
 
+    if trace && let Some(ref table) = dispatch_table {
+        trace_composite_dispatch(ig_buttons, table);
+    }
+
     let resolved = mobj::resolve_buttons(
         ig_buttons,
         &mobj_file,
@@ -586,6 +595,71 @@ fn resolve_mobj_buttons(
             .find(|b| b.button_id == rb.button_id && b.playlist.is_none())
         {
             eb.playlist = Some(rb.playlist);
+        }
+    }
+}
+
+/// Dumps per-clip IG structure: display sets, pages, buttons, and commands.
+#[allow(clippy::print_stderr, reason = "diagnostic trace output")]
+fn trace_ig_clip(clip_id: &str, ig_stream: &reliquary::disc::bdmv::ig::IgStream) {
+    use reliquary::disc::bdmv::ig::NavigationCommand;
+
+    let total_buttons: usize = ig_stream
+        .display_sets
+        .iter()
+        .flat_map(|ds| &ds.compositions)
+        .flat_map(|c| &c.pages)
+        .map(|p| p.buttons.len())
+        .sum();
+
+    eprintln!(
+        "\n--- clip {clip_id}: {} display sets, {total_buttons} buttons ---",
+        ig_stream.display_sets.len()
+    );
+
+    for (ds_idx, ds) in ig_stream.display_sets.iter().enumerate() {
+        for comp in &ds.compositions {
+            for page in &comp.pages {
+                let setgpr_buttons: Vec<_> = page
+                    .buttons
+                    .iter()
+                    .filter(|b| {
+                        b.commands
+                            .iter()
+                            .any(|c| matches!(c, NavigationCommand::SetGpr { .. }))
+                    })
+                    .collect();
+
+                if setgpr_buttons.is_empty() {
+                    eprintln!(
+                        "  ds[{ds_idx}] page={}: {} buttons (no SetGpr)",
+                        page.page_id,
+                        page.buttons.len()
+                    );
+                    continue;
+                }
+
+                eprintln!(
+                    "  ds[{ds_idx}] page={}: {} buttons ({} with SetGpr)",
+                    page.page_id,
+                    page.buttons.len(),
+                    setgpr_buttons.len()
+                );
+
+                for button in &setgpr_buttons {
+                    let gprs: Vec<String> = button
+                        .commands
+                        .iter()
+                        .filter_map(|c| match c {
+                            NavigationCommand::SetGpr { register, value } => {
+                                Some(format!("GPR[{register}]={value}"))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    eprintln!("    btn[{:3}] {}", button.button_id, gprs.join(", "));
+                }
+            }
         }
     }
 }
@@ -1159,6 +1233,115 @@ fn trace_mobj_structure(
         );
     }
     eprintln!("=== END TRACE ===\n");
+}
+
+/// Traces composite dispatch resolution per button.
+///
+/// For each button with a `SetGpr` command, shows the `button_id`, key,
+/// composite value (`button_id + key`), IG clip, page, and whether
+/// the composite matched a dispatch table case.
+#[allow(clippy::print_stderr, reason = "diagnostic trace output")]
+fn trace_composite_dispatch(
+    ig_buttons: &[(
+        reliquary::disc::bdmv::ig::Button,
+        reliquary::disc::bdmv::mobj::PlayerContext,
+    )],
+    table: &reliquary::disc::bdmv::mobj::DispatchTable,
+) {
+    use reliquary::disc::bdmv::ig::NavigationCommand;
+
+    eprintln!("\n=== COMPOSITE DISPATCH TRACE ===");
+    eprintln!(
+        "dispatch table: MOBJ[{}], {} cases on GPR[{}]",
+        table.mobj_index,
+        table.cases.len(),
+        table.dispatch_register
+    );
+
+    let mut matched_cases: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut unmatched_count: u32 = 0;
+
+    for (button, ctx) in ig_buttons {
+        // Skip buttons with direct PlayPl
+        let has_play_pl = button
+            .commands
+            .iter()
+            .any(|c| matches!(c, NavigationCommand::PlayPl { .. }));
+        if has_play_pl {
+            continue;
+        }
+
+        // Find SetGpr assignments
+        let gpr_assignments: Vec<(u32, u32)> = button
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                NavigationCommand::SetGpr { register, value } => Some((*register, *value)),
+                _ => None,
+            })
+            .collect();
+
+        if gpr_assignments.is_empty() {
+            continue;
+        }
+
+        // Skip GotoMobj buttons (pattern 1 — not dispatch table)
+        let has_goto_mobj = button
+            .commands
+            .iter()
+            .any(|c| matches!(c, NavigationCommand::GotoMobj { .. }));
+        if has_goto_mobj {
+            continue;
+        }
+
+        for &(register, value) in &gpr_assignments {
+            let composite = u32::from(button.button_id) + value;
+            let case_match = table.cases.iter().find(|(cv, _)| *cv == composite);
+
+            if let Some(&(_, playlist)) = case_match {
+                matched_cases.insert(composite);
+                eprintln!(
+                    "  btn[{:4}] ig={:05} page={} GPR[{}]={} composite={:3} → playlist {:3}",
+                    button.button_id,
+                    ctx.ig_stream,
+                    ctx.page_id,
+                    register,
+                    value,
+                    composite,
+                    playlist
+                );
+            } else {
+                unmatched_count += 1;
+                eprintln!(
+                    "  btn[{:4}] ig={:05} page={} GPR[{}]={} composite={:3} → NO MATCH",
+                    button.button_id, ctx.ig_stream, ctx.page_id, register, value, composite
+                );
+            }
+        }
+    }
+
+    // Summary: which table cases were reached, which were not
+    let all_cases: std::collections::HashSet<u32> = table.cases.iter().map(|(cv, _)| *cv).collect();
+    let unreached: Vec<(u32, u16)> = table
+        .cases
+        .iter()
+        .filter(|(cv, _)| !matched_cases.contains(cv))
+        .copied()
+        .collect();
+
+    eprintln!(
+        "\n  matched: {} of {} cases, {} buttons unmatched",
+        matched_cases.len(),
+        all_cases.len(),
+        unmatched_count
+    );
+    if !unreached.is_empty() {
+        eprintln!("  unreached cases:");
+        for (cv, pl) in &unreached {
+            eprintln!("    case {cv} → playlist {pl}");
+        }
+    }
+    eprintln!("=== END COMPOSITE DISPATCH TRACE ===\n");
 }
 
 /// Presents content buttons (with `PlayPl`) and prompts for names.
