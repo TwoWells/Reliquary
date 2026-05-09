@@ -370,8 +370,10 @@ fn extract_buttons(
     use reliquary::disc::bdmv::mobj::PlayerContext;
 
     let mut buttons = Vec::new();
-    // Collect raw IG buttons with player context for MOBJ resolution
+    // Collect raw IG buttons with player context for legacy MOBJ resolution
     let mut ig_buttons: Vec<(ig::Button, PlayerContext)> = Vec::new();
+    // Collect page structure per clip for execution-based resolution
+    let mut clip_pages: Vec<(u16, Vec<ig::Page>)> = Vec::new();
 
     for ig_clip in &analysis.ig_clips {
         // Read clip (decrypting if VUK available)
@@ -481,14 +483,29 @@ fn extract_buttons(
                 }
             }
         }
+
+        // Collect pages for execution-based resolution (one copy per clip,
+        // using the first display set's compositions — language variants
+        // share identical button programs).
+        let pages: Vec<ig::Page> = ig_stream
+            .display_sets
+            .into_iter()
+            .take(1)
+            .flat_map(|ds| ds.compositions)
+            .flat_map(|c| c.pages)
+            .collect();
+        if !pages.is_empty() {
+            clip_pages.push((ig_pid, pages));
+        }
     }
 
     // Resolve indirect button → playlist mappings via MovieObject.bdmv
-    if !ig_buttons.is_empty() {
+    if !ig_buttons.is_empty() || !clip_pages.is_empty() {
         let valid_playlists: HashSet<u32> = analysis.playlists.iter().map(|p| p.number).collect();
         resolve_mobj_buttons(
             reader,
             &ig_buttons,
+            &clip_pages,
             &mut buttons,
             &valid_playlists,
             &analysis.menu_playlists,
@@ -501,9 +518,9 @@ fn extract_buttons(
 
 /// Resolves indirect button→playlist mappings via `MovieObject.bdmv`.
 ///
-/// Reads and parses the MOBJ file, finds dispatch entry points from
-/// menu playlist references, runs the resolver, and fills in `playlist`
-/// fields on `ExtractedButton`s that were `None`.
+/// Uses execution-based resolution (running button programs through the VM)
+/// as the primary strategy, with the legacy pattern-matching resolver as
+/// fallback for any buttons the executor doesn't resolve.
 #[allow(clippy::print_stderr, reason = "CLI status output")]
 fn resolve_mobj_buttons(
     reader: &reliquary::disc::reader::DiscReader,
@@ -511,6 +528,7 @@ fn resolve_mobj_buttons(
         reliquary::disc::bdmv::ig::Button,
         reliquary::disc::bdmv::mobj::PlayerContext,
     )],
+    clip_pages: &[(u16, Vec<reliquary::disc::bdmv::ig::Page>)],
     buttons: &mut [ExtractedButton],
     valid_playlists: &HashSet<u32>,
     menu_playlists: &[u32],
@@ -546,17 +564,6 @@ fn resolve_mobj_buttons(
         trace_mobj_structure(&mobj_file, valid_playlists, ig_buttons);
     }
 
-    // Find dispatch entry points for GPR dispatch resolution
-    let menu_set: HashSet<u32> = menu_playlists.iter().copied().collect();
-    let dispatch_entries = mobj::find_dispatch_entries(&mobj_file, &menu_set);
-
-    if !dispatch_entries.is_empty() {
-        eprintln!(
-            "found {} MOBJ dispatch entry points from menu playlists",
-            dispatch_entries.len()
-        );
-    }
-
     // Extract dispatch table from central dispatch MOBJ (SET_BUTTON_PAGE pattern)
     let dispatch_table = mobj::extract_dispatch_table(&mobj_file);
 
@@ -571,30 +578,71 @@ fn resolve_mobj_buttons(
 
     if trace && let Some(ref table) = dispatch_table {
         trace_composite_dispatch(ig_buttons, table);
+        trace_dispatch_handlers(&mobj_file, table);
     }
 
-    let resolved = mobj::resolve_buttons(
-        ig_buttons,
+    // Primary: execution-based resolution (runs ALL button commands
+    // through the VM, including CMP/GOTO/AND/ADD in Other variants)
+    let nav_clips: Vec<mobj::NavClipInput<'_>> = clip_pages
+        .iter()
+        .map(|(pid, pages)| mobj::NavClipInput {
+            ig_pid: *pid,
+            pages: pages.iter().collect(),
+        })
+        .collect();
+
+    let exec_resolved = mobj::resolve_via_execution(
+        &nav_clips,
         &mobj_file,
-        valid_playlists,
-        &dispatch_entries,
         dispatch_table.as_ref(),
+        valid_playlists,
     );
 
-    if !resolved.is_empty() {
+    if !exec_resolved.is_empty() {
         eprintln!(
-            "resolved {} button playlist mappings via MovieObject.bdmv",
-            resolved.len()
+            "resolved {} button playlist mappings via execution",
+            exec_resolved.len()
         );
     }
 
-    // Fill in resolved playlists on the extracted buttons
-    for rb in &resolved {
+    // Fill in execution-resolved playlists
+    for rb in &exec_resolved {
         if let Some(eb) = buttons
             .iter_mut()
             .find(|b| b.button_id == rb.button_id && b.playlist.is_none())
         {
             eb.playlist = Some(rb.playlist);
+        }
+    }
+
+    // Fallback: legacy pattern-matching resolver for any remaining buttons
+    let unresolved_count = buttons.iter().filter(|b| b.playlist.is_none()).count();
+
+    if unresolved_count > 0 && !ig_buttons.is_empty() {
+        let menu_set: HashSet<u32> = menu_playlists.iter().copied().collect();
+        let dispatch_entries = mobj::find_dispatch_entries(&mobj_file, &menu_set);
+
+        let legacy_resolved = mobj::resolve_buttons(
+            ig_buttons,
+            &mobj_file,
+            valid_playlists,
+            &dispatch_entries,
+            dispatch_table.as_ref(),
+        );
+
+        let mut legacy_count = 0u32;
+        for rb in &legacy_resolved {
+            if let Some(eb) = buttons
+                .iter_mut()
+                .find(|b| b.button_id == rb.button_id && b.playlist.is_none())
+            {
+                eb.playlist = Some(rb.playlist);
+                legacy_count += 1;
+            }
+        }
+
+        if legacy_count > 0 {
+            eprintln!("resolved {legacy_count} additional buttons via legacy pattern matching");
         }
     }
 }
@@ -647,17 +695,39 @@ fn trace_ig_clip(clip_id: &str, ig_stream: &reliquary::disc::bdmv::ig::IgStream)
                 );
 
                 for button in &setgpr_buttons {
-                    let gprs: Vec<String> = button
+                    let has_other = button
                         .commands
                         .iter()
-                        .filter_map(|c| match c {
-                            NavigationCommand::SetGpr { register, value } => {
-                                Some(format!("GPR[{register}]={value}"))
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    eprintln!("    btn[{:3}] {}", button.button_id, gprs.join(", "));
+                        .any(|c| matches!(c, NavigationCommand::Other { .. }));
+
+                    if has_other {
+                        // Full disassembly for complex buttons
+                        eprintln!(
+                            "    btn[{:3}] ({} cmds):",
+                            button.button_id,
+                            button.commands.len(),
+                        );
+                        for (i, cmd) in button.commands.iter().enumerate() {
+                            let insn = reliquary::disc::bdmv::mobj::command_to_instruction(cmd);
+                            eprintln!(
+                                "      [{i:2}] {}",
+                                reliquary::disc::bdmv::mobj::format_instruction(&insn),
+                            );
+                        }
+                    } else {
+                        // Compact summary for simple buttons
+                        let gprs: Vec<String> = button
+                            .commands
+                            .iter()
+                            .filter_map(|c| match c {
+                                NavigationCommand::SetGpr { register, value } => {
+                                    Some(format!("GPR[{register}]={value}"))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        eprintln!("    btn[{:3}] {}", button.button_id, gprs.join(", "));
+                    }
                 }
             }
         }
@@ -1342,6 +1412,57 @@ fn trace_composite_dispatch(
         }
     }
     eprintln!("=== END COMPOSITE DISPATCH TRACE ===\n");
+}
+
+/// Traces dispatch handler execution: for each case, runs the handler
+/// and dumps the resulting GPR[3xxx] state.
+#[allow(clippy::print_stderr, reason = "diagnostic trace output")]
+fn trace_dispatch_handlers(
+    mobj_file: &reliquary::disc::bdmv::mobj::MovieObjectFile,
+    table: &reliquary::disc::bdmv::mobj::DispatchTable,
+) {
+    use reliquary::disc::bdmv::mobj;
+
+    eprintln!("\n=== DISPATCH HANDLER TRACE ===");
+    let dispatch_instrs = &mobj_file.objects[table.mobj_index].instructions;
+
+    for &(case_val, playlist) in &table.cases {
+        let handler_pc = mobj::find_handler_pc(dispatch_instrs, case_val, table.dispatch_register);
+        let Some(pc) = handler_pc else {
+            eprintln!("  case {case_val:3} → pl {playlist:3}: handler PC NOT FOUND");
+            continue;
+        };
+
+        let mut gprs = std::collections::HashMap::<u32, u32>::new();
+        let _ = mobj::run_mobj_vm(
+            dispatch_instrs,
+            pc,
+            &mut gprs,
+            &std::collections::HashSet::new(),
+        );
+
+        // Show only GPR[3xxx] entries (the configuration registers)
+        let mut config_gprs: Vec<(u32, u32)> = gprs
+            .iter()
+            .filter(|&(&k, _)| (3000..4000).contains(&k))
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        config_gprs.sort_by_key(|&(k, _)| k);
+
+        let gpr_summary: Vec<String> = config_gprs
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        eprintln!(
+            "  case {case_val:3} → pl {playlist:3} (pc={pc:4}): {}",
+            if gpr_summary.is_empty() {
+                "(no GPR[3xxx] set)".to_string()
+            } else {
+                gpr_summary.join(", ")
+            }
+        );
+    }
+    eprintln!("=== END DISPATCH HANDLER TRACE ===\n");
 }
 
 /// Presents content buttons (with `PlayPl`) and prompts for names.
