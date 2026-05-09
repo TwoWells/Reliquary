@@ -581,6 +581,10 @@ fn resolve_mobj_buttons(
         trace_dispatch_handlers(&mobj_file, table);
     }
 
+    if trace {
+        trace_mobj0_database(&mobj_file);
+    }
+
     // Primary: execution-based resolution (runs ALL button commands
     // through the VM, including CMP/GOTO/AND/ADD in Other variants)
     let nav_clips: Vec<mobj::NavClipInput<'_>> = clip_pages
@@ -613,6 +617,10 @@ fn resolve_mobj_buttons(
         {
             eb.playlist = Some(rb.playlist);
         }
+    }
+
+    if trace && let Some(ref table) = dispatch_table {
+        trace_execution_coverage(&exec_resolved, table, clip_pages);
     }
 
     // Fallback: legacy pattern-matching resolver for any remaining buttons
@@ -668,37 +676,55 @@ fn trace_ig_clip(clip_id: &str, ig_stream: &reliquary::disc::bdmv::ig::IgStream)
     for (ds_idx, ds) in ig_stream.display_sets.iter().enumerate() {
         for comp in &ds.compositions {
             for page in &comp.pages {
-                let setgpr_buttons: Vec<_> = page
+                // Buttons with navigation commands (SetGpr or Other)
+                let nav_buttons: Vec<_> = page
                     .buttons
                     .iter()
                     .filter(|b| {
-                        b.commands
-                            .iter()
-                            .any(|c| matches!(c, NavigationCommand::SetGpr { .. }))
+                        b.commands.iter().any(|c| {
+                            matches!(
+                                c,
+                                NavigationCommand::SetGpr { .. } | NavigationCommand::Other { .. }
+                            )
+                        })
                     })
                     .collect();
 
-                if setgpr_buttons.is_empty() {
+                if nav_buttons.is_empty() {
                     eprintln!(
-                        "  ds[{ds_idx}] page={}: {} buttons (no SetGpr)",
+                        "  ds[{ds_idx}] page={}: {} buttons (no nav cmds)",
                         page.page_id,
                         page.buttons.len()
                     );
                     continue;
                 }
 
+                let setgpr_count = nav_buttons
+                    .iter()
+                    .filter(|b| {
+                        b.commands
+                            .iter()
+                            .any(|c| matches!(c, NavigationCommand::SetGpr { .. }))
+                    })
+                    .count();
+                let other_only_count = nav_buttons.len() - setgpr_count;
                 eprintln!(
-                    "  ds[{ds_idx}] page={}: {} buttons ({} with SetGpr)",
+                    "  ds[{ds_idx}] page={}: {} buttons ({} SetGpr, {} Other-only)",
                     page.page_id,
                     page.buttons.len(),
-                    setgpr_buttons.len()
+                    setgpr_count,
+                    other_only_count,
                 );
 
-                for button in &setgpr_buttons {
+                for button in &nav_buttons {
                     let has_other = button
                         .commands
                         .iter()
                         .any(|c| matches!(c, NavigationCommand::Other { .. }));
+                    let has_setgpr = button
+                        .commands
+                        .iter()
+                        .any(|c| matches!(c, NavigationCommand::SetGpr { .. }));
 
                     if has_other {
                         // Full disassembly for complex buttons
@@ -714,8 +740,8 @@ fn trace_ig_clip(clip_id: &str, ig_stream: &reliquary::disc::bdmv::ig::IgStream)
                                 reliquary::disc::bdmv::mobj::format_instruction(&insn),
                             );
                         }
-                    } else {
-                        // Compact summary for simple buttons
+                    } else if has_setgpr {
+                        // Compact summary for simple SetGpr-only buttons
                         let gprs: Vec<String> = button
                             .commands
                             .iter()
@@ -1463,6 +1489,306 @@ fn trace_dispatch_handlers(
         );
     }
     eprintln!("=== END DISPATCH HANDLER TRACE ===\n");
+}
+
+/// Traces the GPR database state populated by MOBJ[0] (First Play).
+///
+/// Executes MOBJ[0] with BD spec boot PSR defaults and dumps all
+/// GPR[3000–3999] registers — the per-content-item configuration
+/// database that data-driven button programs read. Highlights known
+/// content config registers (3563, 3773, 3774, 3775, 3776).
+#[allow(clippy::print_stderr, reason = "diagnostic trace output")]
+fn trace_mobj0_database(mobj_file: &reliquary::disc::bdmv::mobj::MovieObjectFile) {
+    use reliquary::disc::bdmv::mobj;
+
+    eprintln!("\n=== MOBJ[0] DATABASE ===");
+
+    let Some(mobj0) = mobj_file.objects.first() else {
+        eprintln!("  (no MOBJ[0])");
+        eprintln!("=== END MOBJ[0] DATABASE ===\n");
+        return;
+    };
+
+    eprintln!("{} instructions", mobj0.instructions.len());
+
+    // Execute MOBJ[0] with BD spec boot PSR defaults — same seeds
+    // as resolve_via_execution uses.
+    let psr: u32 = 0x8000_0000;
+    let mut gprs = std::collections::HashMap::<u32, u32>::new();
+    gprs.insert(psr | 0x01, 0xFF); // primary audio
+    gprs.insert(psr | 0x02, 0xFFFE); // PG/TextST
+    gprs.insert(psr | 0x03, 0xFF); // angle
+    gprs.insert(psr | 0x04, 0xFFFF); // title (init guard)
+    gprs.insert(psr | 0x0A, 0xFFFF); // selected button
+    gprs.insert(psr | 0x0C, 0xFF); // user style
+    gprs.insert(psr | 0x0D, 0xFF); // parental level
+    gprs.insert(psr | 0x0E, 0xFFFF); // secondary A/V
+    gprs.insert(psr | 0x0F, 0x0002_0000); // audio cap
+    gprs.insert(psr | 0x1D, 0x0200); // profile 2.0
+    gprs.insert(psr | 0x1F, 0x0200); // player version
+
+    let _ = mobj::run_mobj_vm(
+        &mobj0.instructions,
+        0,
+        &mut gprs,
+        &std::collections::HashSet::new(),
+    );
+
+    // Collect GPR[3xxx] entries (disc database)
+    let mut db_entries: Vec<(u32, u32)> = gprs
+        .iter()
+        .filter(|&(k, _)| (3000..4000).contains(k))
+        .map(|(&k, &v)| (k, v))
+        .collect();
+    db_entries.sort_by_key(|&(k, _)| k);
+
+    if db_entries.is_empty() {
+        eprintln!("  (no GPR[3xxx] entries — disc has no database)");
+    } else {
+        let first = db_entries.first().map_or(0, |&(k, _)| k);
+        let last = db_entries.last().map_or(0, |&(k, _)| k);
+        eprintln!("  {} registers in GPR[{first}–{last}]", db_entries.len());
+
+        // Highlight known content config registers
+        let config_labels: &[(u32, &str)] = &[
+            (3563, "content_index"),
+            (3773, "page"),
+            (3774, "items_per_page"),
+            (3775, "parameter"),
+            (3776, "button_id"),
+        ];
+        eprintln!("  content config:");
+        for &(reg, label) in config_labels {
+            if let Some(&(_, val)) = db_entries.iter().find(|(k, _)| *k == reg) {
+                eprintln!("    GPR[{reg}] = {val:6}  ({label})");
+            } else {
+                eprintln!("    GPR[{reg}] = (unset)  ({label})");
+            }
+        }
+
+        // Compact dump of all database entries (8 per line)
+        eprintln!("  full dump:");
+        for chunk in db_entries.chunks(8) {
+            let entries: Vec<String> = chunk.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            eprintln!("    {}", entries.join("  "));
+        }
+    }
+
+    // Show GPR[4xxx] working registers (used as scratch by button programs)
+    let mut work_entries: Vec<(u32, u32)> = gprs
+        .iter()
+        .filter(|&(k, _)| (4000..5000).contains(k))
+        .map(|(&k, &v)| (k, v))
+        .collect();
+    work_entries.sort_by_key(|&(k, _)| k);
+    if !work_entries.is_empty() {
+        let summary: Vec<String> = work_entries
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        eprintln!(
+            "  {} GPR[4xxx] working: {}",
+            work_entries.len(),
+            summary.join(", ")
+        );
+    }
+
+    eprintln!("=== END MOBJ[0] DATABASE ===\n");
+}
+
+/// Traces execution resolution coverage against the dispatch table.
+///
+/// Shows which dispatch cases were resolved by the BFS executor, and
+/// for each unresolved case, reverse-computes which `(button_id, key)`
+/// pair could produce it. Checks whether a matching `SetGpr(4075, key)`
+/// button exists on any IG page. This identifies whether unresolved
+/// extras need new GPR states on existing pages vs entirely new button
+/// discovery.
+#[allow(clippy::print_stderr, reason = "diagnostic trace output")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "reverse lookup with inventory collection is inherently long"
+)]
+fn trace_execution_coverage(
+    exec_resolved: &[reliquary::disc::bdmv::mobj::ResolvedButton],
+    table: &reliquary::disc::bdmv::mobj::DispatchTable,
+    clip_pages: &[(u16, Vec<reliquary::disc::bdmv::ig::Page>)],
+) {
+    use reliquary::disc::bdmv::ig::NavigationCommand;
+
+    eprintln!("\n=== EXECUTION COVERAGE ===");
+    eprintln!(
+        "dispatch table: MOBJ[{}], {} cases on GPR[{}]",
+        table.mobj_index,
+        table.cases.len(),
+        table.dispatch_register
+    );
+
+    // Map resolved playlists to dispatch cases
+    let mut resolved_cases = std::collections::HashSet::<u32>::new();
+
+    for rb in exec_resolved {
+        let case_match: Vec<u32> = table
+            .cases
+            .iter()
+            .filter(|(_, pl)| *pl == rb.playlist)
+            .map(|(cv, _)| *cv)
+            .collect();
+        for &cv in &case_match {
+            resolved_cases.insert(cv);
+        }
+        if case_match.is_empty() {
+            eprintln!(
+                "  resolved: pl {:3} (btn[{}]) — not in dispatch table",
+                rb.playlist, rb.button_id
+            );
+        } else {
+            for cv in &case_match {
+                eprintln!(
+                    "  resolved: case {:3} -> pl {:3} (btn[{}])",
+                    cv, rb.playlist, rb.button_id
+                );
+            }
+        }
+    }
+
+    // Find unresolved cases
+    let unresolved: Vec<(u32, u16)> = table
+        .cases
+        .iter()
+        .filter(|(cv, _)| !resolved_cases.contains(cv))
+        .copied()
+        .collect();
+
+    eprintln!(
+        "\n  {} of {} dispatch cases resolved",
+        resolved_cases.len(),
+        table.cases.len()
+    );
+
+    if unresolved.is_empty() {
+        eprintln!("  all cases covered!");
+        eprintln!("=== END EXECUTION COVERAGE ===\n");
+        return;
+    }
+
+    // Build button inventory from the first clip only — all clips share
+    // the same page/button structure (language variants), so using the
+    // first avoids N× duplication in the reverse lookup.
+    #[allow(
+        clippy::items_after_statements,
+        reason = "ButtonInfo is local to this trace function"
+    )]
+    struct ButtonInfo {
+        button_id: u16,
+        page_id: u8,
+        key_4075: Option<u32>,
+        has_complex: bool,
+    }
+
+    let mut inventory: Vec<ButtonInfo> = Vec::new();
+    let mut seen = std::collections::HashSet::<(u16, u8)>::new();
+    for (_, pages) in clip_pages {
+        for page in pages {
+            for button in &page.buttons {
+                if !seen.insert((button.button_id, page.page_id)) {
+                    continue;
+                }
+                let key_4075 = button.commands.iter().find_map(|c| {
+                    if let NavigationCommand::SetGpr {
+                        register: 4075,
+                        value,
+                    } = c
+                    {
+                        Some(*value)
+                    } else {
+                        None
+                    }
+                });
+                let has_complex = button
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, NavigationCommand::Other { .. }));
+                inventory.push(ButtonInfo {
+                    button_id: button.button_id,
+                    page_id: page.page_id,
+                    key_4075,
+                    has_complex,
+                });
+            }
+        }
+    }
+
+    let unique_pages: std::collections::HashSet<u8> = inventory.iter().map(|b| b.page_id).collect();
+    eprintln!(
+        "  {} cases unresolved — reverse lookup ({} unique buttons across {} pages):",
+        unresolved.len(),
+        inventory.len(),
+        unique_pages.len()
+    );
+
+    for &(case_val, playlist) in &unresolved {
+        let mut exact_matches: Vec<String> = Vec::new();
+        let mut near_miss_count: u32 = 0;
+        // Complex candidates grouped by page: page_id → Vec<(button_id, needed_key)>
+        let mut complex_by_page = std::collections::BTreeMap::<u8, Vec<(u16, u32)>>::new();
+
+        for bi in &inventory {
+            let Some(needed_key) = case_val.checked_sub(u32::from(bi.button_id)) else {
+                continue;
+            };
+
+            // Complex buttons may have SetGpr(4075, N) as an early
+            // instruction (e.g. items_per_page) that is overwritten by
+            // subsequent computed operations. Treat them as complex
+            // candidates regardless of the initial SetGpr value.
+            if bi.has_complex {
+                complex_by_page
+                    .entry(bi.page_id)
+                    .or_default()
+                    .push((bi.button_id, needed_key));
+            } else {
+                match bi.key_4075 {
+                    Some(actual_key) if actual_key == needed_key => {
+                        exact_matches.push(format!(
+                            "btn[{}] page={} SetGpr(4075, {needed_key})",
+                            bi.button_id, bi.page_id
+                        ));
+                    }
+                    Some(_) => {
+                        near_miss_count += 1;
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        if exact_matches.is_empty() && near_miss_count == 0 && complex_by_page.is_empty() {
+            eprintln!("    case {case_val:3} -> pl {playlist:3}: (no candidate buttons)");
+            continue;
+        }
+
+        eprintln!("    case {case_val:3} -> pl {playlist:3}:");
+        for m in &exact_matches {
+            eprintln!("      match: {m}");
+        }
+        if near_miss_count > 0 {
+            eprintln!("      {near_miss_count} near-miss buttons (wrong key)");
+        }
+        if !complex_by_page.is_empty() {
+            let total: usize = complex_by_page.values().map(Vec::len).sum();
+            eprintln!("      {total} complex buttons (computed key):");
+            for (page_id, btns) in &complex_by_page {
+                let btn_ids: Vec<String> = btns
+                    .iter()
+                    .map(|(id, key)| format!("btn[{id}]+{key}"))
+                    .collect();
+                eprintln!("        page {page_id}: {}", btn_ids.join(", "));
+            }
+        }
+    }
+
+    eprintln!("=== END EXECUTION COVERAGE ===\n");
 }
 
 /// Presents content buttons (with `PlayPl`) and prompts for names.
