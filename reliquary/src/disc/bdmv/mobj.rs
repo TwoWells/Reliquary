@@ -131,11 +131,21 @@ pub struct DispatchEntry {
 /// ending with `PlayPl(playlist)`. This table maps case values directly
 /// to playlist numbers, bypassing the player runtime.
 ///
-/// The dispatch case is `button_id + key`, where `button_id` is the
-/// button's IG identifier and `key` is the `SetGpr(4075, N)` value.
-/// The button bytecode computes `(PSR[10] & 0xFFFF) + GPR[4075]` and
-/// passes it to `SET_BUTTON_PAGE`; `PSR[10]` at activation time equals
-/// the button's own `button_id`.
+/// **Derivation (from libbluray `hdmv_vm.c:837` and
+/// `graphics_controller.c:1644`):** `SET_BUTTON_PAGE` in an IG context
+/// packs `button_id = dst & 0xFFFF` into the event param. The graphics
+/// controller calls `_select_button(gc, button_id)` which writes
+/// `PSR[10] = button_id`. The dispatch MOBJ copies PSR\[10\] into the
+/// switch register at its resume point.
+///
+/// Two resolution paths:
+/// - **Buttons with commands:** bytecode computes a composite (e.g.
+///   `(PSR[10] & 0xFFFF) + key`) and calls `SET_BUTTON_PAGE`. The
+///   composite value is the dispatch case.
+/// - **NOP anchor buttons:** buttons with no commands whose
+///   `button_id` directly matches a dispatch case. When the player
+///   selects an anchor (via cursor navigation or `SET_BUTTON_PAGE`
+///   page transition), `PSR[10] = button_id` becomes the case.
 #[derive(Debug)]
 pub struct DispatchTable {
     /// MOBJ index containing the dispatch table.
@@ -163,8 +173,9 @@ const BRANCH_PLAY: u8 = 2;
 /// `SET_BUTTON_PAGE` operation within the SETSYSTEM sub-group (`sub_group=1`).
 ///
 /// Terminates IG execution and navigates to a new button/page. The
-/// composite value (dst operand) is used by the player runtime to set
-/// GPR[3002] in the dispatch MOBJ.
+/// player runtime packs `button_id = dst & 0xFFFF` and selects that
+/// button on the target page, updating `PSR[10]`. The dispatch MOBJ
+/// reads `PSR[10]` into its switch register on resume.
 const SET_BUTTON_PAGE_OPT: u8 = 3;
 
 /// Maximum instructions the mini-VM will execute before giving up.
@@ -894,6 +905,43 @@ pub fn resolve_via_execution(
                 continue;
             }
 
+            // NOP anchor resolution: buttons whose only commands are
+            // NOPs are navigation anchors whose button_id IS the
+            // dispatch case.
+            //
+            // In the WB SET_BUTTON_PAGE pattern, the player runtime
+            // sets PSR[10] to the selected button_id. When a NOP
+            // anchor is selected (via SET_BUTTON_PAGE navigation or
+            // direct user cursor navigation) and activated, PSR[10]
+            // becomes the dispatch case. The dispatch MOBJ copies
+            // PSR[10] into its switch register and dispatches.
+            //
+            // WB authoring emits a single NOP instruction (all-zero
+            // 12-byte command) on anchor buttons rather than a true
+            // zero-command button.
+            //
+            // Reference: libbluray `graphics_controller.c`
+            // `_select_button()` → writes PSR[10] = button_id.
+            let is_nop_anchor = button.commands.is_empty()
+                || button.commands.iter().all(|c| {
+                    matches!(c, NavigationCommand::Other { opcode, dst, src }
+                        if *opcode == 0 && *dst == 0 && *src == 0)
+                });
+            if is_nop_anchor {
+                if let Some(table) = dispatch_table {
+                    let bid = u32::from(button.button_id);
+                    if let Some(&(_, pl)) = table.cases.iter().find(|(cv, _)| *cv == bid)
+                        && resolved_set.insert((button.button_id, pl))
+                    {
+                        resolved.push(ResolvedButton {
+                            button_id: button.button_id,
+                            playlist: pl,
+                        });
+                    }
+                }
+                continue;
+            }
+
             let ctx = PlayerContext {
                 ig_stream: ig_pid,
                 selected_button_id: button.button_id,
@@ -1559,6 +1607,11 @@ fn fetch_operand(is_immediate: bool, raw: u32, gprs: &std::collections::HashMap<
         raw
     } else if raw & PSR_FLAG != 0 {
         // PSR reference — try PSR key first, fall back to GPR alias.
+        // This fallback is also how SET_BUTTON_PAGE operands resolve:
+        // libbluray's `_read_setbuttonpage_reg` extracts bits 0-11 as
+        // the register number, but we receive the full raw operand
+        // (e.g. 0x80000FED). The PSR lookup misses, the fallback
+        // strips PSR_FLAG and finds GPR[4077].
         gprs.get(&raw)
             .or_else(|| gprs.get(&(raw & !PSR_FLAG)))
             .copied()
@@ -3800,5 +3853,180 @@ mod tests {
 
         assert_eq!(resolved.len(), 1, "one button resolved");
         assert_eq!(resolved[0].playlist, 208, "composite 3+5=8 → 208");
+    }
+
+    // ── NOP anchor resolution tests ──────────────────────────────────
+
+    #[test]
+    fn exec_nop_anchor_resolves_via_button_id() {
+        // NOP anchor buttons resolve by matching their button_id
+        // directly against the dispatch table. This models the WB
+        // SET_BUTTON_PAGE pattern where anchor button_ids on extras
+        // pages are the dispatch cases (PSR[10] = button_id).
+        //
+        // Tests both true empty commands and single-NOP commands
+        // (WB authoring emits a single all-zero 12-byte NOP).
+        let anchor_12 = make_button(12, vec![]);
+        let anchor_15 = make_button(15, vec![spec_to_other(&InsnSpec::Nop)]);
+        let anchor_20 = make_button(20, vec![]);
+
+        let dispatch_mobj =
+            build_dispatch_mobj(&[(5, 205), (12, 212), (15, 215), (20, 220), (32, 232)]);
+        let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let table = extract_dispatch_table(&mobj_file).expect("should extract table");
+
+        let page = make_page(2, vec![anchor_12, anchor_15, anchor_20]);
+        let clips = vec![NavClipInput {
+            ig_pid: 0x1200,
+            pages: vec![&page],
+        }];
+
+        let resolved = resolve_via_execution(
+            &clips,
+            &mobj_file,
+            Some(&table),
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(resolved.len(), 3, "three anchors resolved");
+        let playlists: std::collections::HashSet<u16> =
+            resolved.iter().map(|r| r.playlist).collect();
+        assert!(playlists.contains(&212), "anchor 12 → 212");
+        assert!(playlists.contains(&215), "anchor 15 → 215");
+        assert!(playlists.contains(&220), "anchor 20 → 220");
+    }
+
+    #[test]
+    fn exec_nop_anchor_skipped_without_dispatch_table() {
+        // Without a dispatch table, NOP anchors cannot resolve.
+        let anchor = make_button(12, vec![]);
+
+        let mobj_data = MobjBuilder::new().object(&[InsnSpec::Nop]).build();
+        let mobj_file = parse(&mobj_data).expect("should parse");
+
+        let page = make_page(0, vec![anchor]);
+        let clips = vec![NavClipInput {
+            ig_pid: 0x1200,
+            pages: vec![&page],
+        }];
+
+        let resolved =
+            resolve_via_execution(&clips, &mobj_file, None, &std::collections::HashSet::new());
+        assert!(
+            resolved.is_empty(),
+            "no dispatch table → no anchor resolution"
+        );
+    }
+
+    #[test]
+    fn exec_nop_anchor_unmatched_id_skipped() {
+        // NOP anchor whose button_id doesn't match any dispatch case.
+        let anchor = make_button(99, vec![]);
+
+        let dispatch_mobj = build_dispatch_mobj(&[(5, 205), (10, 210), (15, 215)]);
+        let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let table = extract_dispatch_table(&mobj_file).expect("should extract table");
+
+        let page = make_page(0, vec![anchor]);
+        let clips = vec![NavClipInput {
+            ig_pid: 0x1200,
+            pages: vec![&page],
+        }];
+
+        let resolved = resolve_via_execution(
+            &clips,
+            &mobj_file,
+            Some(&table),
+            &std::collections::HashSet::new(),
+        );
+        assert!(
+            resolved.is_empty(),
+            "button_id 99 not in dispatch table → no resolution"
+        );
+    }
+
+    #[test]
+    fn exec_nop_anchors_coexist_with_command_buttons() {
+        // Mix of NOP anchors and command buttons on the same page.
+        // Both should resolve independently.
+        let command_button = make_button(
+            3,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 4075,
+                    value: 5,
+                },
+                NavigationCommand::SetGpr {
+                    register: 4076,
+                    value: 0xFFFF,
+                },
+                spec_to_other(&InsnSpec::SetGprReg(4077, PSR_FLAG | 0x0A)),
+                spec_to_other(&InsnSpec::AndReg(4077, 4076)),
+                spec_to_other(&InsnSpec::AddReg(4077, 4075)),
+                spec_to_other(&InsnSpec::SetButtonPage(4077, 0)),
+            ],
+        );
+        let anchor = make_button(15, vec![]);
+
+        let dispatch_mobj = build_dispatch_mobj(&[(8, 208), (15, 215), (20, 220)]);
+        let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let table = extract_dispatch_table(&mobj_file).expect("should extract table");
+
+        let page = make_page(0, vec![command_button, anchor]);
+        let clips = vec![NavClipInput {
+            ig_pid: 0x1200,
+            pages: vec![&page],
+        }];
+
+        let resolved = resolve_via_execution(
+            &clips,
+            &mobj_file,
+            Some(&table),
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(resolved.len(), 2, "command button + anchor both resolved");
+        let playlists: std::collections::HashSet<u16> =
+            resolved.iter().map(|r| r.playlist).collect();
+        assert!(playlists.contains(&208), "command button 3+5=8 → 208");
+        assert!(playlists.contains(&215), "anchor 15 → 215");
+    }
+
+    #[test]
+    fn exec_nop_anchor_deduplicates() {
+        // Same anchor on multiple pages should only produce one resolution.
+        let anchor_p0 = make_button(12, vec![]);
+        let anchor_p1 = make_button(12, vec![]);
+
+        let dispatch_mobj = build_dispatch_mobj(&[(12, 212), (15, 215), (20, 220)]);
+        let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let table = extract_dispatch_table(&mobj_file).expect("should extract table");
+
+        let page0 = make_page(0, vec![anchor_p0]);
+        let page1 = make_page(1, vec![anchor_p1]);
+        let clips = vec![NavClipInput {
+            ig_pid: 0x1200,
+            pages: vec![&page0, &page1],
+        }];
+
+        let resolved = resolve_via_execution(
+            &clips,
+            &mobj_file,
+            Some(&table),
+            &std::collections::HashSet::new(),
+        );
+
+        let matching = resolved
+            .iter()
+            .filter(|r| r.button_id == 12 && r.playlist == 212)
+            .count();
+        assert_eq!(
+            matching, 1,
+            "same anchor on two pages → deduplicated to one"
+        );
     }
 }
