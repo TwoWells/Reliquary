@@ -3,7 +3,7 @@
 set -euo pipefail
 
 EXPECTED_LINE1="// SPDX-License-Identifier: AGPL-3.0-or-later"
-EXPECTED_LINE2="// Copyright (C) 2026 Mark Wells <contact@markwells.dev>"
+EXPECTED_LINE2="// Copyright (C) 2026 Two Wells <contact@twowells.dev>"
 
 rc=0
 for f in "$@"; do

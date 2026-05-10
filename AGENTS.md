@@ -38,7 +38,7 @@ Rust workspace. The library crate produces data. CLI/TUI/web crates own presenta
 - **Copyright Headers:** Every `.rs` file must start with the SPDX header (enforced by pre-commit hook):
   ```
   // SPDX-License-Identifier: AGPL-3.0-or-later
-  // Copyright (C) 2026 Mark Wells <contact@markwells.dev>
+  // Copyright (C) 2026 Two Wells <contact@twowells.dev>
   ```
 - **Documentation:** All public APIs must have documentation comments.
 - **Testing:** All new features must include tests.

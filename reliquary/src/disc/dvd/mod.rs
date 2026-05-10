@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Copyright (C) 2026 Mark Wells <contact@markwells.dev>
+// Copyright (C) 2026 Two Wells <contact@twowells.dev>
 
 //! DVD disc analysis — reads IFO files, resolves titles through PGC tables,
 //! and identifies the main title.
