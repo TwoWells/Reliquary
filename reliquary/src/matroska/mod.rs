@@ -4,3 +4,4 @@
 //! Matroska container writer — EBML encoding and MKV muxing.
 
 pub mod ebml;
+pub mod mux;
