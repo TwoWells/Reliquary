@@ -130,10 +130,18 @@ pub struct Button {
 pub enum NavigationCommand {
     /// Play a playlist — `grp=0` (BRANCH), `sub_grp=2` (PLAY).
     ///
-    /// Playlist number from the destination operand.
+    /// Playlist number from the destination operand. The `branch_opt`
+    /// determines the play variant:
+    /// - 0 = `PlayPL` (play from start)
+    /// - 1 = `PlayPLatMK` (play at mark, `mark_or_pi` = mark index)
+    /// - 2 = `PlayPLatPI` (play at play item, `mark_or_pi` = PI index)
     PlayPl {
         /// Playlist number (e.g. 203 → `00203.mpls`).
         playlist: u16,
+        /// Play variant: 0=from start, 1=at mark, 2=at play item.
+        branch_opt: u8,
+        /// Mark index or play item index (meaningful when `branch_opt > 0`).
+        mark_or_pi: u32,
     },
     /// Set a general-purpose register — `grp=2` (SET), `sub_grp=0`.
     ///
@@ -689,15 +697,21 @@ fn parse_navigation_command(r: &mut Cursor<'_>) -> Result<NavigationCommand, IgE
     let imm_op1 = (insn >> 23) & 1 != 0;
     let imm_op2 = (insn >> 22) & 1 != 0;
 
+    let branch_opt_bits = ((insn >> 16) & 0x0F) as u8;
+
     match (grp, sub_grp) {
-        // BRANCH group, PLAY sub-group — PlayPL
+        // BRANCH group, PLAY sub-group — PlayPL / PlayPLatMK / PlayPLatPI
         (0, 2) => {
             #[allow(
                 clippy::cast_possible_truncation,
                 reason = "playlist numbers are u16 values"
             )]
             let playlist = (dst & 0xFFFF) as u16;
-            Ok(NavigationCommand::PlayPl { playlist })
+            Ok(NavigationCommand::PlayPl {
+                playlist,
+                branch_opt: branch_opt_bits,
+                mark_or_pi: src,
+            })
         }
         // BRANCH group, JUMP sub-group — jump to movie object
         (0, 1) if imm_op1 => Ok(NavigationCommand::GotoMobj { object_id: dst }),
@@ -1162,13 +1176,21 @@ pub(crate) mod tests {
         );
         assert_eq!(
             page.buttons[0].commands,
-            vec![NavigationCommand::PlayPl { playlist: 203 }],
+            vec![NavigationCommand::PlayPl {
+                playlist: 203,
+                branch_opt: 0,
+                mark_or_pi: 0
+            }],
             "button 0 PlayPL command"
         );
 
         assert_eq!(
             page.buttons[1].commands,
-            vec![NavigationCommand::PlayPl { playlist: 204 }],
+            vec![NavigationCommand::PlayPl {
+                playlist: 204,
+                branch_opt: 0,
+                mark_or_pi: 0
+            }],
             "button 1 PlayPL command"
         );
     }
@@ -1457,7 +1479,11 @@ pub(crate) mod tests {
         assert_eq!(buttons[0].selected_object_id, 1, "button 0 selected obj");
         assert_eq!(
             buttons[0].commands,
-            vec![NavigationCommand::PlayPl { playlist: 203 }],
+            vec![NavigationCommand::PlayPl {
+                playlist: 203,
+                branch_opt: 0,
+                mark_or_pi: 0
+            }],
             "button 0 plays playlist 203"
         );
 
@@ -1466,7 +1492,11 @@ pub(crate) mod tests {
         assert_eq!(buttons[1].selected_object_id, 3, "button 1 selected obj");
         assert_eq!(
             buttons[1].commands,
-            vec![NavigationCommand::PlayPl { playlist: 204 }],
+            vec![NavigationCommand::PlayPl {
+                playlist: 204,
+                branch_opt: 0,
+                mark_or_pi: 0
+            }],
             "button 1 plays playlist 204"
         );
 

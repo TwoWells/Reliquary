@@ -47,9 +47,20 @@ enum Command {
         #[arg(long)]
         no_keydb: bool,
 
+        /// Dump resolved button→playlist mappings without the interactive
+        /// naming prompt. Outputs JSON to stdout and exits.
+        #[arg(long)]
+        dump: bool,
+
         /// Output as JSON instead of a text report.
         #[arg(long)]
         json: bool,
+
+        /// Minimum playlist duration in seconds to show in the interactive prompt
+        /// (default: 30). Buttons targeting shorter playlists are suppressed from
+        /// the prompt but still appear in `--json` output.
+        #[arg(long, default_value = "30")]
+        min_duration: u64,
 
         /// Skip bitmap rendering (text-only mode).
         #[arg(long)]
@@ -97,6 +108,8 @@ fn main() -> ExitCode {
             vuk,
             keydb,
             no_keydb,
+            dump,
+            min_duration,
             json,
             no_images,
             trace,
@@ -105,6 +118,8 @@ fn main() -> ExitCode {
             vuk.as_deref(),
             keydb.as_deref(),
             no_keydb,
+            dump,
+            min_duration,
             json,
             no_images,
             trace,
@@ -173,6 +188,10 @@ fn run_inspect(path: &std::path::Path, json: bool) -> ExitCode {
 struct ExtractedButton {
     /// Playlist number if the button has a `PlayPl` command.
     playlist: Option<u16>,
+    /// `PlayPl` variant: 0=from start, 1=at mark, 2=at play item.
+    branch_opt: u8,
+    /// Mark index or play item index (meaningful when `branch_opt > 0`).
+    mark_or_pi: u32,
     /// Button identifier from the IG data.
     button_id: u16,
     /// Bitmap width in pixels.
@@ -187,6 +206,10 @@ struct ExtractedButton {
 struct NamedItem {
     /// Playlist number.
     playlist: u16,
+    /// `PlayPl` variant: 0=from start, 1=at mark, 2=at play item.
+    branch_opt: u8,
+    /// Mark index or play item index (meaningful when `branch_opt > 0`).
+    mark_or_pi: u32,
     /// User-provided name (empty string means skipped).
     name: String,
 }
@@ -201,11 +224,17 @@ struct NamedItem {
     clippy::fn_params_excessive_bools,
     reason = "CLI flag pass-through, not a public API"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "CLI flag pass-through, not a public API"
+)]
 fn run_identify(
     path: &std::path::Path,
     vuk_hex: Option<&str>,
     keydb: Option<&std::path::Path>,
     no_keydb: bool,
+    dump: bool,
+    min_duration: u64,
     json: bool,
     no_images: bool,
     trace: bool,
@@ -269,34 +298,89 @@ fn run_identify(
     // 5. Filter: content buttons (have PlayPl targeting a valid playlist)
     let valid_playlists: HashSet<u32> = analysis.playlists.iter().map(|p| p.number).collect();
 
+    // Composite parents: playlists that contain other playlists as members.
+    // Suppress buttons targeting these — the member playlists are the actual content.
+    let composite_parents: HashSet<u32> = analysis
+        .playlists
+        .iter()
+        .filter(|p| !p.members.is_empty())
+        .map(|p| p.number)
+        .collect();
+
+    // Duration lookup for threshold filtering
+    let duration_by_playlist: HashMap<u32, std::time::Duration> = analysis
+        .playlists
+        .iter()
+        .map(|p| (p.number, p.duration))
+        .collect();
+
+    let min_dur = std::time::Duration::from_secs(min_duration);
+
     let content_buttons: Vec<&ExtractedButton> = {
         let mut seen = HashSet::new();
         buttons
             .iter()
             .filter(|b| {
-                b.playlist
-                    .is_some_and(|pl| valid_playlists.contains(&u32::from(pl)) && seen.insert(pl))
+                b.playlist.is_some_and(|pl| {
+                    let pl32 = u32::from(pl);
+                    valid_playlists.contains(&pl32)
+                        && !composite_parents.contains(&pl32)
+                        && duration_by_playlist
+                            .get(&pl32)
+                            .is_some_and(|d| *d >= min_dur)
+                        && seen.insert((pl, b.branch_opt, b.mark_or_pi))
+                })
             })
             .collect()
     };
 
-    // 6. Present buttons and collect names
+    eprintln!(
+        "found {} buttons with playlist targets",
+        content_buttons.len()
+    );
+
+    // 6. Dump mode: output resolved mappings without interactive prompt
+    if dump {
+        output_dump(path, &content_buttons, &analysis);
+        return ExitCode::SUCCESS;
+    }
+
+    // 7. Present buttons and collect names
+    eprintln!();
     let items = if content_buttons.is_empty() {
-        eprintln!("no buttons with playlist targets found — showing all buttons");
+        eprintln!("no buttons with playlist targets — showing all buttons");
         eprintln!();
         // Print playlist table for manual correlation
         eprintln!("{analysis}");
         prompt_fallback_buttons(&buttons, &analysis, no_images)
     } else {
-        eprintln!(
-            "found {} buttons with playlist targets",
-            content_buttons.len()
-        );
-        eprintln!();
         prompt_content_buttons(&content_buttons, &analysis, no_images)
     };
 
-    // 7. Output results
+    // 8. Show partially used clips (summary after interactive prompt)
+    if !analysis.partially_used_clips.is_empty() {
+        eprintln!("partially used clips:");
+        for puc in &analysis.partially_used_clips {
+            let est = format_identify_duration(puc.estimated_duration);
+            let used = format_identify_duration(puc.used_duration);
+            #[allow(clippy::cast_sign_loss, reason = "coverage is always 0-100%")]
+            #[allow(clippy::cast_possible_truncation, reason = "coverage is always 0-100%")]
+            let pct = if puc.estimated_duration.as_secs() > 0 {
+                (puc.used_duration.as_secs_f64() / puc.estimated_duration.as_secs_f64() * 100.0)
+                    as u32
+            } else {
+                0
+            };
+            eprintln!(
+                "  {clip}  {est}  used {used} ({pct}%)  by MPLS {pl:05}",
+                clip = puc.clip_id,
+                pl = puc.playlist,
+            );
+        }
+        eprintln!();
+    }
+
+    // 9. Output results
     if json {
         output_json(path, &items, &analysis);
     } else {
@@ -444,16 +528,28 @@ fn extract_buttons(
                         };
 
                         // Find PlayPl command if any
-                        let playlist = button.commands.iter().find_map(|cmd| {
-                            if let ig::NavigationCommand::PlayPl { playlist } = cmd {
-                                Some(*playlist)
+                        let play_pl = button.commands.iter().find_map(|cmd| {
+                            if let ig::NavigationCommand::PlayPl {
+                                playlist,
+                                branch_opt,
+                                mark_or_pi,
+                            } = cmd
+                            {
+                                Some((*playlist, *branch_opt, *mark_or_pi))
                             } else {
                                 None
                             }
                         });
 
+                        let (playlist, branch_opt, mark_or_pi) = match play_pl {
+                            Some((pl, bo, mpi)) => (Some(pl), bo, mpi),
+                            None => (None, 0, 0),
+                        };
+
                         buttons.push(ExtractedButton {
                             playlist,
+                            branch_opt,
+                            mark_or_pi,
                             button_id: button.button_id,
                             width: bitmap.width,
                             height: bitmap.height,
@@ -615,7 +711,9 @@ fn resolve_mobj_buttons(
             .iter_mut()
             .find(|b| b.button_id == rb.button_id && b.playlist.is_none())
         {
-            eb.playlist = Some(rb.playlist);
+            eb.playlist = Some(rb.target.playlist);
+            eb.branch_opt = rb.target.branch_opt;
+            eb.mark_or_pi = rb.target.mark_or_pi;
         }
     }
 
@@ -644,7 +742,9 @@ fn resolve_mobj_buttons(
                 .iter_mut()
                 .find(|b| b.button_id == rb.button_id && b.playlist.is_none())
             {
-                eb.playlist = Some(rb.playlist);
+                eb.playlist = Some(rb.target.playlist);
+                eb.branch_opt = rb.target.branch_opt;
+                eb.mark_or_pi = rb.target.mark_or_pi;
                 legacy_count += 1;
             }
         }
@@ -1259,9 +1359,15 @@ fn trace_mobj_structure(
                 NavigationCommand::GotoMobj { object_id } => {
                     format!("GotoMobj({object_id})")
                 }
-                NavigationCommand::PlayPl { playlist } => {
-                    format!("PlayPl({playlist})")
-                }
+                NavigationCommand::PlayPl {
+                    playlist,
+                    branch_opt,
+                    mark_or_pi,
+                } => match branch_opt {
+                    1 => format!("PlayPlatMK({playlist}, mark={mark_or_pi})"),
+                    2 => format!("PlayPlatPI({playlist}, pi={mark_or_pi})"),
+                    _ => format!("PlayPl({playlist})"),
+                },
                 NavigationCommand::Other { opcode, dst, src } => {
                     let grp = (opcode >> 27) & 0x03;
                     let sub = (opcode >> 24) & 0x07;
@@ -1631,7 +1737,7 @@ fn trace_execution_coverage(
         let case_match: Vec<u32> = table
             .cases
             .iter()
-            .filter(|(_, pl)| *pl == rb.playlist)
+            .filter(|(_, pl)| *pl == rb.target.playlist)
             .map(|(cv, _)| *cv)
             .collect();
         for &cv in &case_match {
@@ -1640,13 +1746,13 @@ fn trace_execution_coverage(
         if case_match.is_empty() {
             eprintln!(
                 "  resolved: pl {:3} (btn[{}]) — not in dispatch table",
-                rb.playlist, rb.button_id
+                rb.target.playlist, rb.button_id
             );
         } else {
             for cv in &case_match {
                 eprintln!(
                     "  resolved: case {:3} -> pl {:3} (btn[{}])",
-                    cv, rb.playlist, rb.button_id
+                    cv, rb.target.playlist, rb.button_id
                 );
             }
         }
@@ -1812,16 +1918,22 @@ fn prompt_content_buttons(
             .iter()
             .find(|p| p.number == u32::from(playlist));
 
-        // Print playlist metadata
+        // Print playlist metadata with PlayPl variant info
+        let variant_suffix = match button.branch_opt {
+            1 => format!(" @mark {}", button.mark_or_pi),
+            2 => format!(" @PI {}", button.mark_or_pi),
+            _ => String::new(),
+        };
+
         if let Some(info) = pl_info {
             let duration = format_identify_duration(info.duration);
             let streams = format_identify_streams(&info.streams);
             eprintln!(
-                "Playlist {playlist:03}: {duration}  {streams}  {} ch",
+                "Playlist {playlist:03}{variant_suffix}: {duration}  {streams}  {} ch",
                 info.chapters
             );
         } else {
-            eprintln!("Playlist {playlist:03}:");
+            eprintln!("Playlist {playlist:03}{variant_suffix}:");
         }
 
         // Render bitmap
@@ -1841,7 +1953,12 @@ fn prompt_content_buttons(
             break;
         }
 
-        items.push(NamedItem { playlist, name });
+        items.push(NamedItem {
+            playlist,
+            branch_opt: button.branch_opt,
+            mark_or_pi: button.mark_or_pi,
+            name,
+        });
 
         eprintln!();
     }
@@ -1904,7 +2021,12 @@ fn prompt_fallback_buttons(
             break;
         }
 
-        items.push(NamedItem { playlist, name });
+        items.push(NamedItem {
+            playlist,
+            branch_opt: 0,
+            mark_or_pi: 0,
+            name,
+        });
 
         eprintln!();
     }
@@ -2307,15 +2429,82 @@ fn format_identify_streams(s: &reliquary::disc::bdmv::StreamSummary) -> String {
     parts.join("  ")
 }
 
+/// Dumps resolved button→playlist mappings as JSON without prompting.
+#[allow(clippy::print_stdout, reason = "CLI result output to stdout")]
+#[allow(clippy::print_stderr, reason = "CLI error output")]
+fn output_dump(
+    path: &std::path::Path,
+    buttons: &[&ExtractedButton],
+    analysis: &reliquary::disc::bdmv::BdmvAnalysis,
+) {
+    let items: Vec<serde_json::Value> = buttons
+        .iter()
+        .filter_map(|b| {
+            let pl = b.playlist?;
+            let mut entry = serde_json::json!({
+                "playlist": pl,
+                "button_id": b.button_id,
+            });
+
+            if b.branch_opt != 0 {
+                entry["branch_opt"] = serde_json::json!(b.branch_opt);
+                entry["mark_or_pi"] = serde_json::json!(b.mark_or_pi);
+            }
+
+            if let Some(info) = analysis
+                .playlists
+                .iter()
+                .find(|p| p.number == u32::from(pl))
+            {
+                entry["duration"] = serde_json::json!(info.duration.as_secs_f64());
+                entry["chapters"] = serde_json::json!(info.chapters);
+            }
+
+            Some(entry)
+        })
+        .collect();
+
+    let mut output = serde_json::json!({
+        "path": path.display().to_string(),
+        "items": items,
+    });
+
+    if !analysis.partially_used_clips.is_empty() {
+        let partial: Vec<serde_json::Value> = analysis
+            .partially_used_clips
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "clip_id": p.clip_id,
+                    "estimated_duration": p.estimated_duration.as_secs_f64(),
+                    "used_duration": p.used_duration.as_secs_f64(),
+                    "playlist": p.playlist,
+                })
+            })
+            .collect();
+        output["partially_used_clips"] = serde_json::json!(partial);
+    }
+
+    match serde_json::to_string_pretty(&output) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("error: failed to serialize JSON: {e}"),
+    }
+}
+
 /// Outputs the text report to stdout.
 #[allow(clippy::print_stdout, reason = "CLI result output to stdout")]
 fn output_text(path: &std::path::Path, items: &[NamedItem]) {
     println!("# reliquary identify: {}", path.display());
     for item in items {
+        let variant = match item.branch_opt {
+            1 => format!(" @mark {}", item.mark_or_pi),
+            2 => format!(" @PI {}", item.mark_or_pi),
+            _ => String::new(),
+        };
         if item.name.is_empty() {
-            println!("playlist {:03}: (skipped)", item.playlist);
+            println!("playlist {:03}{variant}: (skipped)", item.playlist);
         } else {
-            println!("playlist {:03}: {}", item.playlist, item.name);
+            println!("playlist {:03}{variant}: {}", item.playlist, item.name);
         }
     }
 }
@@ -2335,6 +2524,11 @@ fn output_json(
                 "playlist": item.playlist,
                 "name": item.name,
             });
+
+            if item.branch_opt != 0 {
+                entry["branch_opt"] = serde_json::json!(item.branch_opt);
+                entry["mark_or_pi"] = serde_json::json!(item.mark_or_pi);
+            }
 
             if let Some(info) = analysis
                 .playlists
@@ -3191,6 +3385,8 @@ mod tests {
     fn button_filtering_deduplicates_by_playlist() {
         let buttons = [
             ExtractedButton {
+                branch_opt: 0,
+                mark_or_pi: 0,
                 playlist: Some(203),
                 button_id: 1,
                 width: 2,
@@ -3198,6 +3394,8 @@ mod tests {
                 rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
             },
             ExtractedButton {
+                branch_opt: 0,
+                mark_or_pi: 0,
                 playlist: Some(203), // duplicate playlist
                 button_id: 2,
                 width: 2,
@@ -3205,6 +3403,8 @@ mod tests {
                 rgba: vec![0, 0, 255, 255, 255, 255, 0, 255],
             },
             ExtractedButton {
+                branch_opt: 0,
+                mark_or_pi: 0,
                 playlist: Some(204),
                 button_id: 3,
                 width: 2,
@@ -3220,7 +3420,8 @@ mod tests {
                 .iter()
                 .filter(|b| {
                     b.playlist.is_some_and(|pl| {
-                        valid_playlists.contains(&u32::from(pl)) && seen.insert(pl)
+                        valid_playlists.contains(&u32::from(pl))
+                            && seen.insert((pl, b.branch_opt, b.mark_or_pi))
                     })
                 })
                 .collect()
@@ -3242,6 +3443,8 @@ mod tests {
     fn button_filtering_skips_invalid_playlists() {
         let buttons = [
             ExtractedButton {
+                branch_opt: 0,
+                mark_or_pi: 0,
                 playlist: Some(203),
                 button_id: 1,
                 width: 1,
@@ -3249,6 +3452,8 @@ mod tests {
                 rgba: vec![0, 0, 0, 255],
             },
             ExtractedButton {
+                branch_opt: 0,
+                mark_or_pi: 0,
                 playlist: Some(999), // not in valid set
                 button_id: 2,
                 width: 1,
@@ -3256,6 +3461,8 @@ mod tests {
                 rgba: vec![0, 0, 0, 255],
             },
             ExtractedButton {
+                branch_opt: 0,
+                mark_or_pi: 0,
                 playlist: None, // no PlayPl
                 button_id: 3,
                 width: 1,
@@ -3271,7 +3478,8 @@ mod tests {
                 .iter()
                 .filter(|b| {
                     b.playlist.is_some_and(|pl| {
-                        valid_playlists.contains(&u32::from(pl)) && seen.insert(pl)
+                        valid_playlists.contains(&u32::from(pl))
+                            && seen.insert((pl, b.branch_opt, b.mark_or_pi))
                     })
                 })
                 .collect()
@@ -3295,14 +3503,20 @@ mod tests {
 
         let items = [
             NamedItem {
+                branch_opt: 0,
+                mark_or_pi: 0,
                 playlist: 203,
                 name: "Themyscira: The Hidden Island".to_string(),
             },
             NamedItem {
+                branch_opt: 0,
+                mark_or_pi: 0,
                 playlist: 204,
                 name: String::new(),
             },
             NamedItem {
+                branch_opt: 0,
+                mark_or_pi: 0,
                 playlist: 207,
                 name: "a WB Blu-ray title at War".to_string(),
             },
@@ -3345,10 +3559,14 @@ mod tests {
     fn output_json_structure() {
         let items = [
             NamedItem {
+                branch_opt: 0,
+                mark_or_pi: 0,
                 playlist: 203,
                 name: "Beach Battle".to_string(),
             },
             NamedItem {
+                branch_opt: 0,
+                mark_or_pi: 0,
                 playlist: 204,
                 name: String::new(),
             },

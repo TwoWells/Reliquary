@@ -99,13 +99,27 @@ pub struct Instruction {
     pub src: u32,
 }
 
+/// A playlist target resolved from MOBJ VM execution.
+///
+/// Carries the `PlayPl` variant fields so callers can distinguish between
+/// `PlayPL` (from start), `PlayPLatMK` (at mark), and `PlayPLatPI` (at PI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayTarget {
+    /// Playlist number.
+    pub playlist: u16,
+    /// `PlayPl` variant: 0=from start, 1=at mark, 2=at play item.
+    pub branch_opt: u8,
+    /// Mark index or play item index (meaningful when `branch_opt > 0`).
+    pub mark_or_pi: u32,
+}
+
 /// A resolved button → playlist mapping.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ResolvedButton {
     /// Button identifier from the IG data.
     pub button_id: u16,
-    /// Resolved playlist number.
-    pub playlist: u16,
+    /// Resolved playlist target.
+    pub target: PlayTarget,
 }
 
 /// A dispatch entry point found in an MOBJ for GPR dispatch resolution.
@@ -287,17 +301,21 @@ fn parse_instruction(r: &mut Cursor<'_>) -> Result<Instruction, MobjError> {
 #[must_use]
 pub fn command_to_instruction(cmd: &NavigationCommand) -> Instruction {
     match cmd {
-        NavigationCommand::PlayPl { playlist } => Instruction {
-            op_cnt: 1,
+        NavigationCommand::PlayPl {
+            playlist,
+            branch_opt,
+            mark_or_pi,
+        } => Instruction {
+            op_cnt: if *branch_opt == 0 { 1 } else { 2 },
             group: GRP_BRANCH,
             sub_group: BRANCH_PLAY,
             imm_op1: true,
-            imm_op2: false,
-            branch_opt: 0,
+            imm_op2: *branch_opt != 0,
+            branch_opt: *branch_opt,
             cmp_opt: 0,
             set_opt: 0,
             dst: u32::from(*playlist),
-            src: 0,
+            src: *mark_or_pi,
         },
         NavigationCommand::SetGpr { register, value } => Instruction {
             op_cnt: 2,
@@ -373,9 +391,24 @@ pub fn format_instruction(insn: &Instruction) -> String {
             BRANCH_JUMP => {
                 format!("JumpMobj({})", fmt_op(insn.imm_op1, insn.dst))
             }
-            BRANCH_PLAY => {
-                format!("PlayPl({})", fmt_op(insn.imm_op1, insn.dst))
-            }
+            BRANCH_PLAY => match insn.branch_opt {
+                0 => format!("PlayPl({})", fmt_op(insn.imm_op1, insn.dst)),
+                1 => format!(
+                    "PlayPlatMK({}, mark={})",
+                    fmt_op(insn.imm_op1, insn.dst),
+                    fmt_op(insn.imm_op2, insn.src)
+                ),
+                2 => format!(
+                    "PlayPlatPI({}, pi={})",
+                    fmt_op(insn.imm_op1, insn.dst),
+                    fmt_op(insn.imm_op2, insn.src)
+                ),
+                _ => format!(
+                    "PlayPl({}, opt={})",
+                    fmt_op(insn.imm_op1, insn.dst),
+                    insn.branch_opt
+                ),
+            },
             _ => format!("BRANCH(sub={}, opt={})", insn.sub_group, insn.branch_opt),
         },
         GRP_CMP => {
@@ -750,7 +783,14 @@ pub fn find_handler_pc(
 #[derive(Debug)]
 enum ButtonEffect {
     /// Play a playlist directly (`PlayPl`).
-    Playlist(u16),
+    Playlist {
+        /// Playlist number.
+        playlist: u16,
+        /// `PlayPl` variant: 0=from start, 1=at mark, 2=at play item.
+        branch_opt: u8,
+        /// Mark index or play item index (meaningful when `branch_opt > 0`).
+        mark_or_pi: u32,
+    },
     /// Jump to a movie object (`GotoMobj`).
     GotoMobj(u32),
     /// Navigate to a button/page via `SET_BUTTON_PAGE` (SETSYSTEM `set_opt=3`).
@@ -935,7 +975,11 @@ pub fn resolve_via_execution(
                     {
                         resolved.push(ResolvedButton {
                             button_id: button.button_id,
-                            playlist: pl,
+                            target: PlayTarget {
+                                playlist: pl,
+                                branch_opt: 0,
+                                mark_or_pi: 0,
+                            },
                         });
                     }
                 }
@@ -951,27 +995,35 @@ pub fn resolve_via_execution(
             let (effect, new_gprs) = execute_button_commands(&button.commands, &ctx, &gprs);
 
             match effect {
-                ButtonEffect::Playlist(pl) => {
+                ButtonEffect::Playlist {
+                    playlist: pl,
+                    branch_opt: bo,
+                    mark_or_pi: mpi,
+                } => {
                     let is_valid = pl != 0
                         && pl != 0xFFFF
                         && (valid_playlists.is_empty() || valid_playlists.contains(&u32::from(pl)));
                     if is_valid && resolved_set.insert((button.button_id, pl)) {
                         resolved.push(ResolvedButton {
                             button_id: button.button_id,
-                            playlist: pl,
+                            target: PlayTarget {
+                                playlist: pl,
+                                branch_opt: bo,
+                                mark_or_pi: mpi,
+                            },
                         });
                     }
                 }
                 ButtonEffect::GotoMobj(object_id) => {
                     if let Some(mobj) = mobj_file.objects.get(object_id as usize) {
                         let mut mobj_gprs = new_gprs;
-                        if let Some(pl) =
+                        if let Some(target) =
                             run_mobj_vm(&mobj.instructions, 0, &mut mobj_gprs, valid_playlists)
-                            && resolved_set.insert((button.button_id, pl))
+                            && resolved_set.insert((button.button_id, target.playlist))
                         {
                             resolved.push(ResolvedButton {
                                 button_id: button.button_id,
-                                playlist: pl,
+                                target,
                             });
                         }
                     }
@@ -987,7 +1039,11 @@ pub fn resolve_via_execution(
                     {
                         resolved.push(ResolvedButton {
                             button_id: button.button_id,
-                            playlist: pl,
+                            target: PlayTarget {
+                                playlist: pl,
+                                branch_opt: 0,
+                                mark_or_pi: 0,
+                            },
                         });
                     }
 
@@ -1113,11 +1169,19 @@ fn execute_button_commands(
             GRP_BRANCH => match insn.sub_group {
                 BRANCH_PLAY => {
                     let playlist = fetch_operand(insn.imm_op1, insn.dst, &gprs);
+                    let mark_or_pi = fetch_operand(insn.imm_op2, insn.src, &gprs);
                     #[allow(
                         clippy::cast_possible_truncation,
                         reason = "playlist numbers are u16 values"
                     )]
-                    return (ButtonEffect::Playlist((playlist & 0xFFFF) as u16), gprs);
+                    return (
+                        ButtonEffect::Playlist {
+                            playlist: (playlist & 0xFFFF) as u16,
+                            branch_opt: insn.branch_opt,
+                            mark_or_pi,
+                        },
+                        gprs,
+                    );
                 }
                 BRANCH_JUMP => {
                     let object_id = fetch_operand(insn.imm_op1, insn.dst, &gprs);
@@ -1201,7 +1265,11 @@ pub fn resolve_buttons(
         ) {
             resolved.push(ResolvedButton {
                 button_id: button.button_id,
-                playlist,
+                target: PlayTarget {
+                    playlist,
+                    branch_opt: 0,
+                    mark_or_pi: 0,
+                },
             });
         }
     }
@@ -1301,8 +1369,8 @@ fn trace_button(
         if !has_reg_play_pl {
             continue;
         }
-        if let Some(playlist) = execute_from(instrs, 0, &gpr_assignments, valid_playlists, ctx) {
-            return Some(playlist);
+        if let Some(target) = execute_from(instrs, 0, &gpr_assignments, valid_playlists, ctx) {
+            return Some(target.playlist);
         }
     }
 
@@ -1366,14 +1434,14 @@ fn resolve_via_dispatch(
             continue;
         };
 
-        if let Some(playlist) = execute_from(
+        if let Some(target) = execute_from(
             &mobj.instructions,
             entry.dispatch_pc,
             gpr_assignments,
             valid_playlists,
             ctx,
         ) {
-            return Some(playlist);
+            return Some(target.playlist);
         }
     }
 
@@ -1514,7 +1582,7 @@ fn execute_from(
     gpr_assignments: &[(u32, u32)],
     valid_playlists: &std::collections::HashSet<u32>,
     ctx: &PlayerContext,
-) -> Option<u16> {
+) -> Option<PlayTarget> {
     let mut gprs = std::collections::HashMap::<u32, u32>::new();
     for &(reg, val) in gpr_assignments {
         gprs.insert(reg, val);
@@ -1540,7 +1608,7 @@ pub fn run_mobj_vm(
     start_pc: usize,
     gprs: &mut std::collections::HashMap<u32, u32>,
     valid_playlists: &std::collections::HashSet<u32>,
-) -> Option<u16> {
+) -> Option<PlayTarget> {
     let mut pc: usize = start_pc;
     let mut steps: u32 = 0;
 
@@ -1567,11 +1635,16 @@ pub fn run_mobj_vm(
                         && playlist != 0xFFFF
                         && (valid_playlists.is_empty() || valid_playlists.contains(&playlist));
                     if is_valid {
+                        let mark_or_pi = fetch_operand(insn.imm_op2, insn.src, gprs);
                         #[allow(
                             clippy::cast_possible_truncation,
                             reason = "playlist numbers are u16 values"
                         )]
-                        return Some((playlist & 0xFFFF) as u16);
+                        return Some(PlayTarget {
+                            playlist: (playlist & 0xFFFF) as u16,
+                            branch_opt: insn.branch_opt,
+                            mark_or_pi,
+                        });
                     }
                     pc += 1;
                 }
@@ -2162,7 +2235,7 @@ mod tests {
         );
         assert_eq!(resolved.len(), 1, "one button resolved");
         assert_eq!(resolved[0].button_id, 7, "button id");
-        assert_eq!(resolved[0].playlist, 203, "resolved to playlist 203");
+        assert_eq!(resolved[0].target.playlist, 203, "resolved to playlist 203");
     }
 
     #[test]
@@ -2201,7 +2274,7 @@ mod tests {
             None,
         );
         assert_eq!(resolved.len(), 1, "one button resolved");
-        assert_eq!(resolved[0].playlist, 205, "resolved to playlist 205");
+        assert_eq!(resolved[0].target.playlist, 205, "resolved to playlist 205");
     }
 
     #[test]
@@ -2209,7 +2282,14 @@ mod tests {
         let mobj_data = MobjBuilder::new().object(&[InsnSpec::PlayPl(100)]).build();
         let mobj_file = parse(&mobj_data).expect("should parse");
 
-        let button = make_button(1, vec![NavigationCommand::PlayPl { playlist: 100 }]);
+        let button = make_button(
+            1,
+            vec![NavigationCommand::PlayPl {
+                playlist: 100,
+                branch_opt: 0,
+                mark_or_pi: 0,
+            }],
+        );
 
         let resolved = resolve_buttons(
             &[(button, PlayerContext::default())],
@@ -2312,13 +2392,13 @@ mod tests {
         assert_eq!(resolved.len(), 3, "all three buttons resolved");
 
         assert_eq!(resolved[0].button_id, 10, "button 10");
-        assert_eq!(resolved[0].playlist, 201, "button 10 → playlist 201");
+        assert_eq!(resolved[0].target.playlist, 201, "button 10 → playlist 201");
 
         assert_eq!(resolved[1].button_id, 11, "button 11");
-        assert_eq!(resolved[1].playlist, 202, "button 11 → playlist 202");
+        assert_eq!(resolved[1].target.playlist, 202, "button 11 → playlist 202");
 
         assert_eq!(resolved[2].button_id, 12, "button 12");
-        assert_eq!(resolved[2].playlist, 203, "button 12 → playlist 203");
+        assert_eq!(resolved[2].target.playlist, 203, "button 12 → playlist 203");
     }
 
     #[test]
@@ -2346,7 +2426,7 @@ mod tests {
             None,
         );
         assert_eq!(resolved.len(), 1, "resolved via unconditional fallback");
-        assert_eq!(resolved[0].playlist, 500, "playlist 500");
+        assert_eq!(resolved[0].target.playlist, 500, "playlist 500");
     }
 
     #[test]
@@ -2421,7 +2501,7 @@ mod tests {
             None,
         );
         assert_eq!(resolved.len(), 1, "one button resolved");
-        assert_eq!(resolved[0].playlist, 205, "resolved to playlist 205");
+        assert_eq!(resolved[0].target.playlist, 205, "resolved to playlist 205");
     }
 
     #[test]
@@ -2490,9 +2570,9 @@ mod tests {
             None,
         );
         assert_eq!(resolved.len(), 3, "all three buttons resolved");
-        assert_eq!(resolved[0].playlist, 201, "button 10 → 201");
-        assert_eq!(resolved[1].playlist, 202, "button 11 → 202");
-        assert_eq!(resolved[2].playlist, 203, "button 12 → 203");
+        assert_eq!(resolved[0].target.playlist, 201, "button 10 → 201");
+        assert_eq!(resolved[1].target.playlist, 202, "button 11 → 202");
+        assert_eq!(resolved[2].target.playlist, 203, "button 12 → 203");
     }
 
     #[test]
@@ -2531,7 +2611,7 @@ mod tests {
             None,
         );
         assert_eq!(resolved.len(), 1, "resolved via MOBJ 1");
-        assert_eq!(resolved[0].playlist, 300, "playlist 300");
+        assert_eq!(resolved[0].target.playlist, 300, "playlist 300");
     }
 
     #[test]
@@ -2598,7 +2678,7 @@ mod tests {
             None,
         );
         assert_eq!(resolved.len(), 1, "resolved via register copy");
-        assert_eq!(resolved[0].playlist, 203, "playlist 203");
+        assert_eq!(resolved[0].target.playlist, 203, "playlist 203");
     }
 
     // ── Dispatch entry detection tests ─────────────────────────────
@@ -2750,7 +2830,7 @@ mod tests {
             "lifecycle simulation resolves without dispatch entries"
         );
         assert_eq!(
-            lifecycle_result[0].playlist, 202,
+            lifecycle_result[0].target.playlist, 202,
             "lifecycle: button key=2 → playlist 202"
         );
 
@@ -2777,7 +2857,10 @@ mod tests {
             None,
         );
         assert_eq!(resolved.len(), 1, "resolved with dispatch entry");
-        assert_eq!(resolved[0].playlist, 202, "button key=2 → playlist 202");
+        assert_eq!(
+            resolved[0].target.playlist, 202,
+            "button key=2 → playlist 202"
+        );
     }
 
     #[test]
@@ -2852,9 +2935,9 @@ mod tests {
             None,
         );
         assert_eq!(resolved.len(), 3, "all three buttons resolved");
-        assert_eq!(resolved[0].playlist, 301, "key 10 → 301");
-        assert_eq!(resolved[1].playlist, 302, "key 20 → 302");
-        assert_eq!(resolved[2].playlist, 303, "key 30 → 303");
+        assert_eq!(resolved[0].target.playlist, 301, "key 10 → 301");
+        assert_eq!(resolved[1].target.playlist, 302, "key 20 → 302");
+        assert_eq!(resolved[2].target.playlist, 303, "key 30 → 303");
     }
 
     #[test]
@@ -2899,7 +2982,7 @@ mod tests {
             None,
         );
         assert_eq!(resolved.len(), 1, "resolved via dispatch entry");
-        assert_eq!(resolved[0].playlist, 205, "key 5 → playlist 205");
+        assert_eq!(resolved[0].target.playlist, 205, "key 5 → playlist 205");
     }
 
     #[test]
@@ -2940,7 +3023,7 @@ mod tests {
             None,
         );
         assert_eq!(resolved.len(), 1, "GotoMobj still works");
-        assert_eq!(resolved[0].playlist, 201, "resolved via GotoMobj");
+        assert_eq!(resolved[0].target.playlist, 201, "resolved via GotoMobj");
     }
 
     // ── Dispatch table extraction tests ───────────────────────────────
@@ -3138,15 +3221,15 @@ mod tests {
         );
         assert_eq!(resolved.len(), 3, "all three buttons resolved via table");
         assert_eq!(
-            resolved[0].playlist, 211,
+            resolved[0].target.playlist, 211,
             "button_id=6, key=5 → case 11 → 211"
         );
         assert_eq!(
-            resolved[1].playlist, 208,
+            resolved[1].target.playlist, 208,
             "button_id=3, key=5 → case 8 → 208"
         );
         assert_eq!(
-            resolved[2].playlist, 205,
+            resolved[2].target.playlist, 205,
             "button_id=0, key=5 → case 5 → 205"
         );
     }
@@ -3229,9 +3312,9 @@ mod tests {
         );
         assert_eq!(resolved.len(), 2, "both buttons resolved");
         assert_eq!(resolved[0].button_id, 10, "GotoMobj button");
-        assert_eq!(resolved[0].playlist, 500, "GotoMobj → 500");
+        assert_eq!(resolved[0].target.playlist, 500, "GotoMobj → 500");
         assert_eq!(resolved[1].button_id, 20, "dispatch table button");
-        assert_eq!(resolved[1].playlist, 302, "composite 20+2=22 → 302");
+        assert_eq!(resolved[1].target.playlist, 302, "composite 20+2=22 → 302");
     }
 
     #[test]
@@ -3260,7 +3343,7 @@ mod tests {
             Some(&table),
         );
         assert_eq!(resolved.len(), 1, "button_id=0 resolved");
-        assert_eq!(resolved[0].playlist, 210, "composite 0+10=10 → 210");
+        assert_eq!(resolved[0].target.playlist, 210, "composite 0+10=10 → 210");
     }
 
     // ── Execution-based resolver tests ─────────────────────────────
@@ -3313,7 +3396,7 @@ mod tests {
 
         assert_eq!(resolved.len(), 1, "one button resolved");
         assert_eq!(resolved[0].button_id, 3, "button_id matches");
-        assert_eq!(resolved[0].playlist, 208, "composite 3+5=8 → 208");
+        assert_eq!(resolved[0].target.playlist, 208, "composite 3+5=8 → 208");
     }
 
     #[test]
@@ -3373,7 +3456,7 @@ mod tests {
         );
         assert_eq!(resolved_p2.len(), 1, "page 2 resolved");
         assert_eq!(
-            resolved_p2[0].playlist, 212,
+            resolved_p2[0].target.playlist, 212,
             "page 2: composite 7+5=12 → 212"
         );
 
@@ -3393,7 +3476,7 @@ mod tests {
         );
         assert_eq!(resolved_p3.len(), 1, "page 3 resolved");
         assert_eq!(
-            resolved_p3[0].playlist, 217,
+            resolved_p3[0].target.playlist, 217,
             "page 3: composite 7+10=17 → 217"
         );
     }
@@ -3435,14 +3518,21 @@ mod tests {
 
         let resolved = resolve_via_execution(&clips, &mobj_file, None, &valid);
         assert_eq!(resolved.len(), 1, "GotoMobj resolved");
-        assert_eq!(resolved[0].playlist, 301, "GotoMobj → MOBJ[1] → 301");
+        assert_eq!(resolved[0].target.playlist, 301, "GotoMobj → MOBJ[1] → 301");
     }
 
     #[test]
     fn exec_direct_play_pl_skipped() {
         // Buttons with direct PlayPl are skipped (they're already resolved
         // by the IG parser's typed variant).
-        let button = make_button(1, vec![NavigationCommand::PlayPl { playlist: 200 }]);
+        let button = make_button(
+            1,
+            vec![NavigationCommand::PlayPl {
+                playlist: 200,
+                branch_opt: 0,
+                mark_or_pi: 0,
+            }],
+        );
 
         let mobj_data = MobjBuilder::new().object(&[InsnSpec::Nop]).build();
         let mobj_file = parse(&mobj_data).expect("should parse");
@@ -3546,7 +3636,7 @@ mod tests {
 
         assert_eq!(resolved.len(), 2, "two buttons resolved across clips");
         let playlists: std::collections::HashSet<u16> =
-            resolved.iter().map(|r| r.playlist).collect();
+            resolved.iter().map(|r| r.target.playlist).collect();
         assert!(playlists.contains(&205), "clip 1 button resolved to 205");
         assert!(playlists.contains(&208), "clip 0 button resolved to 208");
     }
@@ -3557,7 +3647,11 @@ mod tests {
         // fields for each NavigationCommand variant.
 
         // PlayPl
-        let play = command_to_instruction(&NavigationCommand::PlayPl { playlist: 42 });
+        let play = command_to_instruction(&NavigationCommand::PlayPl {
+            playlist: 42,
+            branch_opt: 0,
+            mark_or_pi: 0,
+        });
         assert_eq!(play.group, GRP_BRANCH, "PlayPl group");
         assert_eq!(play.sub_group, BRANCH_PLAY, "PlayPl sub_group");
         assert!(play.imm_op1, "PlayPl imm_op1");
@@ -3652,7 +3746,7 @@ mod tests {
         );
 
         let playlists: std::collections::HashSet<u16> =
-            resolved.iter().map(|r| r.playlist).collect();
+            resolved.iter().map(|r| r.target.playlist).collect();
         assert!(
             playlists.contains(&247),
             "propagated GPR[100]=42 → composite 47 → 247; got {resolved:?}"
@@ -3741,7 +3835,7 @@ mod tests {
         );
 
         let playlists: std::collections::HashSet<u16> =
-            resolved.iter().map(|r| r.playlist).collect();
+            resolved.iter().map(|r| r.target.playlist).collect();
         assert!(
             playlists.contains(&215),
             "path A: GPR[100]=10 → composite 15 → 215; got {resolved:?}"
@@ -3852,7 +3946,7 @@ mod tests {
         );
 
         assert_eq!(resolved.len(), 1, "one button resolved");
-        assert_eq!(resolved[0].playlist, 208, "composite 3+5=8 → 208");
+        assert_eq!(resolved[0].target.playlist, 208, "composite 3+5=8 → 208");
     }
 
     // ── NOP anchor resolution tests ──────────────────────────────────
@@ -3891,7 +3985,7 @@ mod tests {
 
         assert_eq!(resolved.len(), 3, "three anchors resolved");
         let playlists: std::collections::HashSet<u16> =
-            resolved.iter().map(|r| r.playlist).collect();
+            resolved.iter().map(|r| r.target.playlist).collect();
         assert!(playlists.contains(&212), "anchor 12 → 212");
         assert!(playlists.contains(&215), "anchor 15 → 215");
         assert!(playlists.contains(&220), "anchor 20 → 220");
@@ -3990,7 +4084,7 @@ mod tests {
 
         assert_eq!(resolved.len(), 2, "command button + anchor both resolved");
         let playlists: std::collections::HashSet<u16> =
-            resolved.iter().map(|r| r.playlist).collect();
+            resolved.iter().map(|r| r.target.playlist).collect();
         assert!(playlists.contains(&208), "command button 3+5=8 → 208");
         assert!(playlists.contains(&215), "anchor 15 → 215");
     }
@@ -4022,7 +4116,7 @@ mod tests {
 
         let matching = resolved
             .iter()
-            .filter(|r| r.button_id == 12 && r.playlist == 212)
+            .filter(|r| r.button_id == 12 && r.target.playlist == 212)
             .count();
         assert_eq!(
             matching, 1,

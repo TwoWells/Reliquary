@@ -125,6 +125,9 @@ pub struct BdmvAnalysis {
     /// Clips not referenced by any playlist.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unreferenced_clips: Vec<UnreferencedClip>,
+    /// Clips where a playlist uses less than the clip's full duration.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub partially_used_clips: Vec<PartiallyUsedClip>,
     /// Warnings from playlists that could not be read or parsed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<PlaylistWarning>,
@@ -166,6 +169,28 @@ pub struct UnreferencedClip {
     pub streams: Vec<String>,
     /// Estimated m2ts file size in bytes.
     pub file_size: u64,
+}
+
+/// A clip whose content is only partially used by playlists.
+///
+/// When a playlist's play item covers less than the clip's estimated
+/// full duration, the unused portion may contain unreferenced content.
+#[derive(Debug, Clone, Serialize)]
+pub struct PartiallyUsedClip {
+    /// Clip ID (e.g. `"00217"`).
+    pub clip_id: String,
+    /// Estimated total clip duration (from packet count and recording rate).
+    #[serde(serialize_with = "serialize_duration")]
+    pub estimated_duration: Duration,
+    /// Duration used by the referencing playlist.
+    #[serde(serialize_with = "serialize_duration")]
+    pub used_duration: Duration,
+    /// Playlist number that references this clip.
+    pub playlist: u32,
+    /// Start of the used range in PTS ticks (45 kHz).
+    pub in_time: u32,
+    /// End of the used range in PTS ticks (45 kHz).
+    pub out_time: u32,
 }
 
 /// An analyzed playlist with computed duration and segment grouping.
@@ -462,15 +487,17 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
         None
     };
 
-    let (ig_clips, unreferenced_clips, clip_warnings) = clipinf_dir.map_or_else(
-        || (Vec::new(), Vec::new(), Vec::new()),
-        |dir| {
-            let (clips, clip_warns) = read_clips(reader, &dir);
-            let ig = identify_ig_clips(&clips);
-            let unreferenced = find_unreferenced_clips(&clips, &playlists);
-            (ig, unreferenced, clip_warns)
-        },
-    );
+    let (ig_clips, unreferenced_clips, partially_used_clips, clip_warnings) = clipinf_dir
+        .map_or_else(
+            || (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            |dir| {
+                let (clips, clip_warns) = read_clips(reader, &dir);
+                let ig = identify_ig_clips(&clips);
+                let unreferenced = find_unreferenced_clips(&clips, &playlists);
+                let partial = find_partially_used_clips(&clips, &playlists);
+                (ig, unreferenced, partial, clip_warns)
+            },
+        );
 
     // Find menu playlists — playlists that reference IG clips.
     // Uses all_playlists (before filtering) because menu playlists are
@@ -482,6 +509,7 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
         ig_clips,
         menu_playlists,
         unreferenced_clips,
+        partially_used_clips,
         warnings,
         clip_warnings,
     })
@@ -683,6 +711,64 @@ fn find_unreferenced_clips(clips: &[ClipInfo], playlists: &[Playlist]) -> Vec<Un
             }
         })
         .collect()
+}
+
+/// Finds clips where a playlist uses less than the clip's full duration.
+///
+/// Estimates each clip's total duration from `num_source_packets * 192 /
+/// ts_recording_rate` and compares with each play item's `(out_time -
+/// in_time) / 45000` seconds. Clips where no play item covers at least
+/// 80% of the estimated duration are reported.
+fn find_partially_used_clips(clips: &[ClipInfo], playlists: &[Playlist]) -> Vec<PartiallyUsedClip> {
+    /// Minimum clip duration to report (avoids noise from short stubs).
+    const MIN_CLIP_SECS: f64 = 60.0;
+    /// Maximum coverage ratio to consider "partially used".
+    const COVERAGE_THRESHOLD: f64 = 0.80;
+
+    let clip_by_id: HashMap<&str, &ClipInfo> =
+        clips.iter().map(|c| (c.clip_id.as_str(), c)).collect();
+
+    let mut results = Vec::new();
+
+    // Collect all (clip_id, playlist, in_time, out_time) references
+    for pl in playlists {
+        for item in &pl.play_items {
+            let Some(clip) = clip_by_id.get(item.clip_id.as_str()) else {
+                continue;
+            };
+
+            if clip.ts_recording_rate == 0 {
+                continue;
+            }
+
+            let estimated_secs =
+                f64::from(clip.num_source_packets) * 192.0 / f64::from(clip.ts_recording_rate);
+            if estimated_secs < MIN_CLIP_SECS {
+                continue;
+            }
+
+            let used_secs = if item.out_time > item.in_time {
+                f64::from(item.out_time - item.in_time) / 45_000.0
+            } else {
+                continue;
+            };
+
+            let coverage = used_secs / estimated_secs;
+            if coverage < COVERAGE_THRESHOLD {
+                results.push(PartiallyUsedClip {
+                    clip_id: item.clip_id.clone(),
+                    estimated_duration: Duration::from_secs_f64(estimated_secs),
+                    used_duration: Duration::from_secs_f64(used_secs),
+                    playlist: pl.number,
+                    in_time: item.in_time,
+                    out_time: item.out_time,
+                });
+            }
+        }
+    }
+
+    results.sort_by(|a, b| a.clip_id.cmp(&b.clip_id).then(a.playlist.cmp(&b.playlist)));
+    results
 }
 
 /// Returns `true` if a playlist is a looping menu.
@@ -1271,6 +1357,7 @@ mod tests {
             ig_clips: Vec::new(),
             menu_playlists: Vec::new(),
             unreferenced_clips: Vec::new(),
+            partially_used_clips: Vec::new(),
             warnings: Vec::new(),
             clip_warnings: Vec::new(),
         };
@@ -1319,6 +1406,7 @@ mod tests {
             ig_clips: Vec::new(),
             menu_playlists: Vec::new(),
             unreferenced_clips: Vec::new(),
+            partially_used_clips: Vec::new(),
             warnings: vec![PlaylistWarning {
                 playlist: 99,
                 message: "failed to parse PLAYLIST/00099.mpls: bad magic".into(),
