@@ -15,6 +15,9 @@ CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/vers
 # Required cargo tools
 CARGO_TOOLS := cargo-deny cargo-machete cargo-nextest cargo-semver-checks cargo-mutants
 
+# Run #[ignore] tests locally (external tools present), skip in CI.
+NEXTEST_IGNORED := $(if $(CI),,--run-ignored all)
+
 # --- Setup ---
 
 # One-time setup: configure hooks and check tools
@@ -77,7 +80,7 @@ check: setup-tools
 	 done
 	@cargo machete
 	@cargo clippy --workspace --tests --quiet -- -D warnings
-	@cargo nextest run --workspace --run-ignored all --no-fail-fast --no-tests=pass --status-level fail --final-status-level fail --cargo-quiet --show-progress only
+	@cargo nextest run --workspace $(NEXTEST_IGNORED) --no-fail-fast --no-tests=pass --status-level fail --final-status-level fail --cargo-quiet --show-progress only
 
 deny:
 	@cargo deny --log-level error check
