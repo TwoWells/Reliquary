@@ -55,6 +55,40 @@ pub(crate) const CHAPTERS: u32 = 0x1043_A770;
 /// Tags element ID.
 pub(crate) const TAGS: u32 = 0x1254_C367;
 
+// Track elements
+const TRACK_ENTRY: u32 = 0xAE;
+const TRACK_NUMBER: u32 = 0xD7;
+const TRACK_UID: u32 = 0x73C5;
+const TRACK_TYPE: u32 = 0x83;
+const CODEC_ID: u32 = 0x86;
+const CODEC_PRIVATE: u32 = 0x63A2;
+const LANGUAGE: u32 = 0x0022_B59C;
+const NAME: u32 = 0x536E;
+const FLAG_DEFAULT: u32 = 0x88;
+const FLAG_FORCED: u32 = 0x55AA;
+const FLAG_LACING: u32 = 0x9C;
+const DEFAULT_DURATION: u32 = 0x0023_E383;
+
+// Video sub-elements
+const VIDEO: u32 = 0xE0;
+const PIXEL_WIDTH: u32 = 0xB0;
+const PIXEL_HEIGHT: u32 = 0xBA;
+const DISPLAY_WIDTH: u32 = 0x54B0;
+const DISPLAY_HEIGHT: u32 = 0x54BA;
+const FLAG_INTERLACED: u32 = 0x9A;
+const COLOUR: u32 = 0x55B0;
+const MATRIX_COEFF: u32 = 0x55B1;
+const TRANSFER_CHAR: u32 = 0x55BA;
+const PRIMARIES: u32 = 0x55BB;
+const RANGE: u32 = 0x55B9;
+const BITS_PER_CHAN: u32 = 0x55B2;
+
+// Audio sub-elements
+const AUDIO: u32 = 0xE1;
+const SAMPLING_FREQ: u32 = 0xB5;
+const CHANNELS: u32 = 0x9F;
+const BIT_DEPTH: u32 = 0x6264;
+
 // ---------------------------------------------------------------------------
 // Layout constants
 // ---------------------------------------------------------------------------
@@ -100,6 +134,93 @@ pub struct SegmentInfo {
     pub title: Option<String>,
 }
 
+/// A track to add to the MKV file.
+pub enum TrackSpec {
+    /// Video track.
+    Video(VideoTrack),
+    /// Audio track.
+    Audio(AudioTrack),
+    /// Subtitle track.
+    Subtitle(SubtitleTrack),
+}
+
+/// Video track description.
+pub struct VideoTrack {
+    /// Matroska `CodecID` string (e.g. `"V_MPEG4/ISO/AVC"`).
+    pub codec_id: &'static str,
+    /// Codec initialization data (e.g. `AVCDecoderConfigurationRecord`).
+    /// `None` for codecs that don't need it (MPEG-2).
+    pub codec_private: Option<Vec<u8>>,
+    /// Coded pixel width.
+    pub pixel_width: u32,
+    /// Coded pixel height.
+    pub pixel_height: u32,
+    /// Display width (for aspect ratio). `None` = same as pixel width.
+    pub display_width: Option<u32>,
+    /// Display height (for aspect ratio). `None` = same as pixel height.
+    pub display_height: Option<u32>,
+    /// Frame duration in nanoseconds (e.g. `41_708_333` for 23.976 fps).
+    /// `None` = variable frame rate.
+    pub default_duration_ns: Option<u64>,
+    /// Interlacing flag. `None` = undetermined, `Some(true)` = interlaced,
+    /// `Some(false)` = progressive.
+    pub interlaced: Option<bool>,
+    /// Track name (e.g. `"Main Video"`). Optional.
+    pub name: Option<String>,
+    /// Colour metadata for HDR content. Optional.
+    pub colour: Option<VideoColour>,
+}
+
+/// Colour metadata for a video track (HDR).
+pub struct VideoColour {
+    /// ITU-T H.273 `MatrixCoefficients`.
+    pub matrix_coefficients: u8,
+    /// ITU-T H.273 `TransferCharacteristics`.
+    pub transfer_characteristics: u8,
+    /// ITU-T H.273 `ColourPrimaries`.
+    pub primaries: u8,
+    /// Signal range (1 = broadcast, 2 = full).
+    pub range: u8,
+    /// Bits per channel (e.g. 10 for HDR10).
+    pub bits_per_channel: u8,
+}
+
+/// Audio track description.
+pub struct AudioTrack {
+    /// Matroska `CodecID` string (e.g. `"A_AC3"`).
+    pub codec_id: &'static str,
+    /// Codec initialization data. `None` for most audio codecs.
+    pub codec_private: Option<Vec<u8>>,
+    /// Sampling rate in Hz (e.g. 48000.0).
+    pub sampling_frequency: f64,
+    /// Channel count.
+    pub channels: u8,
+    /// Bits per sample (required for LPCM).
+    pub bit_depth: Option<u8>,
+    /// ISO 639-2 language code (e.g. `"eng"`).
+    pub language: String,
+    /// Track name (e.g. `"Director's Commentary"`).
+    pub name: Option<String>,
+    /// Whether this is the default audio track.
+    pub is_default: bool,
+}
+
+/// Subtitle track description.
+pub struct SubtitleTrack {
+    /// Matroska `CodecID` string (e.g. `"S_HDMV/PGS"`).
+    pub codec_id: &'static str,
+    /// Codec initialization data. `None` for most subtitle codecs.
+    pub codec_private: Option<Vec<u8>>,
+    /// ISO 639-2 language code.
+    pub language: String,
+    /// Track name.
+    pub name: Option<String>,
+    /// Whether this is the default subtitle track.
+    pub is_default: bool,
+    /// Whether this is a forced subtitle track.
+    pub is_forced: bool,
+}
+
 /// Matroska muxer.  Writes a complete MKV file to the output.
 pub struct MkvMuxer<W: Write + Seek> {
     writer: W,
@@ -111,6 +232,8 @@ pub struct MkvMuxer<W: Write + Seek> {
     seek_placeholders: Vec<SeekPlaceholder>,
     /// Current byte position in the output.
     position: u64,
+    /// Number of tracks added so far (used for `TrackNumber` assignment).
+    track_count: u32,
 }
 
 /// Recorded location of a `SeekPosition` placeholder in the `SeekHead`.
@@ -170,6 +293,7 @@ impl<W: Write + Seek> MkvMuxer<W> {
             segment_data_start,
             seek_placeholders,
             position,
+            track_count: 0,
         })
     }
 
@@ -186,6 +310,45 @@ impl<W: Write + Seek> MkvMuxer<W> {
     #[must_use]
     pub const fn segment_data_start(&self) -> u64 {
         self.segment_data_start
+    }
+
+    /// Writes the Tracks element containing all provided track entries.
+    ///
+    /// Returns the assigned track numbers (1-based, in input order).
+    /// Track numbers are globally sequential across multiple calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] if writing fails.
+    pub fn add_tracks(&mut self, tracks: &[TrackSpec]) -> io::Result<Vec<u32>> {
+        // Buffer all TrackEntry elements to measure the Tracks content size.
+        let mut track_buf: Vec<u8> = Vec::new();
+        let mut assigned = Vec::with_capacity(tracks.len());
+
+        for spec in tracks {
+            self.track_count += 1;
+            let track_number = self.track_count;
+            assigned.push(track_number);
+
+            let uid = generate_track_uid(track_number);
+            write_track_entry(&mut track_buf, track_number, uid, spec)?;
+        }
+
+        // Record position for SeekHead backpatch.
+        let tracks_position = self.position;
+
+        // Write the Tracks master element.
+        let mut written =
+            ebml::write_master(&mut self.writer, TRACKS, track_buf.len() as u64)? as u64;
+        self.writer.write_all(&track_buf)?;
+        written += track_buf.len() as u64;
+
+        self.position += written;
+
+        // Backpatch SeekHead entry for Tracks.
+        self.backpatch_seek_entry(TRACKS, tracks_position)?;
+
+        Ok(assigned)
     }
 
     /// Overwrites a `SeekHead` placeholder with the actual byte position
@@ -368,6 +531,211 @@ fn write_segment_info(w: &mut impl Write, info: &SegmentInfo) -> io::Result<usiz
 }
 
 // ---------------------------------------------------------------------------
+// Track element writers
+// ---------------------------------------------------------------------------
+
+/// Writes a single `TrackEntry` master element.
+///
+/// `pub(crate)` for direct testing without the full muxer (avoids
+/// random `SegmentUID` bytes in test assertions).
+pub(crate) fn write_track_entry(
+    w: &mut impl Write,
+    track_number: u32,
+    uid: u64,
+    spec: &TrackSpec,
+) -> io::Result<usize> {
+    // Buffer children to measure content size.
+    let mut children: Vec<u8> = Vec::new();
+    write_track_entry_children(&mut children, track_number, uid, spec)?;
+
+    let mut written = ebml::write_master(w, TRACK_ENTRY, children.len() as u64)?;
+    w.write_all(&children)?;
+    written += children.len();
+    Ok(written)
+}
+
+/// Writes the children of a `TrackEntry`.
+fn write_track_entry_children(
+    w: &mut impl Write,
+    track_number: u32,
+    uid: u64,
+    spec: &TrackSpec,
+) -> io::Result<usize> {
+    let mut written = 0;
+
+    written += ebml::write_uint(w, TRACK_NUMBER, u64::from(track_number))?;
+    written += ebml::write_uint(w, TRACK_UID, uid)?;
+
+    let (track_type, codec_id, codec_private, language, name, is_default, is_forced) = match spec {
+        TrackSpec::Video(v) => (
+            1u64,
+            v.codec_id,
+            v.codec_private.as_deref(),
+            None,
+            v.name.as_deref(),
+            true,
+            false,
+        ),
+        TrackSpec::Audio(a) => (
+            2u64,
+            a.codec_id,
+            a.codec_private.as_deref(),
+            Some(a.language.as_str()),
+            a.name.as_deref(),
+            a.is_default,
+            false,
+        ),
+        TrackSpec::Subtitle(s) => (
+            17u64,
+            s.codec_id,
+            s.codec_private.as_deref(),
+            Some(s.language.as_str()),
+            s.name.as_deref(),
+            s.is_default,
+            s.is_forced,
+        ),
+    };
+
+    written += ebml::write_uint(w, TRACK_TYPE, track_type)?;
+    written += ebml::write_uint(w, FLAG_LACING, 0)?;
+    written += ebml::write_string(w, CODEC_ID, codec_id)?;
+
+    if let Some(data) = codec_private {
+        written += ebml::write_binary(w, CODEC_PRIVATE, data)?;
+    }
+
+    if let Some(lang) = language {
+        written += ebml::write_string(w, LANGUAGE, lang)?;
+    }
+
+    if let Some(n) = name {
+        written += ebml::write_utf8(w, NAME, n)?;
+    }
+
+    if !is_default {
+        written += ebml::write_uint(w, FLAG_DEFAULT, 0)?;
+    }
+
+    if is_forced {
+        written += ebml::write_uint(w, FLAG_FORCED, 1)?;
+    }
+
+    // Type-specific sub-elements.
+    match spec {
+        TrackSpec::Video(v) => {
+            if let Some(dur) = v.default_duration_ns {
+                written += ebml::write_uint(w, DEFAULT_DURATION, dur)?;
+            }
+            written += write_video_sub(w, v)?;
+        }
+        TrackSpec::Audio(a) => {
+            written += write_audio_sub(w, a)?;
+        }
+        TrackSpec::Subtitle(_) => {}
+    }
+
+    Ok(written)
+}
+
+/// Writes the Video master sub-element.
+fn write_video_sub(w: &mut impl Write, v: &VideoTrack) -> io::Result<usize> {
+    // Buffer to measure content size.
+    let mut children: Vec<u8> = Vec::new();
+    let mut child_written = 0;
+
+    child_written += ebml::write_uint(&mut children, PIXEL_WIDTH, u64::from(v.pixel_width))?;
+    child_written += ebml::write_uint(&mut children, PIXEL_HEIGHT, u64::from(v.pixel_height))?;
+
+    if let Some(dw) = v.display_width {
+        child_written += ebml::write_uint(&mut children, DISPLAY_WIDTH, u64::from(dw))?;
+    }
+    if let Some(dh) = v.display_height {
+        child_written += ebml::write_uint(&mut children, DISPLAY_HEIGHT, u64::from(dh))?;
+    }
+
+    if let Some(interlaced) = v.interlaced {
+        let flag = if interlaced { 1u64 } else { 2u64 };
+        child_written += ebml::write_uint(&mut children, FLAG_INTERLACED, flag)?;
+    }
+
+    if let Some(ref colour) = v.colour {
+        child_written += write_colour_sub(&mut children, colour)?;
+    }
+
+    debug_assert_eq!(
+        child_written,
+        children.len(),
+        "video sub-element size tracking mismatch"
+    );
+
+    let mut written = ebml::write_master(w, VIDEO, children.len() as u64)?;
+    w.write_all(&children)?;
+    written += children.len();
+    Ok(written)
+}
+
+/// Writes the Colour master sub-element.
+fn write_colour_sub(w: &mut impl Write, c: &VideoColour) -> io::Result<usize> {
+    let mut children: Vec<u8> = Vec::new();
+    let mut child_written = 0;
+
+    child_written += ebml::write_uint(
+        &mut children,
+        MATRIX_COEFF,
+        u64::from(c.matrix_coefficients),
+    )?;
+    child_written += ebml::write_uint(
+        &mut children,
+        TRANSFER_CHAR,
+        u64::from(c.transfer_characteristics),
+    )?;
+    child_written += ebml::write_uint(&mut children, PRIMARIES, u64::from(c.primaries))?;
+    child_written += ebml::write_uint(&mut children, RANGE, u64::from(c.range))?;
+    child_written += ebml::write_uint(&mut children, BITS_PER_CHAN, u64::from(c.bits_per_channel))?;
+
+    debug_assert_eq!(
+        child_written,
+        children.len(),
+        "colour sub-element size tracking mismatch"
+    );
+
+    let mut written = ebml::write_master(w, COLOUR, children.len() as u64)?;
+    w.write_all(&children)?;
+    written += children.len();
+    Ok(written)
+}
+
+/// Writes the Audio master sub-element.
+fn write_audio_sub(w: &mut impl Write, a: &AudioTrack) -> io::Result<usize> {
+    let mut children: Vec<u8> = Vec::new();
+    let mut child_written = 0;
+
+    child_written += ebml::write_float(&mut children, SAMPLING_FREQ, a.sampling_frequency)?;
+    child_written += ebml::write_uint(&mut children, CHANNELS, u64::from(a.channels))?;
+
+    if let Some(depth) = a.bit_depth {
+        child_written += ebml::write_uint(&mut children, BIT_DEPTH, u64::from(depth))?;
+    }
+
+    debug_assert_eq!(
+        child_written,
+        children.len(),
+        "audio sub-element size tracking mismatch"
+    );
+
+    let mut written = ebml::write_master(w, AUDIO, children.len() as u64)?;
+    w.write_all(&children)?;
+    written += children.len();
+    Ok(written)
+}
+
+/// Generates a track UID from the track number using [`RandomState`].
+fn generate_track_uid(track_number: u32) -> u64 {
+    let state = RandomState::new();
+    state.hash_one(u64::from(track_number))
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -491,8 +859,9 @@ mod tests {
     use std::io::{self, Cursor};
 
     use super::{
-        CHAPTERS, CUES, MkvMuxer, SEEK_HEAD_REGION_SIZE, SEEK_POSITION_RESERVED, SegmentInfo, TAGS,
-        TRACKS, write_ebml_header, write_seek_head_region, write_segment_info,
+        AudioTrack, CHAPTERS, CUES, MkvMuxer, SEEK_HEAD_REGION_SIZE, SEEK_POSITION_RESERVED,
+        SegmentInfo, SubtitleTrack, TAGS, TRACKS, TrackSpec, VideoColour, VideoTrack,
+        write_ebml_header, write_seek_head_region, write_segment_info,
     };
 
     // -------------------------------------------------------------------
@@ -791,6 +1160,431 @@ mod tests {
             position,
             data.len() as u64,
             "tracked position equals actual output length"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Track entries
+    // -------------------------------------------------------------------
+
+    fn make_muxer() -> MkvMuxer<Cursor<Vec<u8>>> {
+        let info = SegmentInfo {
+            duration_ns: None,
+            title: None,
+        };
+        MkvMuxer::new(Cursor::new(Vec::new()), &info, false, false).expect("create muxer")
+    }
+
+    #[test]
+    fn single_video_track() {
+        let mut muxer = make_muxer();
+        let codec_private = vec![0x01, 0x64, 0x00, 0x28]; // AVC profile
+
+        let tracks = [TrackSpec::Video(VideoTrack {
+            codec_id: "V_MPEG4/ISO/AVC",
+            codec_private: Some(codec_private.clone()),
+            pixel_width: 1920,
+            pixel_height: 1080,
+            display_width: None,
+            display_height: None,
+            default_duration_ns: None,
+            interlaced: None,
+            name: None,
+            colour: None,
+        })];
+
+        let assigned = muxer.add_tracks(&tracks).expect("add_tracks");
+        assert_eq!(assigned, [1], "first track should be number 1");
+
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // Tracks element ID should be present.
+        assert!(
+            contains_bytes(&data, &TRACKS.to_be_bytes()),
+            "output should contain Tracks element ID"
+        );
+
+        // CodecID string.
+        assert!(
+            contains_bytes(&data, b"V_MPEG4/ISO/AVC"),
+            "output should contain CodecID string"
+        );
+
+        // CodecPrivate data.
+        assert!(
+            contains_bytes(&data, &codec_private),
+            "output should contain CodecPrivate bytes"
+        );
+
+        // TrackType = 1 (video): element ID 0x83, size 0x81, value 0x01.
+        assert!(
+            contains_bytes(&data, &[0x83, 0x81, 0x01]),
+            "output should contain TrackType = 1 (video)"
+        );
+
+        // PixelWidth = 1920 = 0x0780: ID 0xB0, size 0x82, value 0x07 0x80.
+        assert!(
+            contains_bytes(&data, &[0xB0, 0x82, 0x07, 0x80]),
+            "output should contain PixelWidth = 1920"
+        );
+
+        // PixelHeight = 1080 = 0x0438: ID 0xBA, size 0x82, value 0x04 0x38.
+        assert!(
+            contains_bytes(&data, &[0xBA, 0x82, 0x04, 0x38]),
+            "output should contain PixelHeight = 1080"
+        );
+    }
+
+    #[test]
+    fn multiple_tracks_numbering() {
+        let mut muxer = make_muxer();
+
+        let tracks = [
+            TrackSpec::Video(VideoTrack {
+                codec_id: "V_MPEG2",
+                codec_private: None,
+                pixel_width: 720,
+                pixel_height: 480,
+                display_width: None,
+                display_height: None,
+                default_duration_ns: None,
+                interlaced: None,
+                name: None,
+                colour: None,
+            }),
+            TrackSpec::Audio(AudioTrack {
+                codec_id: "A_AC3",
+                codec_private: None,
+                sampling_frequency: 48000.0,
+                channels: 6,
+                bit_depth: None,
+                language: "eng".to_string(),
+                name: Some("Surround".to_string()),
+                is_default: true,
+            }),
+            TrackSpec::Audio(AudioTrack {
+                codec_id: "A_AC3",
+                codec_private: None,
+                sampling_frequency: 48000.0,
+                channels: 2,
+                bit_depth: None,
+                language: "fra".to_string(),
+                name: None,
+                is_default: false,
+            }),
+            TrackSpec::Subtitle(SubtitleTrack {
+                codec_id: "S_HDMV/PGS",
+                codec_private: None,
+                language: "eng".to_string(),
+                name: None,
+                is_default: true,
+                is_forced: false,
+            }),
+        ];
+
+        let assigned = muxer.add_tracks(&tracks).expect("add_tracks");
+        assert_eq!(
+            assigned,
+            [1, 2, 3, 4],
+            "track numbers should be 1-based sequential"
+        );
+
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // Video track type.
+        assert!(
+            contains_bytes(&data, &[0x83, 0x81, 0x01]),
+            "should contain TrackType = 1 (video)"
+        );
+        // Audio track type.
+        assert!(
+            contains_bytes(&data, &[0x83, 0x81, 0x02]),
+            "should contain TrackType = 2 (audio)"
+        );
+        // Subtitle track type.
+        assert!(
+            contains_bytes(&data, &[0x83, 0x81, 0x11]),
+            "should contain TrackType = 17 (subtitle)"
+        );
+
+        // Languages.
+        assert!(
+            contains_bytes(&data, b"eng"),
+            "should contain English language"
+        );
+        assert!(
+            contains_bytes(&data, b"fra"),
+            "should contain French language"
+        );
+
+        // Track name.
+        assert!(
+            contains_bytes(&data, b"Surround"),
+            "should contain track name"
+        );
+
+        // CodecIDs.
+        assert!(
+            contains_bytes(&data, b"V_MPEG2"),
+            "should contain video CodecID"
+        );
+        assert!(
+            contains_bytes(&data, b"A_AC3"),
+            "should contain audio CodecID"
+        );
+        assert!(
+            contains_bytes(&data, b"S_HDMV/PGS"),
+            "should contain subtitle CodecID"
+        );
+    }
+
+    #[test]
+    fn audio_lpcm_with_bit_depth() {
+        let mut muxer = make_muxer();
+
+        let tracks = [TrackSpec::Audio(AudioTrack {
+            codec_id: "A_PCM/INT/BIG",
+            codec_private: None,
+            sampling_frequency: 48000.0,
+            channels: 2,
+            bit_depth: Some(24),
+            language: "eng".to_string(),
+            name: None,
+            is_default: true,
+        })];
+
+        muxer.add_tracks(&tracks).expect("add_tracks");
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // BitDepth = 24: ID 0x62 0x64, size 0x81, value 0x18.
+        assert!(
+            contains_bytes(&data, &[0x62, 0x64, 0x81, 0x18]),
+            "should contain BitDepth = 24"
+        );
+    }
+
+    #[test]
+    fn audio_without_codec_private() {
+        let spec = TrackSpec::Audio(AudioTrack {
+            codec_id: "A_AC3",
+            codec_private: None,
+            sampling_frequency: 48000.0,
+            channels: 6,
+            bit_depth: None,
+            language: "eng".to_string(),
+            name: None,
+            is_default: true,
+        });
+
+        let mut buf = Vec::new();
+        super::write_track_entry(&mut buf, 1, 42, &spec).expect("write_track_entry");
+
+        // CodecPrivate ID (0x63 0xA2) should NOT be present.
+        assert!(
+            !contains_bytes(&buf, &[0x63, 0xA2]),
+            "should not contain CodecPrivate element when None"
+        );
+    }
+
+    #[test]
+    fn subtitle_forced_flag() {
+        let mut muxer = make_muxer();
+
+        let tracks = [TrackSpec::Subtitle(SubtitleTrack {
+            codec_id: "S_HDMV/PGS",
+            codec_private: None,
+            language: "eng".to_string(),
+            name: None,
+            is_default: false,
+            is_forced: true,
+        })];
+
+        muxer.add_tracks(&tracks).expect("add_tracks");
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // FlagForced = 1: ID 0x55 0xAA, size 0x81, value 0x01.
+        assert!(
+            contains_bytes(&data, &[0x55, 0xAA, 0x81, 0x01]),
+            "should contain FlagForced = 1"
+        );
+    }
+
+    #[test]
+    fn flag_default_written_when_false() {
+        let mut muxer = make_muxer();
+
+        let tracks = [
+            TrackSpec::Audio(AudioTrack {
+                codec_id: "A_AC3",
+                codec_private: None,
+                sampling_frequency: 48000.0,
+                channels: 6,
+                bit_depth: None,
+                language: "eng".to_string(),
+                name: None,
+                is_default: true,
+            }),
+            TrackSpec::Audio(AudioTrack {
+                codec_id: "A_AC3",
+                codec_private: None,
+                sampling_frequency: 48000.0,
+                channels: 2,
+                bit_depth: None,
+                language: "eng".to_string(),
+                name: None,
+                is_default: false,
+            }),
+        ];
+
+        muxer.add_tracks(&tracks).expect("add_tracks");
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // FlagDefault = 0: ID 0x88, size 0x80 (value 0 = empty body).
+        assert!(
+            contains_bytes(&data, &[0x88, 0x80]),
+            "should contain FlagDefault = 0 for non-default track"
+        );
+    }
+
+    #[test]
+    fn video_hdr_colour() {
+        let mut muxer = make_muxer();
+
+        let tracks = [TrackSpec::Video(VideoTrack {
+            codec_id: "V_MPEGH/ISO/HEVC",
+            codec_private: None,
+            pixel_width: 3840,
+            pixel_height: 2160,
+            display_width: None,
+            display_height: None,
+            default_duration_ns: Some(41_708_333),
+            interlaced: Some(false),
+            name: None,
+            colour: Some(VideoColour {
+                matrix_coefficients: 9,
+                transfer_characteristics: 16,
+                primaries: 9,
+                range: 1,
+                bits_per_channel: 10,
+            }),
+        })];
+
+        muxer.add_tracks(&tracks).expect("add_tracks");
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // Colour element ID: 0x55 0xB0.
+        assert!(
+            contains_bytes(&data, &[0x55, 0xB0]),
+            "should contain Colour element"
+        );
+
+        // MatrixCoefficients = 9: ID 0x55 0xB1, size 0x81, value 0x09.
+        assert!(
+            contains_bytes(&data, &[0x55, 0xB1, 0x81, 0x09]),
+            "should contain MatrixCoefficients = 9"
+        );
+
+        // TransferCharacteristics = 16: ID 0x55 0xBA, size 0x81, value 0x10.
+        assert!(
+            contains_bytes(&data, &[0x55, 0xBA, 0x81, 0x10]),
+            "should contain TransferCharacteristics = 16"
+        );
+
+        // Primaries = 9: ID 0x55 0xBB, size 0x81, value 0x09.
+        assert!(
+            contains_bytes(&data, &[0x55, 0xBB, 0x81, 0x09]),
+            "should contain Primaries = 9"
+        );
+
+        // BitsPerChannel = 10: ID 0x55 0xB2, size 0x81, value 0x0A.
+        assert!(
+            contains_bytes(&data, &[0x55, 0xB2, 0x81, 0x0A]),
+            "should contain BitsPerChannel = 10"
+        );
+
+        // FlagInterlaced = 2 (progressive): ID 0x9A, size 0x81, value 0x02.
+        assert!(
+            contains_bytes(&data, &[0x9A, 0x81, 0x02]),
+            "should contain FlagInterlaced = 2 (progressive)"
+        );
+
+        // DefaultDuration should be present.
+        // ID 0x23 0xE3 0x83 (3-byte ID).
+        assert!(
+            contains_bytes(&data, &[0x23, 0xE3, 0x83]),
+            "should contain DefaultDuration element"
+        );
+    }
+
+    #[test]
+    fn position_updated_after_add_tracks() {
+        let mut muxer = make_muxer();
+        let pos_before = muxer.position();
+
+        let tracks = [TrackSpec::Video(VideoTrack {
+            codec_id: "V_MPEG2",
+            codec_private: None,
+            pixel_width: 720,
+            pixel_height: 480,
+            display_width: None,
+            display_height: None,
+            default_duration_ns: None,
+            interlaced: None,
+            name: None,
+            colour: None,
+        })];
+
+        muxer.add_tracks(&tracks).expect("add_tracks");
+        let pos_after = muxer.position();
+
+        assert!(
+            pos_after > pos_before,
+            "position should advance after add_tracks"
+        );
+
+        let data = muxer.finalize().expect("finalize").into_inner();
+        assert_eq!(
+            pos_after,
+            data.len() as u64,
+            "tracked position should equal actual output length"
+        );
+    }
+
+    #[test]
+    fn seekhead_backpatched_for_tracks() {
+        let mut muxer = make_muxer();
+        let segment_start = muxer.segment_data_start();
+
+        let tracks = [TrackSpec::Video(VideoTrack {
+            codec_id: "V_MPEG2",
+            codec_private: None,
+            pixel_width: 720,
+            pixel_height: 480,
+            display_width: None,
+            display_height: None,
+            default_duration_ns: None,
+            interlaced: None,
+            name: None,
+            colour: None,
+        })];
+
+        muxer.add_tracks(&tracks).expect("add_tracks");
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // SeekPosition for Tracks is at segment_start + 18 (same calc as
+        // backpatch_overwrites_placeholder test).
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "test uses a Cursor<Vec<u8>> — position is always small"
+        )]
+        let value_offset = segment_start as usize + 18;
+        let seek_pos_bytes = &data[value_offset..value_offset + 5];
+
+        // The Tracks element should not be at offset 0 (placeholder was
+        // overwritten).
+        assert_ne!(
+            seek_pos_bytes, [0x00; 5],
+            "SeekPosition for Tracks should be backpatched (non-zero)"
         );
     }
 
