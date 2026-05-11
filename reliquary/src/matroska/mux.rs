@@ -98,6 +98,30 @@ const BLOCK: u32 = 0xA1;
 const BLOCK_DURATION: u32 = 0x9B;
 const PREV_SIZE: u32 = 0xAB;
 
+// Chapter elements
+const EDITION_ENTRY: u32 = 0x45B9;
+const EDITION_UID: u32 = 0x45BC;
+const EDITION_FLAG_DEFAULT: u32 = 0x45DB;
+const EDITION_FLAG_HIDDEN: u32 = 0x45BD;
+const CHAPTER_ATOM: u32 = 0xB6;
+const CHAPTER_UID: u32 = 0x73C4;
+const CHAPTER_TIME_START: u32 = 0x91;
+const CHAPTER_TIME_END: u32 = 0x92;
+const CHAPTER_FLAG_HIDDEN: u32 = 0x98;
+const CHAPTER_FLAG_ENABLED: u32 = 0x4598;
+const CHAPTER_DISPLAY: u32 = 0x80;
+const CHAP_STRING: u32 = 0x85;
+const CHAP_LANGUAGE: u32 = 0x437C;
+
+// Tag elements
+const TAG: u32 = 0x7373;
+const TARGETS: u32 = 0x63C0;
+const TARGET_TYPE_VALUE: u32 = 0x68CA;
+const SIMPLE_TAG: u32 = 0x67C8;
+const TAG_NAME: u32 = 0x45A3;
+const TAG_STRING: u32 = 0x4487;
+const TAG_LANGUAGE: u32 = 0x447A;
+
 // ---------------------------------------------------------------------------
 // Layout constants
 // ---------------------------------------------------------------------------
@@ -141,6 +165,9 @@ pub struct SegmentInfo {
     pub duration_ns: Option<u64>,
     /// Content title (optional).
     pub title: Option<String>,
+    /// Segment UID (16 bytes).  If `None`, a random UID is generated.
+    /// Provide a value for reproducible (deterministic) output.
+    pub segment_uid: Option<[u8; 16]>,
 }
 
 /// A track to add to the MKV file.
@@ -248,6 +275,27 @@ pub struct Frame<'a> {
     /// display segments.  `None` for video/audio (duration is implied
     /// by the next frame's timestamp or `DefaultDuration`).
     pub duration_ms: Option<u64>,
+}
+
+/// A chapter marker for the MKV file.
+pub struct Chapter {
+    /// Chapter start time in nanoseconds from segment start.
+    pub start_ns: u64,
+    /// Chapter end time in nanoseconds. `None` means the chapter runs
+    /// until the next chapter or end of content.
+    pub end_ns: Option<u64>,
+    /// Display name (e.g. "Chapter 1", "Opening Credits").
+    pub title: String,
+    /// Language for the title (ISO 639-2, e.g. "eng").
+    pub language: String,
+}
+
+/// A segment-level tag for the MKV file.
+pub struct ContentTag {
+    /// Tag name (e.g. "TITLE").
+    pub name: String,
+    /// Tag value.
+    pub value: String,
 }
 
 /// Collected cue point for later Cues writing.
@@ -610,6 +658,72 @@ impl<W: Write + Seek> MkvMuxer<W> {
         Ok(())
     }
 
+    /// Writes chapter markers into the MKV file.
+    ///
+    /// Chapters appear between tracks and the first cluster.  If
+    /// `chapters` is empty, nothing is written.  The `SeekHead` entry
+    /// for Chapters is backpatched with the written position.
+    ///
+    /// The muxer must have been created with `has_chapters: true` so
+    /// that a `SeekHead` placeholder exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] if writing or backpatching fails.
+    pub fn write_chapters(&mut self, chapters: &[Chapter]) -> io::Result<()> {
+        if chapters.is_empty() {
+            return Ok(());
+        }
+
+        let chapters_position = self.position;
+
+        // Buffer the edition entry to compute the Chapters content size.
+        let mut edition_buf: Vec<u8> = Vec::new();
+        write_edition_entry(&mut edition_buf, chapters)?;
+
+        self.position +=
+            ebml::write_master(&mut self.writer, CHAPTERS, edition_buf.len() as u64)? as u64;
+        self.writer.write_all(&edition_buf)?;
+        self.position += edition_buf.len() as u64;
+
+        self.backpatch_seek_entry(CHAPTERS, chapters_position)?;
+
+        Ok(())
+    }
+
+    /// Writes segment-level tags into the MKV file.
+    ///
+    /// Tags appear between tracks and the first cluster (after chapters
+    /// if both are present).  If `tags` is empty, nothing is written.
+    /// The `SeekHead` entry for Tags is backpatched with the written
+    /// position.
+    ///
+    /// The muxer must have been created with `has_tags: true` so that
+    /// a `SeekHead` placeholder exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] if writing or backpatching fails.
+    pub fn write_tags(&mut self, tags: &[ContentTag]) -> io::Result<()> {
+        if tags.is_empty() {
+            return Ok(());
+        }
+
+        let tags_position = self.position;
+
+        // Buffer the Tag element to compute the Tags content size.
+        let mut tag_buf: Vec<u8> = Vec::new();
+        write_tag_element(&mut tag_buf, tags)?;
+
+        self.position += ebml::write_master(&mut self.writer, TAGS, tag_buf.len() as u64)? as u64;
+        self.writer.write_all(&tag_buf)?;
+        self.position += tag_buf.len() as u64;
+
+        self.backpatch_seek_entry(TAGS, tags_position)?;
+
+        Ok(())
+    }
+
     /// Finalizes the MKV file and returns the underlying writer.
     ///
     /// Full implementation (cues, final backpatch) is added in a later
@@ -714,7 +828,7 @@ fn write_seek_entry(
 
 /// Writes the Segment Info element.
 fn write_segment_info(w: &mut impl Write, info: &SegmentInfo) -> io::Result<usize> {
-    let uid = generate_segment_uid();
+    let uid = info.segment_uid.unwrap_or_else(generate_segment_uid);
 
     let duration_value = info.duration_ns.map(ns_to_timestamp_scale_units);
 
@@ -946,6 +1060,129 @@ fn write_audio_sub(w: &mut impl Write, a: &AudioTrack) -> io::Result<usize> {
     Ok(written)
 }
 
+// ---------------------------------------------------------------------------
+// Chapter and tag element writers
+// ---------------------------------------------------------------------------
+
+/// Writes one `EditionEntry` containing all chapter atoms.
+fn write_edition_entry(w: &mut impl Write, chapters: &[Chapter]) -> io::Result<usize> {
+    let mut children: Vec<u8> = Vec::new();
+    let mut child_written = 0;
+
+    child_written += ebml::write_uint(&mut children, EDITION_UID, 1)?;
+    child_written += ebml::write_uint(&mut children, EDITION_FLAG_DEFAULT, 1)?;
+    child_written += ebml::write_uint(&mut children, EDITION_FLAG_HIDDEN, 0)?;
+
+    for (i, chapter) in chapters.iter().enumerate() {
+        let uid = (i as u64) + 1;
+        child_written += write_chapter_atom(&mut children, chapter, uid)?;
+    }
+
+    debug_assert_eq!(
+        child_written,
+        children.len(),
+        "edition entry size tracking mismatch"
+    );
+
+    let mut written = ebml::write_master(w, EDITION_ENTRY, children.len() as u64)?;
+    w.write_all(&children)?;
+    written += children.len();
+    Ok(written)
+}
+
+/// Writes one `ChapterAtom` element.
+fn write_chapter_atom(w: &mut impl Write, chapter: &Chapter, uid: u64) -> io::Result<usize> {
+    let mut children: Vec<u8> = Vec::new();
+    let mut child_written = 0;
+
+    child_written += ebml::write_uint(&mut children, CHAPTER_UID, uid)?;
+    child_written += write_uint_min1(&mut children, CHAPTER_TIME_START, chapter.start_ns)?;
+    if let Some(end_ns) = chapter.end_ns {
+        child_written += write_uint_min1(&mut children, CHAPTER_TIME_END, end_ns)?;
+    }
+    child_written += ebml::write_uint(&mut children, CHAPTER_FLAG_HIDDEN, 0)?;
+    child_written += ebml::write_uint(&mut children, CHAPTER_FLAG_ENABLED, 1)?;
+    child_written += write_chapter_display(&mut children, chapter)?;
+
+    debug_assert_eq!(
+        child_written,
+        children.len(),
+        "chapter atom size tracking mismatch"
+    );
+
+    let mut written = ebml::write_master(w, CHAPTER_ATOM, children.len() as u64)?;
+    w.write_all(&children)?;
+    written += children.len();
+    Ok(written)
+}
+
+/// Writes one `ChapterDisplay` element.
+fn write_chapter_display(w: &mut impl Write, chapter: &Chapter) -> io::Result<usize> {
+    let mut children: Vec<u8> = Vec::new();
+    let mut child_written = 0;
+
+    child_written += ebml::write_utf8(&mut children, CHAP_STRING, &chapter.title)?;
+    child_written += ebml::write_string(&mut children, CHAP_LANGUAGE, &chapter.language)?;
+
+    debug_assert_eq!(
+        child_written,
+        children.len(),
+        "chapter display size tracking mismatch"
+    );
+
+    let mut written = ebml::write_master(w, CHAPTER_DISPLAY, children.len() as u64)?;
+    w.write_all(&children)?;
+    written += children.len();
+    Ok(written)
+}
+
+/// Writes one `Tag` element with `Targets` and `SimpleTag` children.
+fn write_tag_element(w: &mut impl Write, tags: &[ContentTag]) -> io::Result<usize> {
+    let mut children: Vec<u8> = Vec::new();
+    let mut child_written = 0;
+
+    // Targets: TargetTypeValue = 50 (segment/movie level).
+    let targets_content_size = measure_uint(TARGET_TYPE_VALUE, 50);
+    child_written += ebml::write_master(&mut children, TARGETS, targets_content_size as u64)?;
+    child_written += ebml::write_uint(&mut children, TARGET_TYPE_VALUE, 50)?;
+
+    for tag in tags {
+        child_written += write_simple_tag(&mut children, tag)?;
+    }
+
+    debug_assert_eq!(
+        child_written,
+        children.len(),
+        "tag element size tracking mismatch"
+    );
+
+    let mut written = ebml::write_master(w, TAG, children.len() as u64)?;
+    w.write_all(&children)?;
+    written += children.len();
+    Ok(written)
+}
+
+/// Writes one `SimpleTag` element.
+fn write_simple_tag(w: &mut impl Write, tag: &ContentTag) -> io::Result<usize> {
+    let mut children: Vec<u8> = Vec::new();
+    let mut child_written = 0;
+
+    child_written += ebml::write_utf8(&mut children, TAG_NAME, &tag.name)?;
+    child_written += ebml::write_utf8(&mut children, TAG_STRING, &tag.value)?;
+    child_written += ebml::write_string(&mut children, TAG_LANGUAGE, "und")?;
+
+    debug_assert_eq!(
+        child_written,
+        children.len(),
+        "simple tag size tracking mismatch"
+    );
+
+    let mut written = ebml::write_master(w, SIMPLE_TAG, children.len() as u64)?;
+    w.write_all(&children)?;
+    written += children.len();
+    Ok(written)
+}
+
 /// Computes the relative timestamp for a block within a cluster.
 ///
 /// Returns an i16 suitable for the `SimpleBlock` / `Block` timestamp field.
@@ -979,15 +1216,35 @@ const fn simple_block_flags(keyframe: bool, discardable: bool) -> u8 {
     flags
 }
 
-/// Generates a track UID from the track number using [`RandomState`].
+/// Generates a deterministic track UID from the track number.
+///
+/// Track numbers are 1-based sequential, so the resulting UIDs are
+/// unique within the file and non-zero.
 fn generate_track_uid(track_number: u32) -> u64 {
-    let state = RandomState::new();
-    state.hash_one(u64::from(track_number))
+    u64::from(track_number)
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Writes a uint element with at least 1 byte of data, even for value 0.
+///
+/// Standard EBML encodes uint 0 as an empty element (size = 0, no data).
+/// Some Matroska parsers (including ffprobe's lavf demuxer) don't handle
+/// empty uints for mandatory timestamp elements.  This writes `0x00` for
+/// value 0, ensuring parser compatibility.
+fn write_uint_min1(w: &mut impl Write, id: u32, value: u64) -> io::Result<usize> {
+    if value == 0 {
+        let mut written = ebml::write_element_id(w, id)?;
+        written += ebml::write_vint(w, 1, 1)?;
+        w.write_all(&[0x00])?;
+        written += 1;
+        Ok(written)
+    } else {
+        ebml::write_uint(w, id, value)
+    }
+}
 
 /// Writes a uint element with a fixed-width value (zero-padded to `width`
 /// bytes).  Used for `SeekPosition` placeholders.
@@ -1034,7 +1291,7 @@ fn seek_entry_content_size() -> u64 {
 /// IDs from module constants.
 const fn element_id_width(id: u32) -> usize {
     match id {
-        0x81..=0xFE => 1,
+        0x80..=0xFE => 1,
         0x4000..=0x7FFF => 2,
         0x20_0000..=0x3F_FFFF => 3,
         _ => 4,
@@ -1109,9 +1366,10 @@ mod tests {
     use std::io::{self, Cursor};
 
     use super::{
-        AudioTrack, CHAPTERS, CLUSTER, CUES, Frame, MkvMuxer, SEEK_HEAD_REGION_SIZE,
-        SEEK_POSITION_RESERVED, SegmentInfo, SubtitleTrack, TAGS, TRACKS, TrackSpec, VideoColour,
-        VideoTrack, write_ebml_header, write_seek_head_region, write_segment_info,
+        AudioTrack, CHAPTERS, CLUSTER, CUES, Chapter, ContentTag, Frame, MkvMuxer,
+        SEEK_HEAD_REGION_SIZE, SEEK_POSITION_RESERVED, SegmentInfo, SubtitleTrack, TAGS, TRACKS,
+        TrackSpec, VideoColour, VideoTrack, write_ebml_header, write_seek_head_region,
+        write_segment_info,
     };
 
     // -------------------------------------------------------------------
@@ -1218,6 +1476,7 @@ mod tests {
         let info = SegmentInfo {
             duration_ns: Some(120_000_000_000),
             title: Some("Test Title".to_string()),
+            segment_uid: None,
         };
         let n = write_segment_info(&mut buf, &info).expect("write Segment Info");
 
@@ -1254,6 +1513,7 @@ mod tests {
         let info = SegmentInfo {
             duration_ns: None,
             title: None,
+            segment_uid: None,
         };
         let n = write_segment_info(&mut buf, &info).expect("write Segment Info");
 
@@ -1280,6 +1540,7 @@ mod tests {
         let info = SegmentInfo {
             duration_ns: None,
             title: None,
+            segment_uid: None,
         };
         let mut muxer =
             MkvMuxer::new(Cursor::new(Vec::new()), &info, false, false).expect("create muxer");
@@ -1316,6 +1577,7 @@ mod tests {
         let info = SegmentInfo {
             duration_ns: None,
             title: None,
+            segment_uid: None,
         };
         let mut muxer =
             MkvMuxer::new(Cursor::new(Vec::new()), &info, false, false).expect("create muxer");
@@ -1339,6 +1601,7 @@ mod tests {
         let info = SegmentInfo {
             duration_ns: Some(60_000_000_000),
             title: Some("Round Trip Test".to_string()),
+            segment_uid: None,
         };
         let muxer =
             MkvMuxer::new(Cursor::new(Vec::new()), &info, true, true).expect("create muxer");
@@ -1382,6 +1645,7 @@ mod tests {
         let info = SegmentInfo {
             duration_ns: None,
             title: None,
+            segment_uid: None,
         };
         let muxer =
             MkvMuxer::new(Cursor::new(Vec::new()), &info, false, false).expect("create muxer");
@@ -1399,6 +1663,7 @@ mod tests {
         let info = SegmentInfo {
             duration_ns: None,
             title: None,
+            segment_uid: None,
         };
         let muxer =
             MkvMuxer::new(Cursor::new(Vec::new()), &info, false, false).expect("create muxer");
@@ -1421,6 +1686,7 @@ mod tests {
         let info = SegmentInfo {
             duration_ns: None,
             title: None,
+            segment_uid: None,
         };
         MkvMuxer::new(Cursor::new(Vec::new()), &info, false, false).expect("create muxer")
     }
@@ -2335,6 +2601,409 @@ mod tests {
         let cluster_id = CLUSTER.to_be_bytes();
         let cluster_count = data.windows(4).filter(|w| *w == cluster_id).count();
         assert_eq!(cluster_count, 2, "output contains 2 clusters");
+    }
+
+    // -------------------------------------------------------------------
+    // Chapter and tag tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn chapters_two_basic() {
+        let info = SegmentInfo {
+            duration_ns: None,
+            title: None,
+            segment_uid: None,
+        };
+        let mut muxer =
+            MkvMuxer::new(Cursor::new(Vec::new()), &info, true, false).expect("create muxer");
+
+        let chapters = [
+            Chapter {
+                start_ns: 0,
+                end_ns: None,
+                title: "Chapter 1".to_string(),
+                language: "eng".to_string(),
+            },
+            Chapter {
+                start_ns: 60_000_000_000,
+                end_ns: None,
+                title: "Chapter 2".to_string(),
+                language: "eng".to_string(),
+            },
+        ];
+
+        muxer.write_chapters(&chapters).expect("write_chapters");
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // Chapters element ID: 0x10 0x43 0xA7 0x70.
+        assert!(
+            contains_bytes(&data, &[0x10, 0x43, 0xA7, 0x70]),
+            "output should contain Chapters element ID"
+        );
+
+        // EditionEntry element ID: 0x45 0xB9.
+        assert!(
+            contains_bytes(&data, &[0x45, 0xB9]),
+            "output should contain EditionEntry element ID"
+        );
+
+        // ChapterAtom element ID: 0xB6 — should appear twice.
+        let atom_count = data.windows(1).filter(|w| w == &[0xB6]).count();
+        assert!(atom_count >= 2, "should contain at least 2 ChapterAtom IDs");
+
+        // Chapter titles.
+        assert!(
+            contains_bytes(&data, b"Chapter 1"),
+            "should contain first chapter title"
+        );
+        assert!(
+            contains_bytes(&data, b"Chapter 2"),
+            "should contain second chapter title"
+        );
+
+        // ChapLanguage = "eng".
+        assert!(
+            contains_bytes(&data, b"eng"),
+            "should contain chapter language"
+        );
+
+        // ChapterTimeStart for second chapter = 60_000_000_000 = 0x0D_F847_5800.
+        // As a 5-byte uint: [0x0D, 0xF8, 0x47, 0x58, 0x00].
+        assert!(
+            contains_bytes(&data, &[0x0D, 0xF8, 0x47, 0x58, 0x00]),
+            "should contain second chapter timestamp (60 billion ns)"
+        );
+    }
+
+    #[test]
+    fn chapter_with_end_time() {
+        let info = SegmentInfo {
+            duration_ns: None,
+            title: None,
+            segment_uid: None,
+        };
+        let mut muxer =
+            MkvMuxer::new(Cursor::new(Vec::new()), &info, true, false).expect("create muxer");
+
+        let chapters = [Chapter {
+            start_ns: 0,
+            end_ns: Some(30_000_000_000),
+            title: "Intro".to_string(),
+            language: "eng".to_string(),
+        }];
+
+        muxer.write_chapters(&chapters).expect("write_chapters");
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // ChapterTimeEnd element ID: 0x92.
+        assert!(
+            contains_bytes(&data, &[0x92]),
+            "should contain ChapterTimeEnd element ID"
+        );
+
+        // ChapterTimeEnd = 30_000_000_000 = 0x06_FC23_AC00.
+        // As a 5-byte uint: [0x06, 0xFC, 0x23, 0xAC, 0x00].
+        assert!(
+            contains_bytes(&data, &[0x06, 0xFC, 0x23, 0xAC, 0x00]),
+            "should contain ChapterTimeEnd value (30 billion ns)"
+        );
+    }
+
+    #[test]
+    fn chapters_empty_writes_nothing() {
+        let info = SegmentInfo {
+            duration_ns: None,
+            title: None,
+            segment_uid: None,
+        };
+        let mut muxer =
+            MkvMuxer::new(Cursor::new(Vec::new()), &info, false, false).expect("create muxer");
+
+        let pos_before = muxer.position();
+        muxer.write_chapters(&[]).expect("write empty chapters");
+        let pos_after = muxer.position();
+
+        assert_eq!(
+            pos_before, pos_after,
+            "position should not change for empty chapters"
+        );
+    }
+
+    #[test]
+    fn tags_single_title() {
+        let info = SegmentInfo {
+            duration_ns: None,
+            title: None,
+            segment_uid: None,
+        };
+        let mut muxer =
+            MkvMuxer::new(Cursor::new(Vec::new()), &info, false, true).expect("create muxer");
+
+        let tags = [ContentTag {
+            name: "TITLE".to_string(),
+            value: "Test Movie".to_string(),
+        }];
+
+        muxer.write_tags(&tags).expect("write_tags");
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // Tags element ID: 0x12 0x54 0xC3 0x67.
+        assert!(
+            contains_bytes(&data, &[0x12, 0x54, 0xC3, 0x67]),
+            "output should contain Tags element ID"
+        );
+
+        // Tag element ID: 0x73 0x73.
+        assert!(
+            contains_bytes(&data, &[0x73, 0x73]),
+            "output should contain Tag element ID"
+        );
+
+        // Targets element ID: 0x63 0xC0.
+        assert!(
+            contains_bytes(&data, &[0x63, 0xC0]),
+            "output should contain Targets element ID"
+        );
+
+        // TargetTypeValue = 50: ID 0x68 0xCA, size 0x81, value 0x32.
+        assert!(
+            contains_bytes(&data, &[0x68, 0xCA, 0x81, 0x32]),
+            "should contain TargetTypeValue = 50"
+        );
+
+        // SimpleTag element ID: 0x67 0xC8.
+        assert!(
+            contains_bytes(&data, &[0x67, 0xC8]),
+            "output should contain SimpleTag element ID"
+        );
+
+        // TagName and TagString values.
+        assert!(contains_bytes(&data, b"TITLE"), "should contain tag name");
+        assert!(
+            contains_bytes(&data, b"Test Movie"),
+            "should contain tag value"
+        );
+
+        // TagLanguage = "und".
+        assert!(contains_bytes(&data, b"und"), "should contain tag language");
+    }
+
+    #[test]
+    fn tags_multiple() {
+        let info = SegmentInfo {
+            duration_ns: None,
+            title: None,
+            segment_uid: None,
+        };
+        let mut muxer =
+            MkvMuxer::new(Cursor::new(Vec::new()), &info, false, true).expect("create muxer");
+
+        let tags = [
+            ContentTag {
+                name: "TITLE".to_string(),
+                value: "Test Movie".to_string(),
+            },
+            ContentTag {
+                name: "DESCRIPTION".to_string(),
+                value: "A test description".to_string(),
+            },
+        ];
+
+        muxer.write_tags(&tags).expect("write_tags");
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // Two SimpleTag elements: ID 0x67 0xC8 should appear twice.
+        let simple_tag_id = [0x67, 0xC8];
+        let count = data.windows(2).filter(|w| *w == simple_tag_id).count();
+        assert_eq!(count, 2, "should contain 2 SimpleTag elements");
+
+        assert!(
+            contains_bytes(&data, b"TITLE"),
+            "should contain first tag name"
+        );
+        assert!(
+            contains_bytes(&data, b"DESCRIPTION"),
+            "should contain second tag name"
+        );
+        assert!(
+            contains_bytes(&data, b"A test description"),
+            "should contain second tag value"
+        );
+    }
+
+    #[test]
+    fn tags_empty_writes_nothing() {
+        let info = SegmentInfo {
+            duration_ns: None,
+            title: None,
+            segment_uid: None,
+        };
+        let mut muxer =
+            MkvMuxer::new(Cursor::new(Vec::new()), &info, false, false).expect("create muxer");
+
+        let pos_before = muxer.position();
+        muxer.write_tags(&[]).expect("write empty tags");
+        let pos_after = muxer.position();
+
+        assert_eq!(
+            pos_before, pos_after,
+            "position should not change for empty tags"
+        );
+    }
+
+    #[test]
+    fn seekhead_backpatched_for_chapters_and_tags() {
+        let info = SegmentInfo {
+            duration_ns: None,
+            title: None,
+            segment_uid: None,
+        };
+        let mut muxer =
+            MkvMuxer::new(Cursor::new(Vec::new()), &info, true, true).expect("create muxer");
+        let segment_start = muxer.segment_data_start();
+
+        let chapters = [Chapter {
+            start_ns: 0,
+            end_ns: None,
+            title: "Chapter 1".to_string(),
+            language: "eng".to_string(),
+        }];
+        muxer.write_chapters(&chapters).expect("write_chapters");
+
+        let tags = [ContentTag {
+            name: "TITLE".to_string(),
+            value: "Test".to_string(),
+        }];
+        muxer.write_tags(&tags).expect("write_tags");
+
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // With 4 SeekHead entries (Tracks, Cues, Chapters, Tags):
+        // Each entry is 18 bytes. Chapters is the 3rd entry (index 2).
+        // SeekHead header = 5 bytes (4-byte ID + 1-byte size VINT).
+        // Entry offset = 5 + entry_index * 18.
+        // SeekPosition value bytes within an entry: at offset 13 (3 + 7 + 3).
+        // Chapters SeekPosition absolute offset = segment_start + 5 + 2*18 + 13
+        //                                      = segment_start + 54.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "test uses a Cursor<Vec<u8>> — position is always small"
+        )]
+        let chapters_seek_offset = segment_start as usize + 54;
+        let chapters_seek_bytes = &data[chapters_seek_offset..chapters_seek_offset + 5];
+        assert_ne!(
+            chapters_seek_bytes, [0x00; 5],
+            "SeekPosition for Chapters should be backpatched (non-zero)"
+        );
+
+        // Tags is the 4th entry (index 3).
+        // Tags SeekPosition absolute offset = segment_start + 5 + 3*18 + 13
+        //                                   = segment_start + 72.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "test uses a Cursor<Vec<u8>> — position is always small"
+        )]
+        let tags_seek_offset = segment_start as usize + 72;
+        let tags_seek_bytes = &data[tags_seek_offset..tags_seek_offset + 5];
+        assert_ne!(
+            tags_seek_bytes, [0x00; 5],
+            "SeekPosition for Tags should be backpatched (non-zero)"
+        );
+    }
+
+    #[test]
+    fn chapters_and_tags_integration() {
+        let info = SegmentInfo {
+            duration_ns: Some(120_000_000_000),
+            title: Some("Integration Test".to_string()),
+            segment_uid: None,
+        };
+        let mut muxer =
+            MkvMuxer::new(Cursor::new(Vec::new()), &info, true, true).expect("create muxer");
+
+        let tracks = [TrackSpec::Video(VideoTrack {
+            codec_id: "V_MPEG2",
+            codec_private: None,
+            pixel_width: 720,
+            pixel_height: 480,
+            display_width: None,
+            display_height: None,
+            default_duration_ns: None,
+            interlaced: None,
+            name: None,
+            colour: None,
+        })];
+        muxer.add_tracks(&tracks).expect("add_tracks");
+
+        let chapters = [
+            Chapter {
+                start_ns: 0,
+                end_ns: None,
+                title: "Opening".to_string(),
+                language: "eng".to_string(),
+            },
+            Chapter {
+                start_ns: 30_000_000_000,
+                end_ns: None,
+                title: "Main Feature".to_string(),
+                language: "eng".to_string(),
+            },
+        ];
+        muxer.write_chapters(&chapters).expect("write_chapters");
+
+        let tags = [ContentTag {
+            name: "TITLE".to_string(),
+            value: "Behind the Scenes - Themyscira".to_string(),
+        }];
+        muxer.write_tags(&tags).expect("write_tags");
+
+        let pos = muxer.position();
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        assert_eq!(
+            pos,
+            data.len() as u64,
+            "tracked position equals actual output length"
+        );
+
+        // EBML header.
+        assert_eq!(
+            &data[..4],
+            [0x1A, 0x45, 0xDF, 0xA3],
+            "file starts with EBML ID"
+        );
+
+        // All major elements present.
+        assert!(
+            contains_bytes(&data, &TRACKS.to_be_bytes()),
+            "output should contain Tracks element"
+        );
+        assert!(
+            contains_bytes(&data, &CHAPTERS.to_be_bytes()),
+            "output should contain Chapters element"
+        );
+        assert!(
+            contains_bytes(&data, &TAGS.to_be_bytes()),
+            "output should contain Tags element"
+        );
+
+        // Content from each section.
+        assert!(
+            contains_bytes(&data, b"V_MPEG2"),
+            "should contain video codec"
+        );
+        assert!(
+            contains_bytes(&data, b"Opening"),
+            "should contain first chapter title"
+        );
+        assert!(
+            contains_bytes(&data, b"Main Feature"),
+            "should contain second chapter title"
+        );
+        assert!(
+            contains_bytes(&data, b"Behind the Scenes - Themyscira"),
+            "should contain content title tag"
+        );
     }
 
     // -------------------------------------------------------------------

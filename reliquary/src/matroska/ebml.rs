@@ -317,7 +317,7 @@ const fn vint_max(width: u8) -> u64 {
 /// Determines the byte width of an element ID from its value.
 fn element_id_width(id: u32) -> io::Result<usize> {
     match id {
-        0x81..=0xFE => Ok(1),
+        0x80..=0xFE => Ok(1),
         0x4000..=0x7FFF => Ok(2),
         0x20_0000..=0x3F_FFFF => Ok(3),
         0x1000_0000..=0x1FFF_FFFF => Ok(4),
