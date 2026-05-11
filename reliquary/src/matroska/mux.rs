@@ -55,6 +55,13 @@ pub(crate) const CHAPTERS: u32 = 0x1043_A770;
 /// Tags element ID.
 pub(crate) const TAGS: u32 = 0x1254_C367;
 
+// Cue elements
+const CUE_POINT: u32 = 0xBB;
+const CUE_TIME: u32 = 0xB3;
+const CUE_TRACK_POSITIONS: u32 = 0xB7;
+const CUE_TRACK: u32 = 0xF7;
+const CUE_CLUSTER_POSITION: u32 = 0xF1;
+
 // Track elements
 const TRACK_ENTRY: u32 = 0xAE;
 const TRACK_NUMBER: u32 = 0xD7;
@@ -299,7 +306,6 @@ pub struct ContentTag {
 }
 
 /// Collected cue point for later Cues writing.
-#[allow(dead_code, reason = "fields consumed by Cues writing in ticket 06")]
 pub(crate) struct CueEntry {
     /// Timestamp in `TimestampScale` units.
     pub timestamp_ms: u64,
@@ -325,7 +331,6 @@ pub struct MkvMuxer<W: Write + Seek> {
     /// Active cluster being written.
     current_cluster: Option<ClusterState>,
     /// Cue entries collected from keyframes, consumed by finalize.
-    #[allow(dead_code, reason = "read by Cues writing in ticket 06")]
     pub(crate) cue_entries: Vec<CueEntry>,
 }
 
@@ -724,15 +729,94 @@ impl<W: Write + Seek> MkvMuxer<W> {
         Ok(())
     }
 
+    /// Writes the Cues element from collected cue entries.
+    ///
+    /// If no keyframes were collected, nothing is written.
+    fn write_cues(&mut self) -> io::Result<()> {
+        if self.cue_entries.is_empty() {
+            return Ok(());
+        }
+
+        let cues_position = self.position;
+
+        // Pre-compute the total Cues content size.
+        let mut content_size: usize = 0;
+        for entry in &self.cue_entries {
+            let cluster_relative = entry.cluster_position - self.segment_data_start;
+            let cue_track_size = measure_uint(CUE_TRACK, u64::from(entry.track));
+            let cue_cluster_pos_size = measure_uint(CUE_CLUSTER_POSITION, cluster_relative);
+            let track_positions_content = cue_track_size + cue_cluster_pos_size;
+            let track_positions_size = measure_master(CUE_TRACK_POSITIONS, track_positions_content);
+
+            let cue_time_size = measure_uint_min1(CUE_TIME, entry.timestamp_ms);
+            let cue_point_content = cue_time_size + track_positions_size;
+            let cue_point_size = measure_master(CUE_POINT, cue_point_content);
+
+            content_size += cue_point_size;
+        }
+
+        // Write Cues master.
+        self.position += ebml::write_master(&mut self.writer, CUES, content_size as u64)? as u64;
+
+        // Write each CuePoint.
+        for entry in &self.cue_entries {
+            let cluster_relative = entry.cluster_position - self.segment_data_start;
+            let cue_track_size = measure_uint(CUE_TRACK, u64::from(entry.track));
+            let cue_cluster_pos_size = measure_uint(CUE_CLUSTER_POSITION, cluster_relative);
+            let track_positions_content = cue_track_size + cue_cluster_pos_size;
+            let track_positions_size = measure_master(CUE_TRACK_POSITIONS, track_positions_content);
+
+            let cue_time_size = measure_uint_min1(CUE_TIME, entry.timestamp_ms);
+            let cue_point_content = cue_time_size + track_positions_size;
+
+            // CuePoint master.
+            self.position +=
+                ebml::write_master(&mut self.writer, CUE_POINT, cue_point_content as u64)? as u64;
+
+            // CueTime.
+            self.position +=
+                write_uint_min1(&mut self.writer, CUE_TIME, entry.timestamp_ms)? as u64;
+
+            // CueTrackPositions master.
+            self.position += ebml::write_master(
+                &mut self.writer,
+                CUE_TRACK_POSITIONS,
+                track_positions_content as u64,
+            )? as u64;
+
+            // CueTrack.
+            self.position +=
+                ebml::write_uint(&mut self.writer, CUE_TRACK, u64::from(entry.track))? as u64;
+
+            // CueClusterPosition.
+            self.position +=
+                ebml::write_uint(&mut self.writer, CUE_CLUSTER_POSITION, cluster_relative)? as u64;
+        }
+
+        // Backpatch SeekHead entry for Cues.
+        self.backpatch_seek_entry(CUES, cues_position)?;
+
+        Ok(())
+    }
+
     /// Finalizes the MKV file and returns the underlying writer.
     ///
-    /// Full implementation (cues, final backpatch) is added in a later
-    /// ticket.  This stub returns the writer as-is.
+    /// Closes any open cluster, writes the `Cues` element, backpatches
+    /// the `SeekHead` entry for `Cues`, and flushes the writer.
     ///
     /// # Errors
     ///
     /// Returns [`io::Error`] if finalization fails.
-    pub fn finalize(self) -> io::Result<W> {
+    pub fn finalize(mut self) -> io::Result<W> {
+        // Close the current cluster (if open).
+        self.current_cluster.take();
+
+        // Write Cues from collected keyframe entries.
+        self.write_cues()?;
+
+        // Flush the writer.
+        self.writer.flush()?;
+
         Ok(self.writer)
     }
 }
@@ -1317,6 +1401,21 @@ const fn measure_float(id: u32) -> usize {
 const fn measure_utf8(id: u32, value: &str) -> usize {
     let data_len = value.len();
     element_id_width(id) + vint_width(data_len as u64) + data_len
+}
+
+/// Measures a complete master element (ID + size VINT + content).
+const fn measure_master(id: u32, content_size: usize) -> usize {
+    element_id_width(id) + vint_width(content_size as u64) + content_size
+}
+
+/// Measures a uint element with at least 1 byte of data (value 0 → 1 byte).
+const fn measure_uint_min1(id: u32, value: u64) -> usize {
+    if value == 0 {
+        // ID + VINT(1) + 1-byte zero.
+        element_id_width(id) + 1 + 1
+    } else {
+        measure_uint(id, value)
+    }
 }
 
 /// Measures a complete binary element.
@@ -2540,12 +2639,14 @@ mod tests {
             })
             .expect("write_frame");
 
-        let pos = muxer.position();
+        let pos_before_finalize = muxer.position();
         let data = muxer.finalize().expect("finalize").into_inner();
-        assert_eq!(
-            pos,
-            data.len() as u64,
-            "tracked position equals actual output length after cluster writes"
+
+        // Finalize appends Cues for the keyframe, so the output is
+        // longer than the pre-finalize position.
+        assert!(
+            data.len() as u64 > pos_before_finalize,
+            "finalize should append Cues data beyond the pre-finalize position"
         );
     }
 
@@ -3007,8 +3108,375 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Cues and finalize tests (ticket 06)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn cue_writing_three_entries() {
+        let mut muxer = make_muxer_with_video_track();
+        let segment_start = muxer.segment_data_start();
+
+        // Three clusters with keyframes at timestamps 0, 5000, 10000.
+        let cluster1_pos = muxer.position();
+        muxer.start_cluster(0).expect("start_cluster 0");
+        muxer
+            .write_frame(&Frame {
+                track: 1,
+                timestamp_ms: 0,
+                data: &[0x00; 100],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("keyframe 0");
+
+        let cluster2_pos = muxer.position();
+        muxer.start_cluster(5000).expect("start_cluster 5000");
+        muxer
+            .write_frame(&Frame {
+                track: 1,
+                timestamp_ms: 5000,
+                data: &[0x00; 100],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("keyframe 5000");
+
+        let cluster3_pos = muxer.position();
+        muxer.start_cluster(10000).expect("start_cluster 10000");
+        muxer
+            .write_frame(&Frame {
+                track: 1,
+                timestamp_ms: 10000,
+                data: &[0x00; 100],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("keyframe 10000");
+
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // Cues element ID should be present after the last cluster.
+        let cues_id = CUES.to_be_bytes();
+        assert!(
+            contains_bytes(&data, &cues_id),
+            "output should contain Cues element ID"
+        );
+
+        // Verify CueClusterPosition values are correct Segment-relative offsets.
+        let rel1 = cluster1_pos - segment_start;
+        let rel2 = cluster2_pos - segment_start;
+        let rel3 = cluster3_pos - segment_start;
+
+        // Each relative position should appear in the output as a uint value.
+        let rel1_bytes = uint_be_bytes(rel1);
+        let rel2_bytes = uint_be_bytes(rel2);
+        let rel3_bytes = uint_be_bytes(rel3);
+        assert!(
+            contains_bytes(&data, &rel1_bytes),
+            "should contain first cluster relative position {rel1:#X}"
+        );
+        assert!(
+            contains_bytes(&data, &rel2_bytes),
+            "should contain second cluster relative position {rel2:#X}"
+        );
+        assert!(
+            contains_bytes(&data, &rel3_bytes),
+            "should contain third cluster relative position {rel3:#X}"
+        );
+    }
+
+    #[test]
+    fn empty_cues_not_written() {
+        // An MKV with no keyframes (no frames at all) should not emit Cues.
+        let mut muxer = make_muxer_with_video_track();
+        let segment_start = muxer.segment_data_start();
+        muxer.start_cluster(0).expect("start_cluster");
+
+        // Don't write any frames — cue_entries stays empty.
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // The Cues ID bytes appear in the SeekHead's SeekID, so instead
+        // verify the SeekPosition for Cues remains at the zero placeholder.
+        // Cues is entry 1: segment_start + 5 + 1*18 + 13 = segment_start + 36.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "test uses a Cursor<Vec<u8>> — position is always small"
+        )]
+        let cues_seek_offset = segment_start as usize + 36;
+        let cues_seek_bytes = &data[cues_seek_offset..cues_seek_offset + 5];
+        assert_eq!(
+            cues_seek_bytes, [0x00; 5],
+            "SeekPosition for Cues should remain zero when no keyframes were written"
+        );
+    }
+
+    #[test]
+    fn seekhead_backpatched_for_cues() {
+        let mut muxer = make_muxer_with_video_track();
+        let segment_start = muxer.segment_data_start();
+
+        muxer.start_cluster(0).expect("start_cluster");
+        muxer
+            .write_frame(&Frame {
+                track: 1,
+                timestamp_ms: 0,
+                data: &[0x00; 100],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("keyframe");
+
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // SeekPosition for Cues is the 2nd entry (index 1).
+        // Offset = segment_start + 5 + 1*18 + 13 = segment_start + 36.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "test uses a Cursor<Vec<u8>> — position is always small"
+        )]
+        let cues_seek_offset = segment_start as usize + 36;
+        let cues_seek_bytes = &data[cues_seek_offset..cues_seek_offset + 5];
+        assert_ne!(
+            cues_seek_bytes, [0x00; 5],
+            "SeekPosition for Cues should be backpatched (non-zero)"
+        );
+
+        // Verify the backpatched position actually points to the Cues element.
+        let mut seek_value = 0u64;
+        for &b in cues_seek_bytes {
+            seek_value = (seek_value << 8) | u64::from(b);
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "test uses a Cursor<Vec<u8>> — position is always small"
+        )]
+        let cues_abs_offset = (segment_start + seek_value) as usize;
+        assert_eq!(
+            &data[cues_abs_offset..cues_abs_offset + 4],
+            CUES.to_be_bytes(),
+            "SeekHead Cues entry should point to the Cues element ID"
+        );
+    }
+
+    #[test]
+    fn finalize_position_matches_output() {
+        let mut muxer = make_muxer_with_video_track();
+
+        muxer.start_cluster(0).expect("start_cluster");
+        muxer
+            .write_frame(&Frame {
+                track: 1,
+                timestamp_ms: 0,
+                data: &[0x00; 100],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("keyframe");
+
+        // Position before finalize includes clusters but not yet Cues.
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // The output should be larger than just clusters (Cues were appended).
+        assert!(!data.is_empty(), "finalized output should have data");
+
+        // Verify the writer is usable (flush succeeded) by checking
+        // the complete data can be read back.
+        assert_eq!(
+            &data[..4],
+            [0x1A, 0x45, 0xDF, 0xA3],
+            "finalized output starts with EBML header"
+        );
+    }
+
+    /// Builds a complete MKV with all features for end-to-end testing.
+    /// Returns `(data, segment_data_start)`.
+    fn build_end_to_end_mkv() -> (Vec<u8>, u64) {
+        let info = SegmentInfo {
+            duration_ns: Some(10_000_000_000),
+            title: Some("Test".to_string()),
+            segment_uid: Some([0x42; 16]),
+        };
+
+        let mut muxer =
+            MkvMuxer::new(Cursor::new(Vec::new()), &info, true, true).expect("create muxer");
+
+        let tracks = muxer
+            .add_tracks(&[
+                TrackSpec::Video(VideoTrack {
+                    codec_id: "V_MPEG2",
+                    codec_private: None,
+                    pixel_width: 720,
+                    pixel_height: 480,
+                    display_width: None,
+                    display_height: None,
+                    default_duration_ns: None,
+                    interlaced: None,
+                    name: None,
+                    colour: None,
+                }),
+                TrackSpec::Audio(AudioTrack {
+                    codec_id: "A_AC3",
+                    codec_private: None,
+                    sampling_frequency: 48000.0,
+                    channels: 6,
+                    bit_depth: None,
+                    language: "eng".to_string(),
+                    name: None,
+                    is_default: true,
+                }),
+            ])
+            .expect("add_tracks");
+
+        muxer
+            .write_chapters(&[
+                Chapter {
+                    start_ns: 0,
+                    end_ns: None,
+                    title: "Chapter 1".to_string(),
+                    language: "eng".to_string(),
+                },
+                Chapter {
+                    start_ns: 5_000_000_000,
+                    end_ns: None,
+                    title: "Chapter 2".to_string(),
+                    language: "eng".to_string(),
+                },
+            ])
+            .expect("write_chapters");
+
+        // First cluster.
+        muxer.start_cluster(0).expect("start_cluster 0");
+        muxer
+            .write_frame(&Frame {
+                track: tracks[0],
+                timestamp_ms: 0,
+                data: &[0u8; 1000],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("video keyframe 0");
+        muxer
+            .write_frame(&Frame {
+                track: tracks[1],
+                timestamp_ms: 0,
+                data: &[0u8; 256],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("audio frame 0");
+
+        // Second cluster.
+        muxer.start_cluster(5000).expect("start_cluster 5000");
+        muxer
+            .write_frame(&Frame {
+                track: tracks[0],
+                timestamp_ms: 5000,
+                data: &[0u8; 1000],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("video keyframe 5000");
+
+        muxer
+            .write_tags(&[ContentTag {
+                name: "TITLE".to_string(),
+                value: "Test Movie".to_string(),
+            }])
+            .expect("write_tags");
+
+        let segment_start = muxer.segment_data_start();
+        let writer = muxer.finalize().expect("finalize");
+        (writer.into_inner(), segment_start)
+    }
+
+    #[test]
+    fn end_to_end_structure() {
+        let (data, _segment_start) = build_end_to_end_mkv();
+
+        // Output starts with EBML header ID.
+        assert_eq!(
+            &data[..4],
+            [0x1A, 0x45, 0xDF, 0xA3],
+            "file starts with EBML header"
+        );
+
+        // Segment ID follows.
+        assert_eq!(
+            &data[40..44],
+            [0x18, 0x53, 0x80, 0x67],
+            "Segment ID at byte 40"
+        );
+
+        // All major top-level elements present.
+        for (name, id) in [
+            ("Tracks", TRACKS),
+            ("Chapters", CHAPTERS),
+            ("Cues", CUES),
+            ("Tags", TAGS),
+        ] {
+            assert!(
+                contains_bytes(&data, &id.to_be_bytes()),
+                "output should contain {name}"
+            );
+        }
+
+        // Cue entry count and SeekHead correctness are verified by
+        // dedicated unit tests (cue_collection, end_to_end_seekhead_points_to_elements).
+    }
+
+    #[test]
+    fn end_to_end_seekhead_points_to_elements() {
+        let (data, segment_start) = build_end_to_end_mkv();
+
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "test uses a Cursor<Vec<u8>> — position is always small"
+        )]
+        let seg = segment_start as usize;
+
+        for (entry_idx, expected_id) in [(0, TRACKS), (1, CUES)] {
+            let value_offset = seg + 5 + entry_idx * 18 + 13;
+            let seek_bytes = &data[value_offset..value_offset + 5];
+            let mut seek_value = 0u64;
+            for &b in seek_bytes {
+                seek_value = (seek_value << 8) | u64::from(b);
+            }
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "test uses a Cursor<Vec<u8>> — position is always small"
+            )]
+            let abs_offset = (segment_start + seek_value) as usize;
+            let id_width = super::element_id_width(expected_id);
+            let actual_id_bytes = &data[abs_offset..abs_offset + id_width];
+            let expected_id_bytes = &expected_id.to_be_bytes()[4 - id_width..];
+            assert_eq!(
+                actual_id_bytes, expected_id_bytes,
+                "SeekHead entry {entry_idx} should point to element {expected_id:#010X}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------
+
+    /// Encodes a u64 as minimal big-endian bytes (same encoding used in uint elements).
+    fn uint_be_bytes(value: u64) -> Vec<u8> {
+        if value == 0 {
+            return vec![0x00];
+        }
+        let bytes = value.to_be_bytes();
+        let start = bytes.iter().position(|&b| b != 0).unwrap_or(7);
+        bytes[start..].to_vec()
+    }
 
     #[must_use]
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {

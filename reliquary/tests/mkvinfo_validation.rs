@@ -158,6 +158,7 @@ fn mkvinfo_validates_structure() {
 
     let tmp = write_temp_mkv();
     let output = Command::new("mkvinfo")
+        .arg("-v")
         .arg(tmp.path())
         .output()
         .expect("run mkvinfo");
@@ -219,6 +220,12 @@ fn mkvinfo_validates_structure() {
         stdout.contains("Cluster"),
         "should contain cluster data:\n{stdout}"
     );
+
+    // Cues (ticket 06). Requires -v for mkvinfo to show the Cues heading.
+    assert!(
+        stdout.contains("Cues"),
+        "should contain cues section:\n{stdout}"
+    );
 }
 
 #[test]
@@ -263,6 +270,12 @@ fn ffprobe_validates_structure() {
     assert!(
         stdout.contains("Behind the Scenes - Themyscira"),
         "should contain title tag:\n{stdout}"
+    );
+
+    // start_time reported implies seek index is usable (ticket 06).
+    assert!(
+        stdout.contains("start_time="),
+        "should report start_time (implies cues are usable):\n{stdout}"
     );
 
     // Streams — should have 2 (video + audio).
@@ -444,6 +457,7 @@ fn mkvinfo_validates_full_features() {
 
     let tmp = write_full_feature_mkv();
     let output = Command::new("mkvinfo")
+        .arg("-v")
         .arg(tmp.path())
         .output()
         .expect("run mkvinfo");
@@ -522,6 +536,12 @@ fn mkvinfo_validates_full_features() {
     assert!(
         stdout.contains("Cluster"),
         "should contain cluster data:\n{stdout}"
+    );
+
+    // Cues (ticket 06).
+    assert!(
+        stdout.contains("Cues"),
+        "should contain cues section:\n{stdout}"
     );
 
     // Chapters (ticket 05).
