@@ -89,6 +89,15 @@ const SAMPLING_FREQ: u32 = 0xB5;
 const CHANNELS: u32 = 0x9F;
 const BIT_DEPTH: u32 = 0x6264;
 
+// Cluster/Block elements
+const CLUSTER: u32 = 0x1F43_B675;
+const TIMESTAMP: u32 = 0xE7;
+const SIMPLE_BLOCK: u32 = 0xA3;
+const BLOCK_GROUP: u32 = 0xA0;
+const BLOCK: u32 = 0xA1;
+const BLOCK_DURATION: u32 = 0x9B;
+const PREV_SIZE: u32 = 0xAB;
+
 // ---------------------------------------------------------------------------
 // Layout constants
 // ---------------------------------------------------------------------------
@@ -221,6 +230,37 @@ pub struct SubtitleTrack {
     pub is_forced: bool,
 }
 
+/// A frame to write into the current cluster.
+pub struct Frame<'a> {
+    /// Track number (1-based, from [`MkvMuxer::add_tracks`] return value).
+    pub track: u32,
+    /// Absolute timestamp in `TimestampScale` units (milliseconds
+    /// with the default scale of 1,000,000 ns).
+    pub timestamp_ms: u64,
+    /// Frame data (raw codec data — length-prefixed NAL units for
+    /// H.264/HEVC, syncframes for AC-3, etc.).
+    pub data: &'a [u8],
+    /// Whether this frame is a keyframe (random access point).
+    pub keyframe: bool,
+    /// Whether this frame is discardable (B-frames).
+    pub discardable: bool,
+    /// Duration in `TimestampScale` units.  Required for subtitle
+    /// display segments.  `None` for video/audio (duration is implied
+    /// by the next frame's timestamp or `DefaultDuration`).
+    pub duration_ms: Option<u64>,
+}
+
+/// Collected cue point for later Cues writing.
+#[allow(dead_code, reason = "fields consumed by Cues writing in ticket 06")]
+pub(crate) struct CueEntry {
+    /// Timestamp in `TimestampScale` units.
+    pub timestamp_ms: u64,
+    /// Track number.
+    pub track: u32,
+    /// Absolute byte position of the cluster in the file.
+    pub cluster_position: u64,
+}
+
 /// Matroska muxer.  Writes a complete MKV file to the output.
 pub struct MkvMuxer<W: Write + Seek> {
     writer: W,
@@ -234,6 +274,11 @@ pub struct MkvMuxer<W: Write + Seek> {
     position: u64,
     /// Number of tracks added so far (used for `TrackNumber` assignment).
     track_count: u32,
+    /// Active cluster being written.
+    current_cluster: Option<ClusterState>,
+    /// Cue entries collected from keyframes, consumed by finalize.
+    #[allow(dead_code, reason = "read by Cues writing in ticket 06")]
+    pub(crate) cue_entries: Vec<CueEntry>,
 }
 
 /// Recorded location of a `SeekPosition` placeholder in the `SeekHead`.
@@ -244,6 +289,14 @@ struct SeekPlaceholder {
     file_offset: u64,
     /// Number of bytes reserved for the `SeekPosition` value.
     reserved_bytes: u8,
+}
+
+/// Active cluster state tracked by the muxer.
+struct ClusterState {
+    /// Absolute byte position of this cluster's element ID in the file.
+    start_position: u64,
+    /// Base timestamp of this cluster (ms).
+    base_timestamp_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +347,8 @@ impl<W: Write + Seek> MkvMuxer<W> {
             seek_placeholders,
             position,
             track_count: 0,
+            current_cluster: None,
+            cue_entries: Vec::new(),
         })
     }
 
@@ -389,6 +444,168 @@ impl<W: Write + Seek> MkvMuxer<W> {
 
         // Seek back to the current write position.
         self.writer.seek(SeekFrom::Start(self.position))?;
+
+        Ok(())
+    }
+
+    /// Starts a new cluster at the given timestamp.
+    ///
+    /// If a cluster is already open, it is implicitly closed and its
+    /// size is recorded for the `PrevSize` element in the new cluster.
+    ///
+    /// The caller is responsible for cluster boundary policy — typically
+    /// starting a new cluster at each video keyframe:
+    ///
+    /// ```ignore
+    /// for frame in demuxed_frames {
+    ///     if frame.keyframe && frame.track == video_track {
+    ///         muxer.start_cluster(frame.timestamp_ms)?;
+    ///     }
+    ///     muxer.write_frame(&frame)?;
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] if writing fails.
+    pub fn start_cluster(&mut self, timestamp_ms: u64) -> io::Result<()> {
+        // Close the previous cluster and record its size for PrevSize.
+        let prev_size = self
+            .current_cluster
+            .take()
+            .map(|c| self.position - c.start_position);
+
+        let start_position = self.position;
+
+        // Cluster master with unknown size.
+        self.position += ebml::write_master_unknown_size(&mut self.writer, CLUSTER)? as u64;
+
+        // Timestamp child element.
+        self.position += ebml::write_uint(&mut self.writer, TIMESTAMP, timestamp_ms)? as u64;
+
+        // PrevSize element (omitted for the first cluster).
+        if let Some(size) = prev_size {
+            self.position += ebml::write_uint(&mut self.writer, PREV_SIZE, size)? as u64;
+        }
+
+        self.current_cluster = Some(ClusterState {
+            start_position,
+            base_timestamp_ms: timestamp_ms,
+        });
+
+        Ok(())
+    }
+
+    /// Writes a frame into the current cluster.
+    ///
+    /// Frames without `duration_ms` are written as `SimpleBlock` elements
+    /// (video and audio).  Frames with `duration_ms` are written as
+    /// `BlockGroup` elements with `BlockDuration` (subtitles).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::Error`] if no cluster is open, if the relative
+    /// timestamp exceeds i16 range, or if writing fails.
+    pub fn write_frame(&mut self, frame: &Frame<'_>) -> io::Result<()> {
+        if frame.duration_ms.is_some() {
+            return self.write_block_group(frame);
+        }
+
+        let cluster = self
+            .current_cluster
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no cluster is open"))?;
+        let base_timestamp_ms = cluster.base_timestamp_ms;
+        let cluster_position = cluster.start_position;
+
+        let relative = relative_timestamp(frame.timestamp_ms, base_timestamp_ms)?;
+
+        // SimpleBlock header: track VINT + timestamp i16 + flags u8.
+        let track_vint_len = vint_width(u64::from(frame.track));
+        let header_len = track_vint_len + 3;
+        let data_size = (header_len + frame.data.len()) as u64;
+
+        self.position += ebml::write_element_id(&mut self.writer, SIMPLE_BLOCK)? as u64;
+        self.position += ebml::write_vint(&mut self.writer, data_size, 1)? as u64;
+        self.position += ebml::write_vint(&mut self.writer, u64::from(frame.track), 1)? as u64;
+
+        self.writer.write_all(&relative.to_be_bytes())?;
+        self.position += 2;
+
+        let flags = simple_block_flags(frame.keyframe, frame.discardable);
+        self.writer.write_all(&[flags])?;
+        self.position += 1;
+
+        self.writer.write_all(frame.data)?;
+        self.position += frame.data.len() as u64;
+
+        if frame.keyframe {
+            self.cue_entries.push(CueEntry {
+                timestamp_ms: frame.timestamp_ms,
+                track: frame.track,
+                cluster_position,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Writes a frame as a `BlockGroup` with `BlockDuration`.
+    fn write_block_group(&mut self, frame: &Frame<'_>) -> io::Result<()> {
+        let cluster = self
+            .current_cluster
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no cluster is open"))?;
+        let base_timestamp_ms = cluster.base_timestamp_ms;
+        let cluster_position = cluster.start_position;
+
+        let relative = relative_timestamp(frame.timestamp_ms, base_timestamp_ms)?;
+        let duration_ms = frame.duration_ms.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BlockGroup requires duration_ms",
+            )
+        })?;
+
+        // Block header: track VINT + timestamp i16 + flags u8.
+        let track_vint_len = vint_width(u64::from(frame.track));
+        let block_data_len = track_vint_len + 3 + frame.data.len();
+
+        // Pre-compute sizes for BlockGroup master.
+        let block_element_size =
+            element_id_width(BLOCK) + vint_width(block_data_len as u64) + block_data_len;
+        let block_duration_size = measure_uint(BLOCK_DURATION, duration_ms);
+        let content_size = block_element_size + block_duration_size;
+
+        // BlockGroup master.
+        self.position +=
+            ebml::write_master(&mut self.writer, BLOCK_GROUP, content_size as u64)? as u64;
+
+        // Block element.
+        self.position += ebml::write_element_id(&mut self.writer, BLOCK)? as u64;
+        self.position += ebml::write_vint(&mut self.writer, block_data_len as u64, 1)? as u64;
+        self.position += ebml::write_vint(&mut self.writer, u64::from(frame.track), 1)? as u64;
+
+        self.writer.write_all(&relative.to_be_bytes())?;
+        self.position += 2;
+
+        // Block flags: bits 7 (keyframe) and 0 (discardable) are unused — always 0.
+        self.writer.write_all(&[0x00])?;
+        self.position += 1;
+
+        self.writer.write_all(frame.data)?;
+        self.position += frame.data.len() as u64;
+
+        // BlockDuration.
+        self.position += ebml::write_uint(&mut self.writer, BLOCK_DURATION, duration_ms)? as u64;
+
+        if frame.keyframe {
+            self.cue_entries.push(CueEntry {
+                timestamp_ms: frame.timestamp_ms,
+                track: frame.track,
+                cluster_position,
+            });
+        }
 
         Ok(())
     }
@@ -729,6 +946,39 @@ fn write_audio_sub(w: &mut impl Write, a: &AudioTrack) -> io::Result<usize> {
     Ok(written)
 }
 
+/// Computes the relative timestamp for a block within a cluster.
+///
+/// Returns an i16 suitable for the `SimpleBlock` / `Block` timestamp field.
+fn relative_timestamp(timestamp_ms: u64, base_timestamp_ms: u64) -> io::Result<i16> {
+    // Timestamps in milliseconds are far below i64::MAX (~292 million years).
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "timestamps in ms are far below i64::MAX — wrap is impossible"
+    )]
+    let relative = timestamp_ms as i64 - base_timestamp_ms as i64;
+    i16::try_from(relative).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "relative timestamp {relative} ms out of i16 range \
+                 (timestamp {timestamp_ms}, cluster base {base_timestamp_ms})"
+            ),
+        )
+    })
+}
+
+/// Builds the `SimpleBlock` flags byte.
+const fn simple_block_flags(keyframe: bool, discardable: bool) -> u8 {
+    let mut flags = 0u8;
+    if keyframe {
+        flags |= 0x80;
+    }
+    if discardable {
+        flags |= 0x01;
+    }
+    flags
+}
+
 /// Generates a track UID from the track number using [`RandomState`].
 fn generate_track_uid(track_number: u32) -> u64 {
     let state = RandomState::new();
@@ -859,9 +1109,9 @@ mod tests {
     use std::io::{self, Cursor};
 
     use super::{
-        AudioTrack, CHAPTERS, CUES, MkvMuxer, SEEK_HEAD_REGION_SIZE, SEEK_POSITION_RESERVED,
-        SegmentInfo, SubtitleTrack, TAGS, TRACKS, TrackSpec, VideoColour, VideoTrack,
-        write_ebml_header, write_seek_head_region, write_segment_info,
+        AudioTrack, CHAPTERS, CLUSTER, CUES, Frame, MkvMuxer, SEEK_HEAD_REGION_SIZE,
+        SEEK_POSITION_RESERVED, SegmentInfo, SubtitleTrack, TAGS, TRACKS, TrackSpec, VideoColour,
+        VideoTrack, write_ebml_header, write_seek_head_region, write_segment_info,
     };
 
     // -------------------------------------------------------------------
@@ -1586,6 +1836,505 @@ mod tests {
             seek_pos_bytes, [0x00; 5],
             "SeekPosition for Tracks should be backpatched (non-zero)"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Cluster and block tests
+    // -------------------------------------------------------------------
+
+    fn make_muxer_with_video_track() -> MkvMuxer<Cursor<Vec<u8>>> {
+        let mut muxer = make_muxer();
+        let tracks = [TrackSpec::Video(VideoTrack {
+            codec_id: "V_MPEG2",
+            codec_private: None,
+            pixel_width: 720,
+            pixel_height: 480,
+            display_width: None,
+            display_height: None,
+            default_duration_ns: None,
+            interlaced: None,
+            name: None,
+            colour: None,
+        })];
+        muxer.add_tracks(&tracks).expect("add video track");
+        muxer
+    }
+
+    fn make_muxer_with_two_tracks() -> MkvMuxer<Cursor<Vec<u8>>> {
+        let mut muxer = make_muxer();
+        let tracks = [
+            TrackSpec::Video(VideoTrack {
+                codec_id: "V_MPEG2",
+                codec_private: None,
+                pixel_width: 720,
+                pixel_height: 480,
+                display_width: None,
+                display_height: None,
+                default_duration_ns: None,
+                interlaced: None,
+                name: None,
+                colour: None,
+            }),
+            TrackSpec::Audio(AudioTrack {
+                codec_id: "A_AC3",
+                codec_private: None,
+                sampling_frequency: 48000.0,
+                channels: 6,
+                bit_depth: None,
+                language: "eng".to_string(),
+                name: None,
+                is_default: true,
+            }),
+        ];
+        muxer.add_tracks(&tracks).expect("add two tracks");
+        muxer
+    }
+
+    /// Returns the current muxer position as `usize` for indexing test output.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "test uses a Cursor<Vec<u8>> — position is always small"
+    )]
+    fn pos(muxer: &MkvMuxer<Cursor<Vec<u8>>>) -> usize {
+        muxer.position() as usize
+    }
+
+    #[test]
+    fn simple_block_keyframe_encoding() {
+        let mut muxer = make_muxer_with_video_track();
+        muxer.start_cluster(0).expect("start_cluster");
+        let frame_offset = pos(&muxer);
+
+        let data = [0xAA; 100];
+        let frame = Frame {
+            track: 1,
+            timestamp_ms: 0,
+            data: &data,
+            keyframe: true,
+            discardable: false,
+            duration_ms: None,
+        };
+        muxer.write_frame(&frame).expect("write_frame");
+
+        let output = muxer.finalize().expect("finalize").into_inner();
+
+        // SimpleBlock ID.
+        assert_eq!(output[frame_offset], 0xA3, "SimpleBlock ID");
+
+        // Size = 1 (track VINT) + 2 (timestamp) + 1 (flags) + 100 (data) = 104.
+        // VINT(104) = 0x80 | 104 = 0xE8.
+        assert_eq!(
+            output[frame_offset + 1],
+            0xE8,
+            "SimpleBlock size VINT = 104"
+        );
+
+        // Track 1 VINT = 0x81.
+        assert_eq!(output[frame_offset + 2], 0x81, "track 1 VINT");
+
+        // Relative timestamp = 0.
+        assert_eq!(
+            &output[frame_offset + 3..frame_offset + 5],
+            [0x00, 0x00],
+            "relative timestamp = 0"
+        );
+
+        // Flags = 0x80 (keyframe).
+        assert_eq!(output[frame_offset + 5], 0x80, "flags = keyframe");
+
+        // Data follows.
+        assert_eq!(
+            &output[frame_offset + 6..frame_offset + 106],
+            &data,
+            "frame data"
+        );
+    }
+
+    #[test]
+    fn simple_block_relative_timestamp() {
+        let mut muxer = make_muxer_with_two_tracks();
+        muxer.start_cluster(400).expect("start_cluster");
+        let frame_offset = pos(&muxer);
+
+        let data = [0xBB; 10];
+        let frame = Frame {
+            track: 2,
+            timestamp_ms: 500,
+            data: &data,
+            keyframe: false,
+            discardable: false,
+            duration_ms: None,
+        };
+        muxer.write_frame(&frame).expect("write_frame");
+
+        let output = muxer.finalize().expect("finalize").into_inner();
+
+        // Track 2 VINT = 0x82.
+        assert_eq!(output[frame_offset + 2], 0x82, "track 2 VINT");
+
+        // Relative timestamp = 500 - 400 = 100 = 0x0064.
+        assert_eq!(
+            &output[frame_offset + 3..frame_offset + 5],
+            [0x00, 0x64],
+            "relative timestamp = 100"
+        );
+
+        // Flags = 0x00 (non-keyframe, non-discardable).
+        assert_eq!(output[frame_offset + 5], 0x00, "flags = P-frame");
+    }
+
+    #[test]
+    fn simple_block_discardable() {
+        let mut muxer = make_muxer_with_video_track();
+        muxer.start_cluster(0).expect("start_cluster");
+        let frame_offset = pos(&muxer);
+
+        let frame = Frame {
+            track: 1,
+            timestamp_ms: 40,
+            data: &[0xCC; 5],
+            keyframe: false,
+            discardable: true,
+            duration_ms: None,
+        };
+        muxer.write_frame(&frame).expect("write_frame");
+
+        let output = muxer.finalize().expect("finalize").into_inner();
+
+        // Flags = 0x01 (discardable B-frame).
+        assert_eq!(output[frame_offset + 5], 0x01, "flags = discardable");
+    }
+
+    #[test]
+    fn simple_block_negative_relative_timestamp() {
+        let mut muxer = make_muxer_with_video_track();
+        muxer.start_cluster(1000).expect("start_cluster");
+        let frame_offset = pos(&muxer);
+
+        let frame = Frame {
+            track: 1,
+            timestamp_ms: 980,
+            data: &[0xDD; 5],
+            keyframe: false,
+            discardable: true,
+            duration_ms: None,
+        };
+        muxer.write_frame(&frame).expect("write_frame");
+
+        let output = muxer.finalize().expect("finalize").into_inner();
+
+        // Relative = 980 - 1000 = -20.  i16 big-endian = 0xFFEC.
+        assert_eq!(
+            &output[frame_offset + 3..frame_offset + 5],
+            [0xFF, 0xEC],
+            "negative relative timestamp = -20"
+        );
+    }
+
+    #[test]
+    fn block_group_subtitle_with_duration() {
+        let mut muxer = make_muxer();
+        let tracks = [TrackSpec::Subtitle(SubtitleTrack {
+            codec_id: "S_HDMV/PGS",
+            codec_private: None,
+            language: "eng".to_string(),
+            name: None,
+            is_default: true,
+            is_forced: false,
+        })];
+        muxer.add_tracks(&tracks).expect("add subtitle track");
+
+        muxer.start_cluster(0).expect("start_cluster");
+        let frame_offset = pos(&muxer);
+
+        let data = [0xEE; 20];
+        let frame = Frame {
+            track: 1,
+            timestamp_ms: 0,
+            data: &data,
+            keyframe: true,
+            discardable: false,
+            duration_ms: Some(5000),
+        };
+        muxer.write_frame(&frame).expect("write_frame");
+
+        let output = muxer.finalize().expect("finalize").into_inner();
+
+        // BlockGroup ID = 0xA0.
+        assert_eq!(output[frame_offset], 0xA0, "BlockGroup ID");
+
+        // Inside the BlockGroup, find Block element (0xA1).
+        let bg_content_start = frame_offset + 1 + 1; // ID + 1-byte size VINT
+        assert_eq!(output[bg_content_start], 0xA1, "Block ID");
+
+        // Block flags byte should be 0x00 (bits 7 and 0 unused in Block).
+        // Block header is after Block ID + size VINT + track VINT + timestamp.
+        let block_header_offset = bg_content_start + 1 + 1 + 1 + 2; // ID + size + track + ts
+        assert_eq!(
+            output[block_header_offset], 0x00,
+            "Block flags = 0x00 (no keyframe/discardable bits)"
+        );
+
+        // BlockDuration = 5000: ID 0x9B, then the value.
+        // The BlockDuration element should follow the Block element.
+        let block_end = bg_content_start + 1 + 1 + 1 + 2 + 1 + data.len(); // full Block element
+        assert_eq!(output[block_end], 0x9B, "BlockDuration ID");
+
+        // Value 5000 = 0x1388, uint_byte_len = 2.
+        // Size VINT = 0x82, value = 0x13 0x88.
+        assert_eq!(output[block_end + 1], 0x82, "BlockDuration size = 2");
+        assert_eq!(
+            &output[block_end + 2..block_end + 4],
+            [0x13, 0x88],
+            "BlockDuration value = 5000"
+        );
+    }
+
+    #[test]
+    fn cluster_structure_with_prevsize() {
+        let mut muxer = make_muxer_with_video_track();
+
+        // First cluster at timestamp 0.
+        let cluster1_offset = pos(&muxer);
+        muxer.start_cluster(0).expect("start_cluster 0");
+
+        let frame1 = Frame {
+            track: 1,
+            timestamp_ms: 0,
+            data: &[0x11; 50],
+            keyframe: true,
+            discardable: false,
+            duration_ms: None,
+        };
+        muxer.write_frame(&frame1).expect("write frame 1");
+
+        let frame2 = Frame {
+            track: 1,
+            timestamp_ms: 40,
+            data: &[0x22; 50],
+            keyframe: false,
+            discardable: false,
+            duration_ms: None,
+        };
+        muxer.write_frame(&frame2).expect("write frame 2");
+
+        let frame3 = Frame {
+            track: 1,
+            timestamp_ms: 80,
+            data: &[0x33; 50],
+            keyframe: false,
+            discardable: false,
+            duration_ms: None,
+        };
+        muxer.write_frame(&frame3).expect("write frame 3");
+
+        // Second cluster at timestamp 1000.
+        let cluster2_offset = pos(&muxer);
+        muxer.start_cluster(1000).expect("start_cluster 1000");
+
+        let output = muxer.finalize().expect("finalize").into_inner();
+        let cluster_id_bytes = CLUSTER.to_be_bytes();
+
+        // First cluster starts at cluster1_offset.
+        assert_eq!(
+            &output[cluster1_offset..cluster1_offset + 4],
+            cluster_id_bytes,
+            "first Cluster ID"
+        );
+
+        // Second cluster starts at cluster2_offset.
+        assert_eq!(
+            &output[cluster2_offset..cluster2_offset + 4],
+            cluster_id_bytes,
+            "second Cluster ID"
+        );
+
+        // Second cluster has a Timestamp element, then PrevSize.
+        // Cluster ID (4) + unknown size (8) = 12 bytes for header.
+        let ts_offset = cluster2_offset + 12;
+        assert_eq!(output[ts_offset], 0xE7, "second cluster Timestamp ID");
+
+        // PrevSize should be present after Timestamp.
+        // Timestamp for value 1000 (0x03E8): ID(1) + size(1) + value(2) = 4 bytes.
+        let prevsize_offset = ts_offset + 4;
+        assert_eq!(output[prevsize_offset], 0xAB, "PrevSize ID");
+
+        // PrevSize value = cluster2_offset - cluster1_offset (size of first cluster).
+        let expected_size = (cluster2_offset - cluster1_offset) as u64;
+        let ps_size_vint = output[prevsize_offset + 1];
+        let ps_data_len = (ps_size_vint & 0x7F) as usize;
+        let ps_value_bytes = &output[prevsize_offset + 2..prevsize_offset + 2 + ps_data_len];
+        let mut ps_value = 0u64;
+        for &b in ps_value_bytes {
+            ps_value = (ps_value << 8) | u64::from(b);
+        }
+        assert_eq!(
+            ps_value, expected_size,
+            "PrevSize value matches first cluster size"
+        );
+    }
+
+    #[test]
+    fn cue_collection() {
+        let mut muxer = make_muxer_with_video_track();
+
+        let cluster1_pos = muxer.position();
+        muxer.start_cluster(0).expect("start_cluster 0");
+
+        // Keyframe at 0.
+        muxer
+            .write_frame(&Frame {
+                track: 1,
+                timestamp_ms: 0,
+                data: &[0x00; 10],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("keyframe 0");
+
+        // Non-keyframes.
+        for i in 1..=8 {
+            muxer
+                .write_frame(&Frame {
+                    track: 1,
+                    timestamp_ms: i * 40,
+                    data: &[0x00; 10],
+                    keyframe: false,
+                    discardable: false,
+                    duration_ms: None,
+                })
+                .expect("non-keyframe");
+        }
+
+        // Second keyframe at 5000 in a new cluster.
+        let cluster2_start = muxer.position();
+        muxer.start_cluster(5000).expect("start_cluster 5000");
+
+        muxer
+            .write_frame(&Frame {
+                track: 1,
+                timestamp_ms: 5000,
+                data: &[0x00; 10],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("keyframe 5000");
+
+        let cues = &muxer.cue_entries;
+        assert_eq!(cues.len(), 2, "should have 2 cue entries");
+        assert_eq!(cues[0].timestamp_ms, 0, "first cue timestamp");
+        assert_eq!(cues[0].track, 1, "first cue track");
+        assert_eq!(
+            cues[0].cluster_position, cluster1_pos,
+            "first cue cluster position"
+        );
+        assert_eq!(cues[1].timestamp_ms, 5000, "second cue timestamp");
+        assert_eq!(cues[1].track, 1, "second cue track");
+        assert_eq!(
+            cues[1].cluster_position, cluster2_start,
+            "second cue cluster position"
+        );
+    }
+
+    #[test]
+    fn write_frame_without_cluster_fails() {
+        let mut muxer = make_muxer_with_video_track();
+        let err = muxer
+            .write_frame(&Frame {
+                track: 1,
+                timestamp_ms: 0,
+                data: &[0x00],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect_err("should fail without cluster");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidInput,
+            "error kind for missing cluster"
+        );
+    }
+
+    #[test]
+    fn position_tracks_cluster_writes() {
+        let mut muxer = make_muxer_with_video_track();
+        muxer.start_cluster(0).expect("start_cluster");
+
+        muxer
+            .write_frame(&Frame {
+                track: 1,
+                timestamp_ms: 0,
+                data: &[0xAA; 100],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("write_frame");
+
+        let pos = muxer.position();
+        let data = muxer.finalize().expect("finalize").into_inner();
+        assert_eq!(
+            pos,
+            data.len() as u64,
+            "tracked position equals actual output length after cluster writes"
+        );
+    }
+
+    #[test]
+    fn playable_output_structure() {
+        let mut muxer = make_muxer_with_two_tracks();
+
+        // Write two clusters with synthetic data.
+        muxer.start_cluster(0).expect("start_cluster 0");
+        muxer
+            .write_frame(&Frame {
+                track: 1,
+                timestamp_ms: 0,
+                data: &[0x00; 1000],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("video keyframe");
+        muxer
+            .write_frame(&Frame {
+                track: 2,
+                timestamp_ms: 0,
+                data: &[0x00; 256],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("audio frame");
+
+        muxer.start_cluster(1000).expect("start_cluster 1000");
+        muxer
+            .write_frame(&Frame {
+                track: 1,
+                timestamp_ms: 1000,
+                data: &[0x00; 1000],
+                keyframe: true,
+                discardable: false,
+                duration_ms: None,
+            })
+            .expect("video keyframe 2");
+
+        let data = muxer.finalize().expect("finalize").into_inner();
+
+        // File starts with EBML header.
+        assert_eq!(
+            &data[..4],
+            [0x1A, 0x45, 0xDF, 0xA3],
+            "file starts with EBML ID"
+        );
+
+        // Contains two Cluster elements.
+        let cluster_id = CLUSTER.to_be_bytes();
+        let cluster_count = data.windows(4).filter(|w| *w == cluster_id).count();
+        assert_eq!(cluster_count, 2, "output contains 2 clusters");
     }
 
     // -------------------------------------------------------------------
