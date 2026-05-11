@@ -150,6 +150,7 @@ fn write_temp_mkv() -> tempfile::NamedTempFile {
 }
 
 #[test]
+#[ignore = "requires mkvinfo"]
 fn mkvinfo_validates_structure() {
     if !tool_available("mkvinfo") {
         return;
@@ -221,6 +222,7 @@ fn mkvinfo_validates_structure() {
 }
 
 #[test]
+#[ignore = "requires ffprobe"]
 fn ffprobe_validates_structure() {
     if !tool_available("ffprobe") {
         return;
@@ -434,6 +436,7 @@ fn write_full_feature_mkv() -> tempfile::NamedTempFile {
 }
 
 #[test]
+#[ignore = "requires mkvinfo"]
 fn mkvinfo_validates_full_features() {
     if !tool_available("mkvinfo") {
         return;
@@ -608,6 +611,7 @@ fn assert_ffprobe_streams(stdout: &str) {
 }
 
 #[test]
+#[ignore = "requires ffprobe"]
 fn ffprobe_validates_full_features() {
     if !tool_available("ffprobe") {
         return;

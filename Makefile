@@ -77,7 +77,7 @@ check: setup-tools
 	 done
 	@cargo machete
 	@cargo clippy --workspace --tests --quiet -- -D warnings
-	@cargo nextest run --workspace --no-fail-fast --no-tests=pass --status-level fail --final-status-level fail --cargo-quiet --show-progress only
+	@cargo nextest run --workspace --run-ignored all --no-fail-fast --no-tests=pass --status-level fail --final-status-level fail --cargo-quiet --show-progress only
 
 deny:
 	@cargo deny --log-level error check
