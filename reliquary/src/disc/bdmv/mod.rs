@@ -10,6 +10,7 @@ pub mod aacs;
 pub mod clpi;
 pub mod cursor;
 pub mod ig;
+pub mod index;
 pub mod keydb;
 pub mod mobj;
 pub mod mpls;
@@ -134,6 +135,12 @@ pub struct BdmvAnalysis {
     /// Warnings from clips that could not be read or parsed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub clip_warnings: Vec<ClipWarning>,
+    /// Playlist numbers registered as titles in `index.bdmv`.
+    ///
+    /// Used to filter the interactive prompt to content playlists only.
+    /// Empty if `index.bdmv` is missing or could not be parsed.
+    #[serde(skip_serializing_if = "HashSet::is_empty")]
+    pub title_playlists: HashSet<u32>,
 }
 
 /// Clip with IG streams — a menu clip for `identify`.
@@ -504,6 +511,9 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
     // typically the looping playlists that content filtering removes.
     let menu_playlists = find_menu_playlists(&all_playlists, &ig_clips);
 
+    // Resolve title table from index.bdmv + MovieObject.bdmv
+    let title_playlists = resolve_title_table(reader);
+
     Ok(BdmvAnalysis {
         playlists: analyzed,
         ig_clips,
@@ -512,6 +522,7 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
         partially_used_clips,
         warnings,
         clip_warnings,
+        title_playlists,
     })
 }
 
@@ -675,6 +686,48 @@ fn find_menu_playlists(playlists: &[Playlist], ig_clips: &[IgClip]) -> Vec<u32> 
     menu_playlists.sort_unstable();
     menu_playlists.dedup();
     menu_playlists
+}
+
+/// Resolves the title table from `index.bdmv` + `MovieObject.bdmv`.
+///
+/// Returns the set of playlist numbers registered as titles. Returns an
+/// empty set if either file is missing or cannot be parsed — this is
+/// non-fatal since older or non-standard discs may lack these files.
+fn resolve_title_table(reader: &DiscReader) -> HashSet<u32> {
+    // Try both paths for index.bdmv
+    let index_path = Path::new("BDMV").join("index.bdmv");
+    let index_alt = Path::new("index.bdmv");
+
+    let index_data = match reader.read_file(&index_path) {
+        Ok(data) => data,
+        Err(_) => match reader.read_file(index_alt) {
+            Ok(data) => data,
+            Err(_) => return HashSet::new(),
+        },
+    };
+
+    let Ok(disc_index) = index::parse(&index_data) else {
+        return HashSet::new();
+    };
+
+    // Try both paths for MovieObject.bdmv
+    let mobj_path = Path::new("BDMV").join("MovieObject.bdmv");
+    let mobj_alt = Path::new("MovieObject.bdmv");
+
+    let mobj_data = match reader.read_file(&mobj_path) {
+        Ok(data) => data,
+        Err(_) => match reader.read_file(mobj_alt) {
+            Ok(data) => data,
+            Err(_) => return HashSet::new(),
+        },
+    };
+
+    let Ok(mobj_file) = mobj::parse(&mobj_data) else {
+        return HashSet::new();
+    };
+
+    let dispatch_table = mobj::extract_dispatch_table(&mobj_file);
+    index::resolve_title_playlists(&disc_index, &mobj_file, dispatch_table.as_ref())
 }
 
 /// Finds clips not referenced by any MPLS playlist.
@@ -1360,6 +1413,7 @@ mod tests {
             partially_used_clips: Vec::new(),
             warnings: Vec::new(),
             clip_warnings: Vec::new(),
+            title_playlists: HashSet::new(),
         };
 
         let output = format!("{analysis}");
@@ -1412,6 +1466,7 @@ mod tests {
                 message: "failed to parse PLAYLIST/00099.mpls: bad magic".into(),
             }],
             clip_warnings: Vec::new(),
+            title_playlists: HashSet::new(),
         };
 
         let output = format!("{analysis}");

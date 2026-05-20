@@ -56,12 +56,6 @@ enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Minimum playlist duration in seconds to show in the interactive prompt
-        /// (default: 30). Buttons targeting shorter playlists are suppressed from
-        /// the prompt but still appear in `--json` output.
-        #[arg(long, default_value = "30")]
-        min_duration: u64,
-
         /// Skip bitmap rendering (text-only mode).
         #[arg(long)]
         no_images: bool,
@@ -109,7 +103,6 @@ fn main() -> ExitCode {
             keydb,
             no_keydb,
             dump,
-            min_duration,
             json,
             no_images,
             trace,
@@ -119,7 +112,6 @@ fn main() -> ExitCode {
             keydb.as_deref(),
             no_keydb,
             dump,
-            min_duration,
             json,
             no_images,
             trace,
@@ -234,7 +226,6 @@ fn run_identify(
     keydb: Option<&std::path::Path>,
     no_keydb: bool,
     dump: bool,
-    min_duration: u64,
     json: bool,
     no_images: bool,
     trace: bool,
@@ -307,14 +298,9 @@ fn run_identify(
         .map(|p| p.number)
         .collect();
 
-    // Duration lookup for threshold filtering
-    let duration_by_playlist: HashMap<u32, std::time::Duration> = analysis
-        .playlists
-        .iter()
-        .map(|p| (p.number, p.duration))
-        .collect();
-
-    let min_dur = std::time::Duration::from_secs(min_duration);
+    // Title table filter: only show playlists registered as titles in index.bdmv
+    let title_playlists = &analysis.title_playlists;
+    let use_title_filter = !title_playlists.is_empty();
 
     let content_buttons: Vec<&ExtractedButton> = {
         let mut seen = HashSet::new();
@@ -325,9 +311,7 @@ fn run_identify(
                     let pl32 = u32::from(pl);
                     valid_playlists.contains(&pl32)
                         && !composite_parents.contains(&pl32)
-                        && duration_by_playlist
-                            .get(&pl32)
-                            .is_some_and(|d| *d >= min_dur)
+                        && (!use_title_filter || title_playlists.contains(&pl32))
                         && seen.insert((pl, b.branch_opt, b.mark_or_pi))
                 })
             })
@@ -508,11 +492,19 @@ fn extract_buttons(
             for comp in &ds.compositions {
                 for page in &comp.pages {
                     for button in &page.buttons {
-                        // Decode bitmap
+                        // Decode bitmap — prefer the selected (highlighted)
+                        // state. WB extras menus render text labels only in
+                        // the selected state; the normal state is a blank
+                        // rectangle.
                         let obj = ds
                             .objects
                             .iter()
-                            .find(|o| o.object_id == button.normal_object_id);
+                            .find(|o| o.object_id == button.selected_object_id)
+                            .or_else(|| {
+                                ds.objects
+                                    .iter()
+                                    .find(|o| o.object_id == button.normal_object_id)
+                            });
 
                         let Some(obj) = obj else { continue };
 
@@ -2468,6 +2460,12 @@ fn output_dump(
         "path": path.display().to_string(),
         "items": items,
     });
+
+    if !analysis.title_playlists.is_empty() {
+        let mut sorted: Vec<u32> = analysis.title_playlists.iter().copied().collect();
+        sorted.sort_unstable();
+        output["title_playlists"] = serde_json::json!(sorted);
+    }
 
     if !analysis.partially_used_clips.is_empty() {
         let partial: Vec<serde_json::Value> = analysis

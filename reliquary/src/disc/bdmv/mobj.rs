@@ -813,6 +813,52 @@ pub struct NavClipInput<'a> {
     pub pages: Vec<&'a Page>,
 }
 
+/// Executes MOBJ\[0\] (First Play) and returns the resulting GPR state.
+///
+/// WB authoring stores per-content-item configuration in a GPR database
+/// (registers 3000–3999) initialized by the First Play object. Title
+/// MOBJs and button programs read from this database to select playlists.
+/// Without seeding, conditional `PlayPl` instructions take default
+/// branches and fail to resolve.
+///
+/// PSR entries are seeded with BD spec first-boot defaults so that
+/// MOBJ\[0\]'s initialization guard enters the configuration block.
+/// The returned map contains only GPR entries (PSRs are stripped).
+#[must_use]
+pub fn seed_gpr_state(mobj_file: &MovieObjectFile) -> std::collections::HashMap<u32, u32> {
+    let Some(mobj0) = mobj_file.objects.first() else {
+        return std::collections::HashMap::new();
+    };
+
+    let mut gprs = std::collections::HashMap::new();
+    // Seed PSRs with first-boot defaults so MOBJ[0]'s init guard enters
+    // the initialization block. PSR[4] (title number) must be 0xFFFF
+    // ("unconfigured") — the guard `CMP PSR[4] != 0xFFFF` skips init
+    // when the title is already set. Other PSRs use BD spec defaults.
+    gprs.insert(PSR_FLAG | 0x01, 0xFF); // primary audio
+    gprs.insert(PSR_FLAG | 0x02, 0xFFFE); // PG/TextST
+    gprs.insert(PSR_FLAG | 0x03, 0xFF); // angle
+    gprs.insert(PSR_FLAG | 0x04, 0xFFFF); // title (init guard)
+    gprs.insert(PSR_FLAG | 0x0A, 0xFFFF); // selected button
+    gprs.insert(PSR_FLAG | 0x0C, 0xFF); // user style
+    gprs.insert(PSR_FLAG | 0x0D, 0xFF); // parental level
+    gprs.insert(PSR_FLAG | 0x0E, 0xFFFF); // secondary A/V
+    gprs.insert(PSR_FLAG | 0x0F, 0x0002_0000); // audio cap
+    gprs.insert(PSR_FLAG | 0x1D, 0x0200); // profile 2.0
+    gprs.insert(PSR_FLAG | 0x1F, 0x0200); // player version
+    let _ = run_mobj_vm(
+        &mobj0.instructions,
+        0,
+        &mut gprs,
+        &std::collections::HashSet::new(),
+    );
+    // Keep only GPR entries (no PSR) — the disc configuration database
+    // that title MOBJs and button programs read.
+    gprs.into_iter()
+        .filter(|(k, _)| k & PSR_FLAG == 0)
+        .collect()
+}
+
 /// Resolves button→playlist mappings by executing button programs.
 ///
 /// Builds a navigation graph via BFS over all (clip, page) nodes.
@@ -846,13 +892,34 @@ pub fn resolve_via_execution(
     dispatch_table: Option<&DispatchTable>,
     valid_playlists: &std::collections::HashSet<u32>,
 ) -> Vec<ResolvedButton> {
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::VecDeque;
+    use std::hash::{Hash, Hasher};
 
     type GprState = std::collections::HashMap<u32, u32>;
 
     /// Maximum BFS iterations to prevent runaway execution on cyclic
     /// or pathological graphs.
     const NAV_GRAPH_LIMIT: u32 = 50_000;
+
+    /// Computes a deterministic hash of a GPR state map for visited-set
+    /// lookups. Uses sorted key-value pairs so iteration order doesn't
+    /// affect the result.
+    #[allow(
+        clippy::collection_is_never_read,
+        reason = "pairs is read via Hash::hash"
+    )]
+    fn hash_gpr_state(state: &GprState) -> u64 {
+        // Collect and sort for determinism (HashMap iteration is random)
+        let mut pairs: Vec<(u32, u32)> = state
+            .iter()
+            .filter(|(k, _)| *k & PSR_FLAG == 0)
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        pairs.sort_unstable();
+        let mut hasher = std::hash::DefaultHasher::new();
+        pairs.hash(&mut hasher);
+        hasher.finish()
+    }
 
     let mut resolved = Vec::new();
     let mut resolved_set = std::collections::HashSet::<(u16, u16)>::new();
@@ -868,57 +935,25 @@ pub fn resolve_via_execution(
     // BFS queue: (clip_index, page_id, gprs)
     let mut queue: VecDeque<(usize, u8, GprState)> = VecDeque::new();
 
-    // Visited: (clip_index, page_id) → list of GPR state keys processed.
-    // Keys exclude PSR entries (they are re-seeded per button execution).
-    let mut visited = std::collections::HashMap::<(usize, u8), Vec<BTreeMap<u32, u32>>>::new();
+    // Visited: (clip_index, page_id) → set of GPR state hashes processed.
+    let mut visited =
+        std::collections::HashMap::<(usize, u8), std::collections::HashSet<u64>>::new();
 
     // Execute MOBJ[0] (First Play) to collect GPR[3xxx] configuration
     // state. WB authoring stores per-content-item configuration in a
     // GPR database (registers 3000–3999) initialized by MOBJ[0]. The
     // complex button programs read from this database to compute
     // dispatch values. Without it, buttons follow default branches.
-    let init_gprs: GprState = mobj_file
-        .objects
-        .first()
-        .map_or_else(GprState::new, |mobj0| {
-            let mut gprs = GprState::new();
-            // Seed PSRs with first-boot defaults so MOBJ[0]'s init
-            // guard enters the initialization block. PSR[4] (title
-            // number) must be 0xFFFF ("unconfigured") — the guard
-            // `CMP PSR[4] != 0xFFFF` skips init when the title is
-            // already set. Other PSRs use BD spec defaults.
-            gprs.insert(PSR_FLAG | 0x01, 0xFF); // primary audio
-            gprs.insert(PSR_FLAG | 0x02, 0xFFFE); // PG/TextST
-            gprs.insert(PSR_FLAG | 0x03, 0xFF); // angle
-            gprs.insert(PSR_FLAG | 0x04, 0xFFFF); // title (init guard)
-            gprs.insert(PSR_FLAG | 0x0A, 0xFFFF); // selected button
-            gprs.insert(PSR_FLAG | 0x0C, 0xFF); // user style
-            gprs.insert(PSR_FLAG | 0x0D, 0xFF); // parental level
-            gprs.insert(PSR_FLAG | 0x0E, 0xFFFF); // secondary A/V
-            gprs.insert(PSR_FLAG | 0x0F, 0x0002_0000); // audio cap
-            gprs.insert(PSR_FLAG | 0x1D, 0x0200); // profile 2.0
-            gprs.insert(PSR_FLAG | 0x1F, 0x0200); // player version
-            let _ = run_mobj_vm(
-                &mobj0.instructions,
-                0,
-                &mut gprs,
-                &std::collections::HashSet::new(),
-            );
-            // Keep only GPR entries (no PSR) — the disc configuration
-            // database that button programs read.
-            gprs.into_iter()
-                .filter(|(k, _)| k & PSR_FLAG == 0)
-                .collect()
-        });
+    let init_gprs: GprState = seed_gpr_state(mobj_file);
 
     // Seed BFS with all pages using MOBJ[0]'s GPR state.
-    let init_key: BTreeMap<u32, u32> = init_gprs.iter().map(|(&k, &v)| (k, v)).collect();
+    let init_hash = hash_gpr_state(&init_gprs);
     for (clip_idx, clip) in clips.iter().enumerate() {
         for page in &clip.pages {
             visited
                 .entry((clip_idx, page.page_id))
                 .or_default()
-                .push(init_key.clone());
+                .insert(init_hash);
             queue.push_back((clip_idx, page.page_id, init_gprs.clone()));
         }
     }
@@ -1081,13 +1116,11 @@ pub fn resolve_via_execution(
                             .filter(|(k, _)| k & PSR_FLAG == 0)
                             .collect();
 
-                        let key: BTreeMap<u32, u32> =
-                            handler_state.iter().map(|(&k, &v)| (k, v)).collect();
+                        let key = hash_gpr_state(&handler_state);
                         for &(ci, pid) in page_lookup.keys() {
                             if ci == clip_idx {
                                 let states = visited.entry((ci, pid)).or_default();
-                                if !states.contains(&key) {
-                                    states.push(key.clone());
+                                if states.insert(key) {
                                     queue.push_back((ci, pid, handler_state.clone()));
                                 }
                             }
@@ -1106,11 +1139,9 @@ pub fn resolve_via_execution(
                             .filter(|(k, _)| k & PSR_FLAG == 0)
                             .collect();
 
-                        let key: BTreeMap<u32, u32> =
-                            propagated.iter().map(|(&k, &v)| (k, v)).collect();
+                        let key = hash_gpr_state(&propagated);
                         let states = visited.entry((clip_idx, target_page_id)).or_default();
-                        if !states.contains(&key) {
-                            states.push(key);
+                        if states.insert(key) {
                             queue.push_back((clip_idx, target_page_id, propagated));
                         }
                     }
