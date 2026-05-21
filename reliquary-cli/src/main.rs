@@ -632,12 +632,6 @@ fn run_identify(
     let use_title_filter = !title_playlists.is_empty();
 
     let content_buttons: Vec<&ExtractedButton> = {
-        // Sort candidates so execution-resolved buttons (with breadcrumbs)
-        // precede legacy-resolved ones (no breadcrumbs). Within each group
-        // preserve extraction order. This ensures the dedup picks the
-        // execution-resolved button — which has correct clip/page context
-        // and a navigation breadcrumb — over a legacy match that may be on
-        // a different clip with the wrong bitmap.
         let mut candidates: Vec<&ExtractedButton> = buttons
             .iter()
             .filter(|b| {
@@ -649,7 +643,44 @@ fn run_identify(
                 })
             })
             .collect();
-        candidates.sort_by_key(|b| u8::from(b.breadcrumb.is_empty()));
+
+        // Cross-clip dedup: when the same playlist is resolved from
+        // multiple clips, prefer the resolution from the page with the
+        // most sibling content buttons. That page is the dedicated
+        // content page (e.g. special features thumbnails) rather than
+        // a page that happens to share the same dispatch table (e.g.
+        // scene selection NOP anchors claiming the same playlists).
+        let page_content_count: HashMap<(usize, u8), usize> = {
+            let mut counts: HashMap<(usize, u8), usize> = HashMap::new();
+            for b in &candidates {
+                let key = b
+                    .breadcrumb
+                    .last()
+                    .map_or((b.clip_index, b.page_id), |s| (s.clip_index, s.page_id));
+                *counts.entry(key).or_default() += 1;
+            }
+            counts
+        };
+
+        // Sort: prefer breadcrumb-having buttons, then pages with more
+        // sibling content buttons.
+        candidates.sort_by(|a, b| {
+            let a_has_bc = u8::from(a.breadcrumb.is_empty());
+            let b_has_bc = u8::from(b.breadcrumb.is_empty());
+            a_has_bc.cmp(&b_has_bc).then_with(|| {
+                let a_key = a
+                    .breadcrumb
+                    .last()
+                    .map_or((a.clip_index, a.page_id), |s| (s.clip_index, s.page_id));
+                let b_key = b
+                    .breadcrumb
+                    .last()
+                    .map_or((b.clip_index, b.page_id), |s| (s.clip_index, s.page_id));
+                let a_count = page_content_count.get(&a_key).copied().unwrap_or(0);
+                let b_count = page_content_count.get(&b_key).copied().unwrap_or(0);
+                b_count.cmp(&a_count)
+            })
+        });
 
         let mut seen = HashSet::new();
         candidates

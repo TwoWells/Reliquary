@@ -1041,7 +1041,12 @@ pub fn resolve_via_execution(
     }
 
     let mut resolved = Vec::new();
-    let mut resolved_set = std::collections::HashSet::<PlayTarget>::new();
+    // Per-clip dedup: the same playlist from different clips is NOT a
+    // duplicate — it's the same content accessible from different menus.
+    // Each menu provides different visual context (e.g. scene selection
+    // thumbnails vs. special features thumbnails). The CLI decides which
+    // clip's resolution to present.
+    let mut resolved_set = std::collections::HashSet::<(usize, PlayTarget)>::new();
 
     // Page index: (clip_index, page_id) → (page ref, ig_pid)
     let mut page_lookup = std::collections::HashMap::<(usize, u8), (&Page, u16)>::new();
@@ -1134,7 +1139,7 @@ pub fn resolve_via_execution(
                             branch_opt: 0,
                             mark_or_pi: 0,
                         };
-                        if resolved_set.insert(target) {
+                        if resolved_set.insert((clip_idx, target)) {
                             let visible_bid =
                                 find_visible_button_for_nop(page, button, ig_pid, page_id, &gprs)
                                     .unwrap_or(button.button_id);
@@ -1177,7 +1182,7 @@ pub fn resolve_via_execution(
                     let is_valid = pl != 0
                         && pl != 0xFFFF
                         && (valid_playlists.is_empty() || valid_playlists.contains(&u32::from(pl)));
-                    if is_valid && resolved_set.insert(target) {
+                    if is_valid && resolved_set.insert((clip_idx, target)) {
                         let mut crumb = breadcrumb.clone();
                         crumb.push(BreadcrumbStep {
                             clip_index: clip_idx,
@@ -1196,7 +1201,7 @@ pub fn resolve_via_execution(
                         let mut mobj_gprs = new_gprs;
                         if let Some(target) =
                             run_mobj_vm(&mobj.instructions, 0, &mut mobj_gprs, valid_playlists)
-                            && resolved_set.insert(target)
+                            && resolved_set.insert((clip_idx, target))
                         {
                             let mut crumb = breadcrumb.clone();
                             crumb.push(BreadcrumbStep {
@@ -1339,7 +1344,7 @@ pub fn resolve_via_execution(
                                 branch_opt: 0,
                                 mark_or_pi: 0,
                             };
-                            if resolved_set.insert(target) {
+                            if resolved_set.insert((clip_idx, target)) {
                                 let visible_bid = find_visible_button_for_nop(
                                     page,
                                     button,
@@ -1396,7 +1401,7 @@ pub fn resolve_via_execution(
                             && pl != 0xFFFF
                             && (valid_playlists.is_empty()
                                 || valid_playlists.contains(&u32::from(pl)));
-                        if is_valid && resolved_set.insert(target) {
+                        if is_valid && resolved_set.insert((clip_idx, target)) {
                             resolved.push(ResolvedPlaylist {
                                 breadcrumb: vec![BreadcrumbStep {
                                     clip_index: clip_idx,
@@ -1413,7 +1418,7 @@ pub fn resolve_via_execution(
                             let mut mobj_gprs = new_gprs;
                             if let Some(target) =
                                 run_mobj_vm(&mobj.instructions, 0, &mut mobj_gprs, valid_playlists)
-                                && resolved_set.insert(target)
+                                && resolved_set.insert((clip_idx, target))
                             {
                                 resolved.push(ResolvedPlaylist {
                                     breadcrumb: vec![BreadcrumbStep {
@@ -1460,7 +1465,8 @@ pub fn resolve_via_execution(
                     continue;
                 }
 
-                if resolved_set.insert(target) {
+                let crumb_clip = crumb.last().map_or(0, |s| s.clip_index);
+                if resolved_set.insert((crumb_clip, target)) {
                     // New resolution — no prior path existed.
                     resolved.push(ResolvedPlaylist {
                         breadcrumb: crumb.clone(),
@@ -5093,6 +5099,144 @@ mod tests {
             breadcrumb_ids(&r1.breadcrumb),
             vec![1],
             "GotoMobj breadcrumb unchanged"
+        );
+    }
+
+    #[test]
+    fn exec_cross_clip_nop_anchors_both_preserved() {
+        // Same NOP anchor button_id and dispatch case in two different clips.
+        // Per-clip dedup: both resolutions are preserved (one per clip).
+        // The CLI decides which clip's resolution to present.
+        let anchor_a = make_button_at(15, 199, 668, vec![]);
+        let thumb_a = make_button_at(
+            5,
+            229,
+            668,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 50,
+                    value: 0,
+                },
+                NavigationCommand::SetGpr {
+                    register: 51,
+                    value: 26,
+                },
+                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
+            ],
+        );
+
+        let anchor_b = make_button_at(15, 199, 668, vec![]);
+        let thumb_b = make_button_at(
+            7,
+            229,
+            668,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 50,
+                    value: 0,
+                },
+                NavigationCommand::SetGpr {
+                    register: 51,
+                    value: 26,
+                },
+                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
+            ],
+        );
+
+        let dispatch_mobj = build_dispatch_mobj(&[(10, 210), (15, 215), (20, 220)]);
+        let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let table = extract_dispatch_table(&mobj_file).expect("should extract table");
+
+        let page_a = make_page(0, vec![anchor_a, thumb_a]);
+        let page_b = make_page(0, vec![anchor_b, thumb_b]);
+        let clips = vec![
+            NavClipInput {
+                ig_pid: 0x1200,
+                pages: vec![&page_a],
+            },
+            NavClipInput {
+                ig_pid: 0x1201,
+                pages: vec![&page_b],
+            },
+        ];
+
+        let resolved = resolve_via_execution(
+            &clips,
+            &mobj_file,
+            Some(&table),
+            &std::collections::HashSet::new(),
+        );
+
+        let matching: Vec<_> = resolved
+            .iter()
+            .filter(|r| r.target.playlist == 215)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            2,
+            "same playlist from two clips → both preserved"
+        );
+
+        let clip_indices: std::collections::HashSet<usize> = matching
+            .iter()
+            .map(|r| {
+                r.breadcrumb
+                    .last()
+                    .expect("breadcrumb should not be empty")
+                    .clip_index
+            })
+            .collect();
+        assert!(clip_indices.contains(&0), "clip 0 resolution preserved");
+        assert!(clip_indices.contains(&1), "clip 1 resolution preserved");
+    }
+
+    #[test]
+    fn exec_same_clip_still_deduplicates() {
+        // Same PlayTarget from two pages within the same clip is still
+        // deduplicated (BFS first-arrival wins within a clip).
+        let anchor_p0 = make_button_at(12, 199, 668, vec![]);
+        let thumb_p0 = make_button_at(
+            7,
+            229,
+            668,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 50,
+                    value: 0,
+                },
+                NavigationCommand::SetGpr {
+                    register: 51,
+                    value: 26,
+                },
+                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
+            ],
+        );
+        let anchor_p1 = make_button(12, vec![]);
+
+        let dispatch_mobj = build_dispatch_mobj(&[(12, 212), (15, 215), (20, 220)]);
+        let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let table = extract_dispatch_table(&mobj_file).expect("should extract table");
+
+        let page0 = make_page(0, vec![anchor_p0, thumb_p0]);
+        let page1 = make_page(1, vec![anchor_p1]);
+        let clips = vec![NavClipInput {
+            ig_pid: 0x1200,
+            pages: vec![&page0, &page1],
+        }];
+
+        let resolved = resolve_via_execution(
+            &clips,
+            &mobj_file,
+            Some(&table),
+            &std::collections::HashSet::new(),
+        );
+
+        let count = resolved.iter().filter(|r| r.target.playlist == 212).count();
+        assert_eq!(
+            count, 1,
+            "same clip, same PlayTarget → still deduplicated to one"
         );
     }
 }
