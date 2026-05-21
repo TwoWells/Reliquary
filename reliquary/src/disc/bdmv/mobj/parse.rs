@@ -273,7 +273,7 @@ pub fn format_instruction(insn: &Instruction) -> String {
     reason = "tests use expect() for assertions per project rules"
 )]
 mod tests {
-    use super::super::test_helpers::{spec_to_raw, InsnSpec, MobjBuilder};
+    use super::super::test_helpers::{InsnSpec, MobjBuilder, spec_to_raw};
     use super::*;
 
     #[test]
@@ -408,5 +408,4 @@ mod tests {
         assert_eq!(other.dst, 4077, "Other AND dst");
         assert_eq!(other.src, 4076, "Other AND src");
     }
-
 }
