@@ -809,6 +809,91 @@ pub fn find_handler_pc(
     None
 }
 
+// ── NOP anchor classification ──────────────────────────────────────────
+
+/// Returns `true` if a button is a NOP anchor — a dispatch target with no
+/// real commands.
+///
+/// NOP anchors have either no commands or all commands are NOP instructions
+/// (all-zero 12-byte commands). In the WB `SET_BUTTON_PAGE` pattern, NOP
+/// anchors exist solely so the MOBJ VM can read their `button_id` from
+/// PSR\[10\] to dispatch to the correct playlist. They are not visible to
+/// the user.
+#[must_use]
+pub fn is_nop_anchor(button: &Button) -> bool {
+    button.commands.is_empty()
+        || button.commands.iter().all(|c| {
+            matches!(c, NavigationCommand::Other { opcode, dst, src }
+                if *opcode == 0 && *dst == 0 && *src == 0)
+        })
+}
+
+/// Finds the visible button on a page that corresponds to a NOP anchor.
+///
+/// Two strategies, tried in order:
+/// 1. **Forward trace:** execute each visible button's commands. If a button
+///    produces `SET_BUTTON_PAGE` whose target button ID matches the NOP
+///    anchor's `button_id`, it navigates to this anchor.
+/// 2. **Spatial fallback:** find the nearest visible button by squared
+///    Euclidean distance. WB authoring places NOP anchors ~30px from their
+///    corresponding visible thumbnails.
+///
+/// Returns `None` if the page has no visible (non-NOP) buttons.
+fn find_visible_button_for_nop(
+    page: &Page,
+    nop_button: &Button,
+    ig_stream: u16,
+    page_id: u8,
+    gprs: &std::collections::HashMap<u32, u32>,
+) -> Option<u16> {
+    /// Maximum squared distance for the spatial fallback (~60px).
+    ///
+    /// WB authoring places thumbnail NOP anchors ~30-42px from their
+    /// co-located visible thumbnails. Menu bar NOP anchors are ~285px+
+    /// from the nearest thumbnail — those must NOT match, because many
+    /// menu bar NOPs mapping to the same few thumbnails causes the CLI's
+    /// fallback matching to grab unrelated buttons (arrows, page numbers).
+    const MAX_SQUARED_DISTANCE: i32 = 60 * 60;
+
+    let visible: Vec<&Button> = page.buttons.iter().filter(|b| !is_nop_anchor(b)).collect();
+
+    if visible.is_empty() {
+        return None;
+    }
+
+    // Forward trace: check if any visible button's SET_BUTTON_PAGE targets
+    // this NOP anchor. The target button_id is `composite & 0xFFFF`.
+    for vis in &visible {
+        let ctx = PlayerContext {
+            ig_stream,
+            selected_button_id: vis.button_id,
+            page_id,
+        };
+        let (effect, _) = execute_button_commands(&vis.commands, &ctx, gprs);
+        if let ButtonEffect::SetButtonPage { composite, .. } = effect {
+            #[allow(clippy::cast_possible_truncation, reason = "button IDs are u16 values")]
+            let target_bid = (composite & 0xFFFF) as u16;
+            if target_bid == nop_button.button_id {
+                return Some(vis.button_id);
+            }
+        }
+    }
+
+    // Spatial fallback: nearest visible button within the distance
+    // threshold. Rejects distant matches that cause many-to-one
+    // collisions in the CLI's button matching.
+    visible
+        .iter()
+        .filter_map(|v| {
+            let dx = i32::from(v.x) - i32::from(nop_button.x);
+            let dy = i32::from(v.y) - i32::from(nop_button.y);
+            let d2 = dx * dx + dy * dy;
+            (d2 <= MAX_SQUARED_DISTANCE).then_some((d2, v.button_id))
+        })
+        .min_by_key(|(d2, _)| *d2)
+        .map(|(_, bid)| bid)
+}
+
 // ── Execution-based resolver ───────────────────────────────────────────
 
 /// The terminal effect of executing a button's command program.
@@ -1036,36 +1121,28 @@ pub fn resolve_via_execution(
             // becomes the dispatch case. The dispatch MOBJ copies
             // PSR[10] into its switch register and dispatches.
             //
-            // WB authoring emits a single NOP instruction (all-zero
-            // 12-byte command) on anchor buttons rather than a true
-            // zero-command button.
-            //
-            // Reference: libbluray `graphics_controller.c`
-            // `_select_button()` → writes PSR[10] = button_id.
-            let is_nop_anchor = button.commands.is_empty()
-                || button.commands.iter().all(|c| {
-                    matches!(c, NavigationCommand::Other { opcode, dst, src }
-                        if *opcode == 0 && *dst == 0 && *src == 0)
-                });
-            if is_nop_anchor {
+            // The breadcrumb records the corresponding visible button
+            // (the one with the selected-state bitmap showing the
+            // content label), not the NOP anchor itself. This ensures
+            // the CLI highlights the correct thumbnail/label position.
+            if is_nop_anchor(button) {
                 if let Some(table) = dispatch_table {
                     let bid = u32::from(button.button_id);
-                    let target = PlayTarget {
-                        playlist: 0,
-                        branch_opt: 0,
-                        mark_or_pi: 0,
-                    };
                     if let Some(&(_, pl)) = table.cases.iter().find(|(cv, _)| *cv == bid) {
                         let target = PlayTarget {
                             playlist: pl,
-                            ..target
+                            branch_opt: 0,
+                            mark_or_pi: 0,
                         };
                         if resolved_set.insert(target) {
+                            let visible_bid =
+                                find_visible_button_for_nop(page, button, ig_pid, page_id, &gprs)
+                                    .unwrap_or(button.button_id);
                             let mut crumb = breadcrumb.clone();
                             crumb.push(BreadcrumbStep {
                                 clip_index: clip_idx,
                                 page_id,
-                                button_id: button.button_id,
+                                button_id: visible_bid,
                             });
                             resolved.push(ResolvedPlaylist {
                                 breadcrumb: crumb,
@@ -1251,31 +1328,31 @@ pub fn resolve_via_execution(
             };
 
             for button in &page.buttons {
-                // NOP anchor orphans
-                let is_nop_anchor = button.commands.is_empty()
-                    || button.commands.iter().all(|c| {
-                        matches!(c, NavigationCommand::Other { opcode, dst, src }
-                            if *opcode == 0 && *dst == 0 && *src == 0)
-                    });
-                if is_nop_anchor {
+                // NOP anchor orphans — same visible-button resolution
+                // as the main BFS, but with orphan=true.
+                if is_nop_anchor(button) {
                     if let Some(table) = dispatch_table {
                         let bid = u32::from(button.button_id);
-                        let target = PlayTarget {
-                            playlist: 0,
-                            branch_opt: 0,
-                            mark_or_pi: 0,
-                        };
                         if let Some(&(_, pl)) = table.cases.iter().find(|(cv, _)| *cv == bid) {
                             let target = PlayTarget {
                                 playlist: pl,
-                                ..target
+                                branch_opt: 0,
+                                mark_or_pi: 0,
                             };
                             if resolved_set.insert(target) {
+                                let visible_bid = find_visible_button_for_nop(
+                                    page,
+                                    button,
+                                    ig_pid,
+                                    page.page_id,
+                                    &init_gprs,
+                                )
+                                .unwrap_or(button.button_id);
                                 resolved.push(ResolvedPlaylist {
                                     breadcrumb: vec![BreadcrumbStep {
                                         clip_index: clip_idx,
                                         page_id: page.page_id,
-                                        button_id: button.button_id,
+                                        button_id: visible_bid,
                                     }],
                                     orphan: true,
                                     target,
@@ -2358,6 +2435,17 @@ mod tests {
             button_id,
             x: 0,
             y: 0,
+            normal_object_id: 0,
+            selected_object_id: 0,
+            commands,
+        }
+    }
+
+    fn make_button_at(button_id: u16, x: u16, y: u16, commands: Vec<NavigationCommand>) -> Button {
+        Button {
+            button_id,
+            x,
+            y,
             normal_object_id: 0,
             selected_object_id: 0,
             commands,
@@ -4350,12 +4438,20 @@ mod tests {
 
     #[test]
     fn exec_nop_anchors_coexist_with_navigation_buttons() {
-        // Mix of NOP anchors and navigation buttons on the same page.
-        // The NOP anchor resolves via direct dispatch lookup during BFS.
-        // The navigation button's composite also resolves via the
-        // post-BFS fallback (different dispatch case, different playlist).
-        let nav_button = make_button(
+        // Mix of NOP anchors, visible thumbnails, and navigation buttons
+        // on the same page (models WB extras layout):
+        // - nav btn[3]@(1080,949) — menu bar navigation
+        // - visible btn[5]@(229,668) — thumbnail the user sees
+        // - NOP anchor btn[15]@(199,668) — ~30px from thumbnail
+        //
+        // The NOP anchor resolves via dispatch lookup. The breadcrumb
+        // records the visible thumbnail (btn[5]), not the NOP anchor.
+        // The navigation button's composite resolves via the post-BFS
+        // fallback (different dispatch case, different playlist).
+        let nav_button = make_button_at(
             3,
+            1080,
+            949,
             vec![
                 NavigationCommand::SetGpr {
                     register: 4075,
@@ -4371,14 +4467,31 @@ mod tests {
                 spec_to_other(&InsnSpec::SetButtonPage(4077, 0)),
             ],
         );
-        let anchor = make_button(15, vec![]);
+        // Visible thumbnail — navigates to a details page (page 26)
+        let thumbnail = make_button_at(
+            5,
+            229,
+            668,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 50,
+                    value: 0,
+                },
+                NavigationCommand::SetGpr {
+                    register: 51,
+                    value: 26,
+                },
+                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
+            ],
+        );
+        let anchor = make_button_at(15, 199, 668, vec![]);
 
         let dispatch_mobj = build_dispatch_mobj(&[(8, 208), (15, 215), (20, 220)]);
         let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
         let mobj_file = parse(&mobj_data).expect("should parse");
         let table = extract_dispatch_table(&mobj_file).expect("should extract table");
 
-        let page = make_page(0, vec![nav_button, anchor]);
+        let page = make_page(0, vec![nav_button, thumbnail, anchor]);
         let clips = vec![NavClipInput {
             ig_pid: 0x1200,
             pages: vec![&page],
@@ -4392,6 +4505,7 @@ mod tests {
         );
 
         // NOP anchor btn[15] → case 15 → PL 215 (BFS direct)
+        // Breadcrumb records btn[5] (visible thumbnail), not btn[15].
         // Nav btn[3] → composite 8 → PL 208 (fallback)
         assert_eq!(
             resolved.len(),
@@ -4402,15 +4516,51 @@ mod tests {
             resolved.iter().map(|r| r.target.playlist).collect();
         assert!(pls.contains(&215), "anchor 15 → 215");
         assert!(pls.contains(&208), "nav composite 8 → 208");
+
+        // Verify the anchor's breadcrumb points to the visible thumbnail
+        let anchor_resolution = resolved
+            .iter()
+            .find(|r| r.target.playlist == 215)
+            .expect("should find anchor resolution");
+        assert_eq!(
+            breadcrumb_ids(&anchor_resolution.breadcrumb),
+            vec![5],
+            "NOP anchor breadcrumb remapped to visible thumbnail btn[5]"
+        );
     }
 
     #[test]
     fn exec_nop_anchor_deduplicates() {
         // Same PlayTarget reached via two navigation paths should only
         // produce one resolution. Dedup keeps the shortest breadcrumb.
-        let anchor_p0 = make_button(12, vec![]);
-        let nav_a = make_button(
+        //
+        // Page 0: NOP anchor btn[12]@(199,668) + visible thumbnail
+        // btn[7]@(229,668) + navigation buttons at the menu bar.
+        // Page 1: same NOP anchor btn[12] (no visible buttons).
+        //
+        // The root page anchor resolves first (shortest breadcrumb)
+        // and gets remapped to the visible thumbnail btn[7].
+        let anchor_p0 = make_button_at(12, 199, 668, vec![]);
+        let thumbnail = make_button_at(
+            7,
+            229,
+            668,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 50,
+                    value: 0,
+                },
+                NavigationCommand::SetGpr {
+                    register: 51,
+                    value: 26,
+                },
+                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
+            ],
+        );
+        let nav_a = make_button_at(
             1,
+            400,
+            949,
             vec![
                 NavigationCommand::SetGpr {
                     register: 50,
@@ -4423,8 +4573,10 @@ mod tests {
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
         );
-        let nav_b = make_button(
+        let nav_b = make_button_at(
             2,
+            800,
+            949,
             vec![
                 NavigationCommand::SetGpr {
                     register: 50,
@@ -4444,7 +4596,7 @@ mod tests {
         let mobj_file = parse(&mobj_data).expect("should parse");
         let table = extract_dispatch_table(&mobj_file).expect("should extract table");
 
-        let page0 = make_page(0, vec![anchor_p0, nav_a, nav_b]);
+        let page0 = make_page(0, vec![anchor_p0, thumbnail, nav_a, nav_b]);
         let page1 = make_page(1, vec![anchor_p1]);
         let clips = vec![NavClipInput {
             ig_pid: 0x1200,
@@ -4469,8 +4621,8 @@ mod tests {
         );
         assert_eq!(
             breadcrumb_ids(&matching[0].breadcrumb),
-            vec![12],
-            "shortest breadcrumb (root page) wins over navigation path"
+            vec![7],
+            "shortest breadcrumb (root page) wins, remapped to visible thumbnail"
         );
     }
 
@@ -4641,6 +4793,306 @@ mod tests {
         assert_eq!(
             orphan.breadcrumb[0].page_id, 2,
             "orphan step carries page context"
+        );
+    }
+
+    // ── NOP detection tests ─────────────────────────────────────────
+
+    #[test]
+    fn nop_detection_empty_commands() {
+        let button = make_button(10, vec![]);
+        assert!(is_nop_anchor(&button), "empty commands → NOP anchor");
+    }
+
+    #[test]
+    fn nop_detection_all_nop_instructions() {
+        let button = make_button(10, vec![spec_to_other(&InsnSpec::Nop)]);
+        assert!(
+            is_nop_anchor(&button),
+            "single NOP instruction → NOP anchor"
+        );
+
+        let button2 = make_button(
+            10,
+            vec![spec_to_other(&InsnSpec::Nop), spec_to_other(&InsnSpec::Nop)],
+        );
+        assert!(
+            is_nop_anchor(&button2),
+            "multiple NOP instructions → NOP anchor"
+        );
+    }
+
+    #[test]
+    fn nop_detection_real_commands_not_nop() {
+        let button = make_button(
+            10,
+            vec![NavigationCommand::SetGpr {
+                register: 100,
+                value: 42,
+            }],
+        );
+        assert!(!is_nop_anchor(&button), "SetGpr command → not NOP");
+
+        let button2 = make_button(10, vec![NavigationCommand::GotoMobj { object_id: 1 }]);
+        assert!(!is_nop_anchor(&button2), "GotoMobj command → not NOP");
+
+        let button3 = make_button(
+            10,
+            vec![NavigationCommand::PlayPl {
+                playlist: 200,
+                branch_opt: 0,
+                mark_or_pi: 0,
+            }],
+        );
+        assert!(!is_nop_anchor(&button3), "PlayPl command → not NOP");
+    }
+
+    // ── Visible button resolution tests ───────────────────────────────
+
+    #[test]
+    fn visible_button_forward_trace() {
+        // Visible button's SET_BUTTON_PAGE directly targets the NOP
+        // anchor's button_id. Forward trace matches without spatial
+        // fallback.
+        //
+        // Visible button computes composite = button_id 19 via register.
+        // SetGpr(50, 19) + SetButtonPage(50, 51) → composite = 19.
+        let visible = make_button_at(
+            5,
+            229,
+            668,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 50,
+                    value: 19,
+                },
+                NavigationCommand::SetGpr {
+                    register: 51,
+                    value: 0,
+                },
+                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
+            ],
+        );
+        let page = make_page(0, vec![make_button_at(19, 1339, 949, vec![]), visible]);
+        let nop_ref = make_button_at(19, 1339, 949, vec![]);
+
+        let gprs = std::collections::HashMap::new();
+        let result = find_visible_button_for_nop(&page, &nop_ref, 0x1200, 0, &gprs);
+        assert_eq!(
+            result,
+            Some(5),
+            "forward trace finds visible btn[5] targeting NOP btn[19]"
+        );
+    }
+
+    #[test]
+    fn visible_button_spatial_fallback() {
+        // No visible button's commands target the NOP anchor, but a
+        // co-located visible button is ~30px away. Spatial fallback
+        // selects the nearest one.
+        let thumb_near = make_button_at(
+            5,
+            229,
+            668,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 50,
+                    value: 0,
+                },
+                NavigationCommand::SetGpr {
+                    register: 51,
+                    value: 26,
+                },
+                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
+            ],
+        );
+        let thumb_far = make_button_at(
+            6,
+            530,
+            668,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 50,
+                    value: 0,
+                },
+                NavigationCommand::SetGpr {
+                    register: 51,
+                    value: 26,
+                },
+                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
+            ],
+        );
+
+        let page = make_page(
+            0,
+            vec![make_button_at(21, 199, 668, vec![]), thumb_near, thumb_far],
+        );
+        let nop_ref = make_button_at(21, 199, 668, vec![]);
+        let gprs = std::collections::HashMap::new();
+        let result = find_visible_button_for_nop(&page, &nop_ref, 0x1200, 0, &gprs);
+        assert_eq!(
+            result,
+            Some(5),
+            "spatial fallback selects nearest visible btn[5] (30px) over btn[6] (331px)"
+        );
+    }
+
+    #[test]
+    fn visible_button_spatial_rejects_distant_match() {
+        // Menu bar NOP anchor btn[19]@(1339,949) — nearest visible
+        // button is btn[9]@(1430,668) at ~295px, far beyond the 60px
+        // threshold. Should return None to prevent the many-to-one
+        // collision that causes fallback matching to grab random
+        // buttons (arrows, page numbers).
+        let page = make_page(
+            0,
+            vec![
+                make_button_at(19, 1339, 949, vec![]),
+                make_button_at(
+                    9,
+                    1430,
+                    668,
+                    vec![NavigationCommand::SetGpr {
+                        register: 50,
+                        value: 0,
+                    }],
+                ),
+            ],
+        );
+        let nop_ref = make_button_at(19, 1339, 949, vec![]);
+
+        let gprs = std::collections::HashMap::new();
+        let result = find_visible_button_for_nop(&page, &nop_ref, 0x1200, 0, &gprs);
+        assert_eq!(result, None, "295px distance exceeds 60px threshold");
+    }
+
+    #[test]
+    fn visible_button_no_visible_returns_none() {
+        // Page with only NOP anchors — no visible buttons to map to.
+        let page = make_page(
+            0,
+            vec![
+                make_button(12, vec![]),
+                make_button(15, vec![spec_to_other(&InsnSpec::Nop)]),
+            ],
+        );
+        let nop_ref = make_button(12, vec![]);
+
+        let gprs = std::collections::HashMap::new();
+        let result = find_visible_button_for_nop(&page, &nop_ref, 0x1200, 0, &gprs);
+        assert_eq!(result, None, "no visible buttons → None");
+    }
+
+    #[test]
+    fn visible_button_breadcrumb_in_resolver() {
+        // End-to-end: NOP anchor on a page with a co-located visible
+        // thumbnail. The resolver's breadcrumb should record the visible
+        // button, not the NOP anchor.
+        let nop = make_button_at(21, 199, 668, vec![]);
+        let thumb = make_button_at(
+            5,
+            229,
+            668,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 50,
+                    value: 0,
+                },
+                NavigationCommand::SetGpr {
+                    register: 51,
+                    value: 26,
+                },
+                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
+            ],
+        );
+        let page = make_page(0, vec![nop, thumb]);
+
+        let dispatch_mobj = build_dispatch_mobj(&[(21, 209), (23, 210), (25, 211)]);
+        let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let table = extract_dispatch_table(&mobj_file).expect("should extract table");
+
+        let clips = vec![NavClipInput {
+            ig_pid: 0x1200,
+            pages: vec![&page],
+        }];
+
+        let resolved = resolve_via_execution(
+            &clips,
+            &mobj_file,
+            Some(&table),
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(resolved.len(), 1, "one NOP anchor resolved");
+        assert_eq!(resolved[0].target.playlist, 209, "NOP btn[21] → PL 209");
+        assert_eq!(
+            breadcrumb_ids(&resolved[0].breadcrumb),
+            vec![5],
+            "breadcrumb records visible btn[5], not NOP btn[21]"
+        );
+    }
+
+    #[test]
+    fn goto_mobj_pattern_unaffected_by_visible_resolution() {
+        // GotoMobj pattern (a Blu-ray series style): buttons have direct
+        // GotoMobj commands, no NOP anchors, no dispatch table.
+        // This ticket's changes should be a no-op.
+        let button_a = make_button(
+            1,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 0,
+                    value: 1,
+                },
+                NavigationCommand::GotoMobj { object_id: 1 },
+            ],
+        );
+        let button_b = make_button(
+            2,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 0,
+                    value: 2,
+                },
+                NavigationCommand::GotoMobj { object_id: 2 },
+            ],
+        );
+        let page = make_page(0, vec![button_a, button_b]);
+
+        let mobj_data = MobjBuilder::new()
+            .object(&[InsnSpec::Nop])
+            .object(&[InsnSpec::PlayPl(301)])
+            .object(&[InsnSpec::PlayPl(302)])
+            .build();
+        let mobj_file = parse(&mobj_data).expect("should parse");
+
+        let mut valid = std::collections::HashSet::new();
+        valid.insert(301);
+        valid.insert(302);
+
+        let clips = vec![NavClipInput {
+            ig_pid: 0x1200,
+            pages: vec![&page],
+        }];
+
+        let resolved = resolve_via_execution(&clips, &mobj_file, None, &valid);
+
+        assert_eq!(resolved.len(), 2, "two GotoMobj buttons resolved");
+        let pls: std::collections::HashSet<u16> =
+            resolved.iter().map(|r| r.target.playlist).collect();
+        assert!(pls.contains(&301), "btn[1] → 301");
+        assert!(pls.contains(&302), "btn[2] → 302");
+
+        // Breadcrumbs point directly to the buttons that have the commands
+        let r1 = resolved
+            .iter()
+            .find(|r| r.target.playlist == 301)
+            .expect("should find 301");
+        assert_eq!(
+            breadcrumb_ids(&r1.breadcrumb),
+            vec![1],
+            "GotoMobj breadcrumb unchanged"
         );
     }
 }

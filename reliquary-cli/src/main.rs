@@ -1225,7 +1225,10 @@ fn resolve_mobj_buttons(
 
 /// Dumps per-clip IG structure: display sets, pages, buttons, and commands.
 #[allow(clippy::print_stderr, reason = "diagnostic trace output")]
-#[allow(clippy::too_many_lines, reason = "diagnostic dump with position + command detail")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "diagnostic dump with position + command detail"
+)]
 fn trace_ig_clip(clip_id: &str, ig_stream: &reliquary::disc::bdmv::ig::IgStream) {
     use reliquary::disc::bdmv::ig::NavigationCommand;
 
@@ -1261,11 +1264,13 @@ fn trace_ig_clip(clip_id: &str, ig_stream: &reliquary::disc::bdmv::ig::IgStream)
 
                 // Show button positions for spatial debugging
                 for b in &page.buttons {
-                    let cmd_label = if b.commands.is_empty() || b.commands.len() <= 2 && b.commands.iter().all(|c| {
-                        matches!(c, NavigationCommand::Other { opcode, .. } if opcode >> 24 == 0)
-                    }) {
+                    let cmd_label = if reliquary::disc::bdmv::mobj::is_nop_anchor(b) {
                         "NOP"
-                    } else if b.commands.iter().any(|c| matches!(c, NavigationCommand::PlayPl { .. })) {
+                    } else if b
+                        .commands
+                        .iter()
+                        .any(|c| matches!(c, NavigationCommand::PlayPl { .. }))
+                    {
                         "PlayPl"
                     } else {
                         "nav"
@@ -2589,10 +2594,7 @@ fn prompt_content_buttons(
                 // Draw a visible border so the user can locate the button
                 // even when the selected-state bitmap is invisible.
                 if let Some(btn_comp) = p.buttons.iter().find(|b| b.button_id == highlight_id) {
-                    let bmp = btn_comp
-                        .selected
-                        .as_ref()
-                        .or(btn_comp.normal.as_ref());
+                    let bmp = btn_comp.selected.as_ref().or(btn_comp.normal.as_ref());
                     if let Some(bmp) = bmp {
                         draw_highlight_border(
                             &mut canvas,
