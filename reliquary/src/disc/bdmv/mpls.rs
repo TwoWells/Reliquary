@@ -65,6 +65,12 @@ pub struct Playlist {
     pub play_items: Vec<PlayItem>,
     /// Chapter marks referencing play items by index.
     pub marks: Vec<Mark>,
+    /// Clip IDs referenced by sub-paths (e.g. IG overlay clips).
+    ///
+    /// Sub-paths associate secondary clips (interactive graphics, pip
+    /// video) with the main play items. Only the clip IDs are extracted;
+    /// timing and sync details are not parsed.
+    pub sub_path_clip_ids: Vec<String>,
 }
 
 /// A single play item referencing an m2ts clip with timing information.
@@ -271,11 +277,42 @@ pub fn parse(data: &[u8], number: u32) -> Result<Playlist, MplsError> {
     let _section_length = r.read_u32()?;
     let _reserved = r.read_u16()?;
     let num_play_items = r.read_u16()?;
-    let _num_sub_paths = r.read_u16()?;
+    let num_sub_paths = r.read_u16()?;
+
+    // Compute expected cursor position after all play items by walking
+    // the raw length fields. This lets us recover if the play item
+    // parser leaves the cursor misaligned (e.g. from STN table edge
+    // cases with many streams).
+    let play_items_start = r.pos;
+    let expected_after_items = {
+        let mut pos = play_items_start;
+        for _ in 0..num_play_items {
+            if pos + 2 > data.len() {
+                break;
+            }
+            let item_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2 + item_len;
+        }
+        pos
+    };
 
     let mut play_items = Vec::with_capacity(num_play_items as usize);
     for _ in 0..num_play_items {
         play_items.push(parse_play_item(&mut r)?);
+    }
+
+    // Recover cursor alignment if the parser drifted
+    if r.pos != expected_after_items && expected_after_items <= data.len() {
+        r.pos = expected_after_items;
+    }
+
+    let mut sub_path_clip_ids = Vec::new();
+    for _ in 0..num_sub_paths {
+        if let Ok(clips) = parse_sub_path_clip_ids(&mut r) {
+            sub_path_clip_ids.extend(clips);
+        } else {
+            break;
+        }
     }
 
     // ── PlayListMark section ────────────────────────────────────────
@@ -292,6 +329,7 @@ pub fn parse(data: &[u8], number: u32) -> Result<Playlist, MplsError> {
         number,
         play_items,
         marks,
+        sub_path_clip_ids,
     })
 }
 
@@ -353,6 +391,56 @@ fn parse_play_item(r: &mut Cursor<'_>) -> Result<PlayItem, MplsError> {
         angle_clip_ids,
         streams,
     })
+}
+
+/// Extracts clip IDs from a single sub-path entry.
+///
+/// Each sub-path contains one or more `SubPlayItem` entries, each
+/// referencing a clip. Only the clip IDs are extracted — timing,
+/// sync, and type information are skipped.
+///
+/// Reference: BD spec `SubPath` structure.
+fn parse_sub_path_clip_ids(r: &mut Cursor<'_>) -> Result<Vec<String>, MplsError> {
+    let sub_path_length = r.read_u32()? as usize;
+    let sub_path_start = r.pos;
+
+    // padding (u8) + sub_path_type (u8) + reserved/is_repeat (u16)
+    // + reserved (u8) + num_sub_play_items (u8) = 6 bytes header
+    if sub_path_length < 6 {
+        r.skip(sub_path_length)?;
+        return Ok(Vec::new());
+    }
+    r.skip(1)?; // padding
+    r.skip(1)?; // sub_path_type
+    r.skip(2)?; // reserved (15 bits) + is_repeat_SubPath (1 bit)
+    r.skip(1)?; // reserved
+    let num_items = r.read_u8()?;
+
+    let mut clip_ids = Vec::with_capacity(num_items as usize);
+    for _ in 0..num_items {
+        let item_length = r.read_u16()? as usize;
+        let item_start = r.pos;
+
+        if item_length >= 9 {
+            // clip_id: 5 ASCII bytes + codec_id: 4 bytes
+            let clip_id_bytes = r.read_bytes(5)?;
+            clip_ids.push(String::from_utf8_lossy(clip_id_bytes).into_owned());
+        }
+
+        // Skip remaining bytes in this sub-play item
+        let consumed = r.pos - item_start;
+        if consumed < item_length {
+            r.skip(item_length - consumed)?;
+        }
+    }
+
+    // Skip any remaining bytes in this sub-path
+    let total_consumed = r.pos - sub_path_start;
+    if total_consumed < sub_path_length {
+        r.skip(sub_path_length - total_consumed)?;
+    }
+
+    Ok(clip_ids)
 }
 
 /// Parses the STN (Stream Number Table) from the current reader position.

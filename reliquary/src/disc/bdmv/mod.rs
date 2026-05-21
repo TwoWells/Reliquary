@@ -141,6 +141,13 @@ pub struct BdmvAnalysis {
     /// Empty if `index.bdmv` is missing or could not be parsed.
     #[serde(skip_serializing_if = "HashSet::is_empty")]
     pub title_playlists: HashSet<u32>,
+    /// Maps IG clip IDs to their video background clip IDs.
+    ///
+    /// Built from MPLS sub-paths: when a playlist has a sub-path
+    /// referencing an IG clip, the main play item's clip provides
+    /// the video background for the IG overlay.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub ig_video_clips: HashMap<String, String>,
 }
 
 /// Clip with IG streams — a menu clip for `identify`.
@@ -511,6 +518,9 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
     // typically the looping playlists that content filtering removes.
     let menu_playlists = find_menu_playlists(&all_playlists, &ig_clips);
 
+    // Map IG clips to their video background clips via MPLS sub-paths.
+    let ig_video_clips = map_ig_to_video_clips(&all_playlists, &ig_clips);
+
     // Resolve title table from index.bdmv + MovieObject.bdmv
     let title_playlists = resolve_title_table(reader);
 
@@ -523,6 +533,7 @@ pub fn analyze(reader: &DiscReader) -> Result<BdmvAnalysis, BdmvError> {
         warnings,
         clip_warnings,
         title_playlists,
+        ig_video_clips,
     })
 }
 
@@ -686,6 +697,104 @@ fn find_menu_playlists(playlists: &[Playlist], ig_clips: &[IgClip]) -> Vec<u32> 
     menu_playlists.sort_unstable();
     menu_playlists.dedup();
     menu_playlists
+}
+
+/// Maps IG clip IDs to their video background clip IDs.
+///
+/// Uses two strategies:
+/// 1. **Sub-path association**: when a playlist has sub-path entries
+///    referencing an IG clip, the main play item's clip provides the
+///    video background.
+/// 2. **Looping playlist fallback**: when no sub-path references exist
+///    (WB authoring pattern), collects the first unique video clip from
+///    each looping playlist. These are assigned to all IG clips — a
+///    heuristic that works for WB discs where the looping playlists
+///    provide the menu background for unreferenced IG clips.
+fn map_ig_to_video_clips(playlists: &[Playlist], ig_clips: &[IgClip]) -> HashMap<String, String> {
+    /// Maximum playlist duration (PTS ticks) for sub-path menu association.
+    /// Menu playlists are short (seconds); content playlists are long.
+    /// 60 seconds × 45 000 ticks/sec.
+    const MAX_MENU_PL_TICKS: u64 = 60 * 45_000;
+
+    let ig_clip_ids: HashSet<&str> = ig_clips.iter().map(|c| c.clip_id.as_str()).collect();
+    let mut mapping = HashMap::new();
+
+    // Strategy 1: sub-path association.
+    // Sort playlists by duration (shortest first) so short menu playlists
+    // are matched before feature-length content playlists. Only consider
+    // playlists under 60 seconds — anything longer is content, not a menu.
+    let mut sorted: Vec<&Playlist> = playlists.iter().collect();
+    sorted.sort_by_key(|pl| playlist_duration_ticks(pl));
+
+    for pl in &sorted {
+        if playlist_duration_ticks(pl) > MAX_MENU_PL_TICKS {
+            continue;
+        }
+
+        let sub_ig: Vec<&str> = pl
+            .sub_path_clip_ids
+            .iter()
+            .filter(|id| ig_clip_ids.contains(id.as_str()))
+            .map(String::as_str)
+            .collect();
+
+        if sub_ig.is_empty() {
+            continue;
+        }
+
+        let Some(video_clip) = pl.play_items.first().map(|item| &item.clip_id) else {
+            continue;
+        };
+
+        for ig_id in sub_ig {
+            mapping
+                .entry(ig_id.to_owned())
+                .or_insert_with(|| video_clip.clone());
+        }
+    }
+
+    if !mapping.is_empty() {
+        return mapping;
+    }
+
+    // Strategy 2: looping playlist fallback.
+    // Collect unique video clip IDs from looping playlists — these are
+    // the menu background clips. Map each IG clip to the first available
+    // video clip. Multiple IG clips may share the same video background
+    // (language variants of the same menu).
+    let mut menu_video_clips: Vec<String> = Vec::new();
+    let mut seen_clips = HashSet::new();
+    for pl in playlists {
+        if !is_looping(pl) {
+            continue;
+        }
+        if let Some(item) = pl.play_items.first()
+            && !ig_clip_ids.contains(item.clip_id.as_str())
+            && seen_clips.insert(item.clip_id.clone())
+        {
+            menu_video_clips.push(item.clip_id.clone());
+        }
+    }
+
+    // Assign video clips to IG clips. When there are fewer video clips
+    // than IG clips, reuse the first video clip as a default.
+    if let Some(default_video) = menu_video_clips.first().cloned() {
+        for ig_clip in ig_clips {
+            mapping
+                .entry(ig_clip.clip_id.clone())
+                .or_insert_with(|| default_video.clone());
+        }
+    }
+
+    mapping
+}
+
+/// Computes a playlist's total duration in PTS ticks from its play items.
+fn playlist_duration_ticks(pl: &Playlist) -> u64 {
+    pl.play_items
+        .iter()
+        .map(|item| u64::from(item.out_time.saturating_sub(item.in_time)))
+        .sum()
 }
 
 /// Resolves the title table from `index.bdmv` + `MovieObject.bdmv`.
@@ -1414,6 +1523,7 @@ mod tests {
             warnings: Vec::new(),
             clip_warnings: Vec::new(),
             title_playlists: HashSet::new(),
+            ig_video_clips: HashMap::new(),
         };
 
         let output = format!("{analysis}");
@@ -1467,6 +1577,7 @@ mod tests {
             }],
             clip_warnings: Vec::new(),
             title_playlists: HashSet::new(),
+            ig_video_clips: HashMap::new(),
         };
 
         let output = format!("{analysis}");

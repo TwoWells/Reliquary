@@ -63,6 +63,10 @@ enum Command {
         /// Dump MOBJ instruction trace for debugging GPR dispatch resolution.
         #[arg(long)]
         trace: bool,
+
+        /// Write composited page images as PPM files to the given directory.
+        #[arg(long)]
+        dump_pages: Option<PathBuf>,
     },
 
     /// Decrypt an AACS-encrypted Blu-ray disc or single clip.
@@ -106,6 +110,7 @@ fn main() -> ExitCode {
             json,
             no_images,
             trace,
+            dump_pages,
         } => run_identify(
             &path,
             vuk.as_deref(),
@@ -115,6 +120,7 @@ fn main() -> ExitCode {
             json,
             no_images,
             trace,
+            dump_pages.as_deref(),
         ),
         Command::Decrypt {
             path,
@@ -184,8 +190,17 @@ struct ExtractedButton {
     branch_opt: u8,
     /// Mark index or play item index (meaningful when `branch_opt > 0`).
     mark_or_pi: u32,
+    /// Index into the clips list (identifies the IG clip).
+    clip_index: usize,
+    /// Page ID within the clip.
+    page_id: u8,
     /// Button identifier from the IG data.
     button_id: u16,
+    /// Navigation breadcrumb — ordered steps from root to this button.
+    /// Empty for direct `PlayPl` buttons (single-step resolution).
+    breadcrumb: Vec<reliquary::disc::bdmv::mobj::BreadcrumbStep>,
+    /// `true` when the content is on a page not reachable from the root menu.
+    orphan: bool,
     /// Bitmap width in pixels.
     width: u16,
     /// Bitmap height in pixels.
@@ -204,6 +219,318 @@ struct NamedItem {
     mark_or_pi: u32,
     /// User-provided name (empty string means skipped).
     name: String,
+}
+
+// ── Page composition ─────────────────────────────────────────────────
+
+/// All decoded button bitmaps for one IG page, with positions and canvas size.
+///
+/// Used for full-page rendering: composite all buttons at their `(x, y)`
+/// coordinates onto a canvas at the composition window dimensions, then
+/// highlight the active button by overwriting its region with the selected-
+/// state bitmap.
+struct PageComposition {
+    /// Index into the clips list (matches [`ExtractedButton::clip_index`]).
+    clip_index: usize,
+    /// Page identifier.
+    page_id: u8,
+    /// Canvas width in pixels (from the IG composition descriptor).
+    canvas_width: u16,
+    /// Canvas height in pixels.
+    canvas_height: u16,
+    /// Decoded button bitmaps with positions.
+    buttons: Vec<ButtonComposition>,
+}
+
+/// A single button's position and decoded bitmaps (both states).
+struct ButtonComposition {
+    /// Button identifier.
+    button_id: u16,
+    /// Horizontal position on the canvas.
+    x: u16,
+    /// Vertical position on the canvas.
+    y: u16,
+    /// Normal (unselected) state bitmap, if decodable.
+    normal: Option<reliquary::disc::bdmv::rle::Bitmap>,
+    /// Selected (highlighted) state bitmap, if decodable.
+    selected: Option<reliquary::disc::bdmv::rle::Bitmap>,
+}
+
+/// Draws a colored border rectangle on an RGBA canvas.
+///
+/// Marks a button's region with a visible outline so the user can see
+/// which area of the page corresponds to a playlist, even when the
+/// button's selected-state bitmap is invisible or identical to normal.
+fn draw_highlight_border(
+    canvas: &mut [u8],
+    canvas_width: usize,
+    canvas_height: usize,
+    bx: usize,
+    by: usize,
+    bw: usize,
+    bh: usize,
+) {
+    const COLOR: [u8; 4] = [255, 50, 50, 255];
+    const THICKNESS: usize = 3;
+
+    let x_start = bx.saturating_sub(THICKNESS);
+    let x_end = (bx + bw + THICKNESS).min(canvas_width);
+
+    // Horizontal edges (top and bottom)
+    for t in 0..THICKNESS {
+        let top_y = by.saturating_sub(THICKNESS) + t;
+        let bot_y = by + bh + t;
+        for x in x_start..x_end {
+            if top_y < canvas_height {
+                let off = (top_y * canvas_width + x) * 4;
+                canvas[off..off + 4].copy_from_slice(&COLOR);
+            }
+            if bot_y < canvas_height {
+                let off = (bot_y * canvas_width + x) * 4;
+                canvas[off..off + 4].copy_from_slice(&COLOR);
+            }
+        }
+    }
+
+    // Vertical edges (left and right)
+    for y in by..(by + bh).min(canvas_height) {
+        for t in 0..THICKNESS {
+            let left_x = bx.saturating_sub(THICKNESS) + t;
+            let right_x = bx + bw + t;
+            if left_x < canvas_width {
+                let off = (y * canvas_width + left_x) * 4;
+                canvas[off..off + 4].copy_from_slice(&COLOR);
+            }
+            if right_x < canvas_width {
+                let off = (y * canvas_width + right_x) * 4;
+                canvas[off..off + 4].copy_from_slice(&COLOR);
+            }
+        }
+    }
+}
+
+/// Composites a full menu page into an RGBA canvas.
+///
+/// When a video `background` is provided, button bitmaps are alpha-composited
+/// on top of the decoded video frame — producing the same view a person sees
+/// on their TV. Without a background, transparent regions are left as black.
+///
+/// All buttons are rendered at their `(x, y)` positions in the normal state.
+/// If `highlight` is provided, that button is rendered in its selected state
+/// instead.
+fn composite_page(
+    page: &PageComposition,
+    highlight: Option<u16>,
+    background: Option<&[u8]>,
+) -> Vec<u8> {
+    let w = usize::from(page.canvas_width);
+    let h = usize::from(page.canvas_height);
+    let expected = w * h * 4;
+    let mut canvas = match background {
+        Some(bg) if bg.len() == expected => bg.to_vec(),
+        _ => vec![0u8; expected],
+    };
+
+    for btn in &page.buttons {
+        let use_selected = highlight == Some(btn.button_id);
+        let bitmap = if use_selected {
+            btn.selected.as_ref().or(btn.normal.as_ref())
+        } else {
+            btn.normal.as_ref().or(btn.selected.as_ref())
+        };
+        let Some(bmp) = bitmap else { continue };
+
+        let bx = usize::from(btn.x);
+        let by = usize::from(btn.y);
+        let bw = usize::from(bmp.width);
+        let bh = usize::from(bmp.height);
+
+        for row in 0..bh {
+            let dst_y = by + row;
+            if dst_y >= h {
+                break;
+            }
+            for col in 0..bw {
+                let dst_x = bx + col;
+                if dst_x >= w {
+                    break;
+                }
+                let src_off = (row * bw + col) * 4;
+                let dst_off = (dst_y * w + dst_x) * 4;
+                let alpha = bmp.data[src_off + 3];
+                if alpha > 0 {
+                    canvas[dst_off..dst_off + 4].copy_from_slice(&bmp.data[src_off..src_off + 4]);
+                }
+            }
+        }
+    }
+
+    canvas
+}
+
+/// Writes an RGBA canvas as a PPM file (RGB, no alpha).
+///
+/// PPM is a trivial image format that needs no external dependencies.
+/// The alpha channel is composited against black.
+/// Writes an RGBA canvas as a scaled-down PNG file.
+///
+/// Uses uncompressed DEFLATE stored blocks (no compression library
+/// needed). The canvas is scaled to `target_width` pixels wide
+/// (preserving aspect ratio) and alpha is composited against black.
+#[allow(clippy::print_stderr, reason = "CLI diagnostic output")]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "alpha-premultiply and dimension results fit target types"
+)]
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "inputs are non-negative (u8 * normalized alpha)"
+)]
+fn write_png(path: &std::path::Path, width: u16, height: u16, rgba: &[u8], target_width: usize) {
+    use std::io::Write;
+
+    let src_w = usize::from(width);
+    let src_h = usize::from(height);
+    let dst_w = target_width.min(src_w);
+    let dst_h = src_h * dst_w / src_w;
+
+    // Build filtered scanlines: filter byte (0 = None) + RGB per pixel
+    let row_bytes = 1 + dst_w * 3;
+    let mut raw = Vec::with_capacity(dst_h * row_bytes);
+    for row in 0..dst_h {
+        raw.push(0); // filter: None
+        for col in 0..dst_w {
+            let sx = col * src_w / dst_w;
+            let sy = row * src_h / dst_h;
+            let off = (sy * src_w + sx) * 4;
+            let a = f32::from(rgba[off + 3]) / 255.0;
+            raw.push((f32::from(rgba[off]) * a) as u8);
+            raw.push((f32::from(rgba[off + 1]) * a) as u8);
+            raw.push((f32::from(rgba[off + 2]) * a) as u8);
+        }
+    }
+
+    // DEFLATE stored blocks (uncompressed): split into <=65535 byte blocks
+    let mut deflate = Vec::new();
+    let chunks: Vec<&[u8]> = raw.chunks(65535).collect();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let last = u8::from(i + 1 == chunks.len());
+        deflate.push(last);
+        let len = chunk.len() as u16;
+        deflate.extend_from_slice(&len.to_le_bytes());
+        deflate.extend_from_slice(&(!len).to_le_bytes());
+        deflate.extend_from_slice(chunk);
+    }
+
+    // Adler-32 checksum of raw data
+    let mut s1: u32 = 1;
+    let mut s2: u32 = 0;
+    for &b in &raw {
+        s1 = (s1 + u32::from(b)) % 65521;
+        s2 = (s2 + s1) % 65521;
+    }
+    let adler = (s2 << 16) | s1;
+
+    // zlib wrapper: CMF + FLG + deflate + adler32
+    let mut zlib = vec![0x78, 0x01];
+    zlib.extend_from_slice(&deflate);
+    zlib.extend_from_slice(&adler.to_be_bytes());
+
+    let Ok(mut f) = std::fs::File::create(path) else {
+        eprintln!("warning: could not create {}", path.display());
+        return;
+    };
+
+    let png_crc = |tag: &[u8], data: &[u8]| -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in tag.iter().chain(data.iter()) {
+            let mut c = u32::from((crc ^ u32::from(b)) as u8);
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+            crc = c ^ (crc >> 8);
+        }
+        crc ^ 0xFFFF_FFFF
+    };
+
+    let png_chunk = |f: &mut std::fs::File,
+                     tag: &[u8; 4],
+                     data: &[u8],
+                     crc_fn: &dyn Fn(&[u8], &[u8]) -> u32| {
+        let _ = f.write_all(&(data.len() as u32).to_be_bytes());
+        let _ = f.write_all(tag);
+        let _ = f.write_all(data);
+        let _ = f.write_all(&crc_fn(tag, data).to_be_bytes());
+    };
+
+    // PNG signature
+    let _ = f.write_all(&[137, 80, 78, 71, 13, 10, 26, 10]);
+    // IHDR
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&(dst_w as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(dst_h as u32).to_be_bytes());
+    ihdr.push(8); // bit depth
+    ihdr.push(2); // color type: RGB
+    ihdr.extend_from_slice(&[0, 0, 0]); // compression, filter, interlace
+    png_chunk(&mut f, b"IHDR", &ihdr, &png_crc);
+    // IDAT
+    png_chunk(&mut f, b"IDAT", &zlib, &png_crc);
+    // IEND
+    png_chunk(&mut f, b"IEND", &[], &png_crc);
+}
+
+/// Dumps composited page images for all content buttons.
+///
+/// Writes one PPM per content button to `dir`, named by playlist number
+/// and breadcrumb step. Used for visual inspection of page composition.
+#[allow(clippy::print_stderr, reason = "CLI diagnostic output")]
+fn dump_page_images(
+    dir: &std::path::Path,
+    buttons: &[&ExtractedButton],
+    pages: &[PageComposition],
+    backgrounds: &HashMap<usize, Vec<u8>>,
+) {
+    let _ = std::fs::create_dir_all(dir);
+
+    for button in buttons {
+        let Some(playlist) = button.playlist else {
+            continue;
+        };
+
+        let steps = if button.breadcrumb.is_empty() {
+            vec![reliquary::disc::bdmv::mobj::BreadcrumbStep {
+                clip_index: button.clip_index,
+                page_id: button.page_id,
+                button_id: button.button_id,
+            }]
+        } else {
+            button.breadcrumb.clone()
+        };
+
+        for (i, step) in steps.iter().enumerate() {
+            if let Some(page) = pages
+                .iter()
+                .find(|p| p.clip_index == step.clip_index && p.page_id == step.page_id)
+            {
+                let bg = backgrounds.get(&page.clip_index).map(Vec::as_slice);
+                let canvas = composite_page(page, Some(step.button_id), bg);
+                let name = format!("pl{playlist:03}_step{i}_page{}.png", step.page_id);
+                write_png(
+                    &dir.join(name),
+                    page.canvas_width,
+                    page.canvas_height,
+                    &canvas,
+                    240,
+                );
+            }
+        }
+    }
+
+    eprintln!("wrote page images to {}", dir.display());
 }
 
 /// Runs the `identify` subcommand — full IG pipeline with interactive naming.
@@ -229,6 +556,7 @@ fn run_identify(
     json: bool,
     no_images: bool,
     trace: bool,
+    dump_pages: Option<&std::path::Path>,
 ) -> ExitCode {
     // Auto-disable images when stderr is not a terminal (images render to stderr)
     let no_images = no_images || !std::io::IsTerminal::is_terminal(&std::io::stderr());
@@ -278,13 +606,14 @@ fn run_identify(
         clip_summary.join(", ")
     );
 
-    let buttons = match extract_buttons(&reader, &analysis, vuk.as_ref(), trace) {
-        Ok(b) => b,
-        Err(msg) => {
-            eprintln!("error: {msg}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let (buttons, page_compositions, clip_backgrounds) =
+        match extract_buttons(&reader, &analysis, vuk.as_ref(), trace) {
+            Ok(b) => b,
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     // 5. Filter: content buttons (have PlayPl targeting a valid playlist)
     let valid_playlists: HashSet<u32> = analysis.playlists.iter().map(|p| p.number).collect();
@@ -303,8 +632,13 @@ fn run_identify(
     let use_title_filter = !title_playlists.is_empty();
 
     let content_buttons: Vec<&ExtractedButton> = {
-        let mut seen = HashSet::new();
-        buttons
+        // Sort candidates so execution-resolved buttons (with breadcrumbs)
+        // precede legacy-resolved ones (no breadcrumbs). Within each group
+        // preserve extraction order. This ensures the dedup picks the
+        // execution-resolved button — which has correct clip/page context
+        // and a navigation breadcrumb — over a legacy match that may be on
+        // a different clip with the wrong bitmap.
+        let mut candidates: Vec<&ExtractedButton> = buttons
             .iter()
             .filter(|b| {
                 b.playlist.is_some_and(|pl| {
@@ -312,8 +646,17 @@ fn run_identify(
                     valid_playlists.contains(&pl32)
                         && !composite_parents.contains(&pl32)
                         && (!use_title_filter || title_playlists.contains(&pl32))
-                        && seen.insert((pl, b.branch_opt, b.mark_or_pi))
                 })
+            })
+            .collect();
+        candidates.sort_by_key(|b| u8::from(b.breadcrumb.is_empty()));
+
+        let mut seen = HashSet::new();
+        candidates
+            .into_iter()
+            .filter(|b| {
+                b.playlist
+                    .is_some_and(|pl| seen.insert((pl, b.branch_opt, b.mark_or_pi)))
             })
             .collect()
     };
@@ -323,7 +666,12 @@ fn run_identify(
         content_buttons.len()
     );
 
-    // 6. Dump mode: output resolved mappings without interactive prompt
+    // 6. Dump page images (diagnostic)
+    if let Some(dir) = dump_pages {
+        dump_page_images(dir, &content_buttons, &page_compositions, &clip_backgrounds);
+    }
+
+    // 7. Dump mode: output resolved mappings without interactive prompt
     if dump {
         output_dump(path, &content_buttons, &analysis);
         return ExitCode::SUCCESS;
@@ -338,7 +686,13 @@ fn run_identify(
         eprintln!("{analysis}");
         prompt_fallback_buttons(&buttons, &analysis, no_images)
     } else {
-        prompt_content_buttons(&content_buttons, &analysis, no_images)
+        prompt_content_buttons(
+            &content_buttons,
+            &page_compositions,
+            &clip_backgrounds,
+            &analysis,
+            no_images,
+        )
     };
 
     // 8. Show partially used clips (summary after interactive prompt)
@@ -425,23 +779,52 @@ fn resolve_vuk_for_identify(
 /// Runs the full pipeline for each IG clip: read → demux → parse PES →
 /// parse IG segments → decode RLE bitmaps. Then resolves indirect
 /// button→playlist mappings via `MovieObject.bdmv` tracing.
+///
+/// Returns the extracted buttons, per-page composition data, and
+/// per-clip video background frames (decoded from the menu clip's
+/// video stream via `ffmpeg`). The backgrounds are keyed by clip
+/// index and used to composite IG overlays on the actual menu art.
 #[allow(clippy::print_stderr, reason = "CLI warning output")]
 #[allow(clippy::too_many_lines, reason = "per-clip trace adds lines")]
+#[allow(
+    clippy::type_complexity,
+    reason = "returns buttons + page compositions + video backgrounds together"
+)]
 fn extract_buttons(
     reader: &reliquary::disc::reader::DiscReader,
     analysis: &reliquary::disc::bdmv::BdmvAnalysis,
     vuk: Option<&[u8; 16]>,
     trace: bool,
-) -> Result<Vec<ExtractedButton>, String> {
+) -> Result<
+    (
+        Vec<ExtractedButton>,
+        Vec<PageComposition>,
+        HashMap<usize, Vec<u8>>,
+    ),
+    String,
+> {
     use reliquary::disc::bdmv::{ig, read_clip, rle, ts};
 
     use reliquary::disc::bdmv::mobj::PlayerContext;
 
+    /// Maximum video clip size to read for background extraction (50 MB).
+    /// Menu clips are short still-frames; anything larger is content.
+    const MAX_VIDEO_CLIP_SIZE: usize = 50 * 1024 * 1024;
+
     let mut buttons = Vec::new();
+    let mut page_compositions = Vec::new();
+    // Per-clip video background RGBA frames (clip_index → RGBA data)
+    let mut clip_backgrounds: HashMap<usize, Vec<u8>> = HashMap::new();
+    // Cache: video_clip_id → extracted RGBA frame (avoids re-reading/re-decoding)
+    let mut frame_cache: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     // Collect raw IG buttons with player context for legacy MOBJ resolution
     let mut ig_buttons: Vec<(ig::Button, PlayerContext)> = Vec::new();
     // Collect page structure per clip for execution-based resolution
     let mut clip_pages: Vec<(u16, Vec<ig::Page>)> = Vec::new();
+    // Track clip_index for breadcrumb matching (indexes into clip_pages)
+    let mut next_clip_index: usize = 0;
+    // Track whether ffmpeg was found (only warn once if missing)
+    let mut ffmpeg_warned = false;
 
     for ig_clip in &analysis.ig_clips {
         // Read clip (decrypting if VUK available)
@@ -483,41 +866,46 @@ fn extract_buttons(
             trace_ig_clip(&ig_clip.clip_id, &ig_stream);
         }
 
-        // Collect buttons from all display sets
-        for ds in &ig_stream.display_sets {
+        // Collect buttons from the first display set only. Language
+        // variants share identical button programs but have different
+        // bitmaps. Using the first display set matches what the resolver
+        // uses for page structure and avoids cross-language bitmap
+        // collisions when looking up buttons by (clip, page, button_id).
+        for ds in ig_stream.display_sets.iter().take(1) {
             let Some(palette) = ds.palettes.first() else {
                 continue;
             };
 
             for comp in &ds.compositions {
                 for page in &comp.pages {
+                    let mut btn_comps = Vec::new();
+
                     for button in &page.buttons {
-                        // Decode bitmap — prefer the selected (highlighted)
-                        // state. WB extras menus render text labels only in
-                        // the selected state; the normal state is a blank
-                        // rectangle.
-                        let obj = ds
+                        // Decode both bitmap states for page composition.
+                        let normal_bmp = ds
+                            .objects
+                            .iter()
+                            .find(|o| o.object_id == button.normal_object_id)
+                            .and_then(|o| rle::decode(o, palette).ok());
+                        let selected_bmp = ds
                             .objects
                             .iter()
                             .find(|o| o.object_id == button.selected_object_id)
-                            .or_else(|| {
-                                ds.objects
-                                    .iter()
-                                    .find(|o| o.object_id == button.normal_object_id)
-                            });
+                            .and_then(|o| rle::decode(o, palette).ok());
 
-                        let Some(obj) = obj else { continue };
+                        btn_comps.push(ButtonComposition {
+                            button_id: button.button_id,
+                            x: button.x,
+                            y: button.y,
+                            normal: normal_bmp,
+                            selected: selected_bmp,
+                        });
 
-                        let bitmap = match rle::decode(obj, palette) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                eprintln!(
-                                    "warning: RLE decode failed for object {}: {e}",
-                                    button.normal_object_id
-                                );
-                                continue;
-                            }
-                        };
+                        // For ExtractedButton, prefer selected state bitmap.
+                        let bitmap_ref = btn_comps
+                            .last()
+                            .and_then(|bc| bc.selected.as_ref().or(bc.normal.as_ref()));
+                        let Some(bitmap) = bitmap_ref else { continue };
 
                         // Find PlayPl command if any
                         let play_pl = button.commands.iter().find_map(|cmd| {
@@ -542,10 +930,14 @@ fn extract_buttons(
                             playlist,
                             branch_opt,
                             mark_or_pi,
+                            clip_index: next_clip_index,
+                            page_id: page.page_id,
                             button_id: button.button_id,
+                            breadcrumb: Vec::new(),
+                            orphan: false,
                             width: bitmap.width,
                             height: bitmap.height,
-                            rgba: bitmap.data,
+                            rgba: bitmap.data.clone(),
                         });
 
                         // Clone the IG button for MOBJ resolution (only if
@@ -568,9 +960,26 @@ fn extract_buttons(
                             ));
                         }
                     }
+
+                    page_compositions.push(PageComposition {
+                        clip_index: next_clip_index,
+                        page_id: page.page_id,
+                        canvas_width: comp.width,
+                        canvas_height: comp.height,
+                        buttons: btn_comps,
+                    });
                 }
             }
         }
+
+        // Extract video background for this clip. The IG clip only
+        // contains the overlay — the video background is in a separate
+        // clip identified by the MPLS sub-path mapping.
+        let canvas_dims = ig_stream
+            .display_sets
+            .first()
+            .and_then(|ds| ds.compositions.first())
+            .map(|c| (c.width, c.height));
 
         // Collect pages for execution-based resolution (one copy per clip,
         // using the first display set's compositions — language variants
@@ -583,7 +992,43 @@ fn extract_buttons(
             .flat_map(|c| c.pages)
             .collect();
         if !pages.is_empty() {
+            if let Some((w, h)) = canvas_dims {
+                // Look up the video clip for this IG clip via sub-path mapping.
+                // If no mapping exists, try the IG clip itself (some discs
+                // bundle video and IG in the same clip).
+                let video_clip_id = analysis
+                    .ig_video_clips
+                    .get(&ig_clip.clip_id)
+                    .map_or_else(|| ig_clip.clip_id.clone(), Clone::clone);
+
+                // Use cached frame if we've already processed this video clip.
+                let frame = frame_cache.entry(video_clip_id.clone()).or_insert_with(|| {
+                    let clip_data = if video_clip_id == ig_clip.clip_id {
+                        if data.len() <= MAX_VIDEO_CLIP_SIZE {
+                            Some(data.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        read_clip(reader, vuk, &video_clip_id)
+                            .ok()
+                            .filter(|d| d.len() <= MAX_VIDEO_CLIP_SIZE)
+                    };
+                    clip_data.and_then(|d| extract_video_frame(&d, w, h))
+                });
+
+                if let Some(bg) = frame {
+                    clip_backgrounds.insert(next_clip_index, bg.clone());
+                } else if !ffmpeg_warned {
+                    eprintln!(
+                        "note: could not extract video background \
+                         (is ffmpeg installed?)"
+                    );
+                    ffmpeg_warned = true;
+                }
+            }
             clip_pages.push((ig_pid, pages));
+            next_clip_index += 1;
         }
     }
 
@@ -601,7 +1046,7 @@ fn extract_buttons(
         );
     }
 
-    Ok(buttons)
+    Ok((buttons, page_compositions, clip_backgrounds))
 }
 
 /// Resolves indirect button→playlist mappings via `MovieObject.bdmv`.
@@ -610,6 +1055,10 @@ fn extract_buttons(
 /// as the primary strategy, with the legacy pattern-matching resolver as
 /// fallback for any buttons the executor doesn't resolve.
 #[allow(clippy::print_stderr, reason = "CLI status output")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "pipeline orchestration with two resolver passes"
+)]
 fn resolve_mobj_buttons(
     reader: &reliquary::disc::reader::DiscReader,
     ig_buttons: &[(
@@ -697,20 +1146,47 @@ fn resolve_mobj_buttons(
         );
     }
 
-    // Fill in execution-resolved playlists
-    for rb in &exec_resolved {
-        if let Some(eb) = buttons
-            .iter_mut()
-            .find(|b| b.button_id == rb.button_id && b.playlist.is_none())
-        {
-            eb.playlist = Some(rb.target.playlist);
-            eb.branch_opt = rb.target.branch_opt;
-            eb.mark_or_pi = rb.target.mark_or_pi;
+    // Fill in execution-resolved playlists. The last breadcrumb step
+    // identifies the content button by (clip_index, page_id, button_id);
+    // match it against the extracted buttons to fill in the playlist.
+    //
+    // Fallback: when the exact match fails (e.g. the navigation button
+    // that produced a dispatch composite has no bitmap), try any
+    // unresolved button on the same clip and page.
+    for rp in &exec_resolved {
+        let Some(content_step) = rp.breadcrumb.last() else {
+            continue;
+        };
+        let idx = buttons
+            .iter()
+            .position(|b| {
+                b.clip_index == content_step.clip_index
+                    && b.page_id == content_step.page_id
+                    && b.button_id == content_step.button_id
+                    && b.playlist.is_none()
+            })
+            .or_else(|| {
+                buttons.iter().position(|b| {
+                    b.clip_index == content_step.clip_index
+                        && b.page_id == content_step.page_id
+                        && b.playlist.is_none()
+                })
+            });
+        if let Some(i) = idx {
+            buttons[i].playlist = Some(rp.target.playlist);
+            buttons[i].branch_opt = rp.target.branch_opt;
+            buttons[i].mark_or_pi = rp.target.mark_or_pi;
+            buttons[i].breadcrumb.clone_from(&rp.breadcrumb);
+            buttons[i].orphan = rp.orphan;
         }
     }
 
     if trace && let Some(ref table) = dispatch_table {
         trace_execution_coverage(&exec_resolved, table, clip_pages);
+    }
+
+    if trace {
+        trace_direct_play_pl(buttons, &exec_resolved);
     }
 
     // Fallback: legacy pattern-matching resolver for any remaining buttons
@@ -749,6 +1225,7 @@ fn resolve_mobj_buttons(
 
 /// Dumps per-clip IG structure: display sets, pages, buttons, and commands.
 #[allow(clippy::print_stderr, reason = "diagnostic trace output")]
+#[allow(clippy::too_many_lines, reason = "diagnostic dump with position + command detail")]
 fn trace_ig_clip(clip_id: &str, ig_stream: &reliquary::disc::bdmv::ig::IgStream) {
     use reliquary::disc::bdmv::ig::NavigationCommand;
 
@@ -781,6 +1258,23 @@ fn trace_ig_clip(clip_id: &str, ig_stream: &reliquary::disc::bdmv::ig::IgStream)
                         })
                     })
                     .collect();
+
+                // Show button positions for spatial debugging
+                for b in &page.buttons {
+                    let cmd_label = if b.commands.is_empty() || b.commands.len() <= 2 && b.commands.iter().all(|c| {
+                        matches!(c, NavigationCommand::Other { opcode, .. } if opcode >> 24 == 0)
+                    }) {
+                        "NOP"
+                    } else if b.commands.iter().any(|c| matches!(c, NavigationCommand::PlayPl { .. })) {
+                        "PlayPl"
+                    } else {
+                        "nav"
+                    };
+                    eprintln!(
+                        "    btn[{:3}]@({:4},{:4}) {cmd_label}",
+                        b.button_id, b.x, b.y,
+                    );
+                }
 
                 if nav_buttons.is_empty() {
                     eprintln!(
@@ -1708,7 +2202,7 @@ fn trace_mobj0_database(mobj_file: &reliquary::disc::bdmv::mobj::MovieObjectFile
     reason = "reverse lookup with inventory collection is inherently long"
 )]
 fn trace_execution_coverage(
-    exec_resolved: &[reliquary::disc::bdmv::mobj::ResolvedButton],
+    exec_resolved: &[reliquary::disc::bdmv::mobj::ResolvedPlaylist],
     table: &reliquary::disc::bdmv::mobj::DispatchTable,
     clip_pages: &[(u16, Vec<reliquary::disc::bdmv::ig::Page>)],
 ) {
@@ -1725,11 +2219,17 @@ fn trace_execution_coverage(
     // Map resolved playlists to dispatch cases
     let mut resolved_cases = std::collections::HashSet::<u32>::new();
 
-    for rb in exec_resolved {
+    for rp in exec_resolved {
+        let btn_label = rp
+            .breadcrumb
+            .iter()
+            .map(|s| format!("{}", s.button_id))
+            .collect::<Vec<_>>()
+            .join("→");
         let case_match: Vec<u32> = table
             .cases
             .iter()
-            .filter(|(_, pl)| *pl == rb.target.playlist)
+            .filter(|(_, pl)| *pl == rp.target.playlist)
             .map(|(cv, _)| *cv)
             .collect();
         for &cv in &case_match {
@@ -1737,14 +2237,14 @@ fn trace_execution_coverage(
         }
         if case_match.is_empty() {
             eprintln!(
-                "  resolved: pl {:3} (btn[{}]) — not in dispatch table",
-                rb.target.playlist, rb.button_id
+                "  resolved: pl {:3} (btn[{btn_label}]) — not in dispatch table",
+                rp.target.playlist,
             );
         } else {
             for cv in &case_match {
                 eprintln!(
-                    "  resolved: case {:3} -> pl {:3} (btn[{}])",
-                    cv, rb.target.playlist, rb.button_id
+                    "  resolved: case {:3} -> pl {:3} (btn[{btn_label}])",
+                    cv, rp.target.playlist,
                 );
             }
         }
@@ -1889,70 +2389,247 @@ fn trace_execution_coverage(
     eprintln!("=== END EXECUTION COVERAGE ===\n");
 }
 
-/// Presents content buttons (with `PlayPl`) and prompts for names.
+/// Traces direct `PlayPl` buttons — those resolved by the IG parser, not
+/// the BFS executor.
+///
+/// Shows which clip each direct `PlayPl` button lives on and whether the
+/// execution resolver also covers that playlist. Buttons on non-navigable
+/// clips (pop-up menus) show bitmaps from the wrong context; playlists
+/// only reachable via direct `PlayPl` on a pop-up clip may be missing
+/// from the main menu's navigation graph entirely.
+#[allow(clippy::print_stderr, reason = "diagnostic trace output")]
+fn trace_direct_play_pl(
+    buttons: &[ExtractedButton],
+    exec_resolved: &[reliquary::disc::bdmv::mobj::ResolvedPlaylist],
+) {
+    let direct: Vec<&ExtractedButton> = buttons
+        .iter()
+        .filter(|b| b.playlist.is_some() && b.breadcrumb.is_empty() && !b.orphan)
+        .collect();
+
+    if direct.is_empty() {
+        return;
+    }
+
+    let exec_playlists: std::collections::HashSet<u16> =
+        exec_resolved.iter().map(|rp| rp.target.playlist).collect();
+
+    eprintln!("\n=== DIRECT PlayPl BUTTONS ===");
+    eprintln!(
+        "{} buttons with inline PlayPl (no breadcrumb, not orphan):",
+        direct.len()
+    );
+
+    // Group by clip_index for readability
+    let mut by_clip = std::collections::BTreeMap::<usize, Vec<&ExtractedButton>>::new();
+    for b in &direct {
+        by_clip.entry(b.clip_index).or_default().push(b);
+    }
+
+    for (clip_idx, clip_buttons) in &by_clip {
+        eprintln!("  clip[{clip_idx}]:");
+        for b in clip_buttons {
+            let Some(pl) = b.playlist else {
+                continue;
+            };
+            let also_exec = if exec_playlists.contains(&pl) {
+                " (also resolved via execution)"
+            } else {
+                " (UNIQUE — not in execution results)"
+            };
+            let variant = match b.branch_opt {
+                1 => format!(" @mark {}", b.mark_or_pi),
+                2 => format!(" @PI {}", b.mark_or_pi),
+                _ => String::new(),
+            };
+            eprintln!(
+                "    btn[{:3}] page={} -> PL {:3}{variant}{also_exec}",
+                b.button_id, b.page_id, pl,
+            );
+        }
+    }
+
+    eprintln!("=== END DIRECT PlayPl ===\n");
+}
+
+/// Returns the leaf page key for a content button.
+///
+/// The leaf page is where the content button lives — the last breadcrumb
+/// step's page, or the button's own page if no breadcrumb exists.
+fn leaf_page(button: &ExtractedButton) -> (usize, u8) {
+    button
+        .breadcrumb
+        .last()
+        .map_or((button.clip_index, button.page_id), |step| {
+            (step.clip_index, step.page_id)
+        })
+}
+
+/// Presents content buttons grouped by menu page.
+///
+/// For each unique page that contains content buttons:
+/// 1. Renders the full page (video background + IG overlay, no highlight)
+///    so the user sees all labels and thumbnails at once.
+/// 2. For each content button on that page, renders the page again with
+///    that button highlighted and prompts for a name.
+///
+/// Pages are sorted so sub-pages (with visible button highlights) appear
+/// before the main menu page. Orphan content appears last.
 #[allow(clippy::print_stderr, reason = "CLI interactive output")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "page-grouped rendering with overview + per-item highlights"
+)]
 fn prompt_content_buttons(
     buttons: &[&ExtractedButton],
+    pages: &[PageComposition],
+    backgrounds: &HashMap<usize, Vec<u8>>,
     analysis: &reliquary::disc::bdmv::BdmvAnalysis,
     no_images: bool,
 ) -> Vec<NamedItem> {
     let mut items = Vec::new();
     let stdin = std::io::stdin();
 
-    for button in buttons {
-        let Some(playlist) = button.playlist else {
-            continue;
-        };
+    // Group content buttons by their leaf page (clip_index, page_id).
+    let mut groups: HashMap<(usize, u8), Vec<&ExtractedButton>> = HashMap::new();
+    for &button in buttons {
+        groups.entry(leaf_page(button)).or_default().push(button);
+    }
 
-        // Look up playlist metadata
-        let pl_info = analysis
-            .playlists
+    // Sort groups: deeper sub-pages first (more likely to have visible
+    // button highlights), orphans last.
+    let mut sorted: Vec<((usize, u8), Vec<&ExtractedButton>)> = groups.into_iter().collect();
+    sorted.sort_by(|ga, gb| {
+        let a_orphan = ga.1.first().is_some_and(|btn| btn.orphan);
+        let b_orphan = gb.1.first().is_some_and(|btn| btn.orphan);
+        let a_depth = ga.1.first().map_or(0, |btn| btn.breadcrumb.len());
+        let b_depth = gb.1.first().map_or(0, |btn| btn.breadcrumb.len());
+        a_orphan
+            .cmp(&b_orphan)
+            .then_with(|| b_depth.cmp(&a_depth))
+            .then_with(|| ga.0.cmp(&gb.0))
+    });
+
+    let multiple_clips = sorted
+        .iter()
+        .map(|(key, _)| key.0)
+        .collect::<HashSet<_>>()
+        .len()
+        > 1;
+
+    for ((clip_index, page_id), group_buttons) in &sorted {
+        // Find the page composition for this group
+        let page = pages
             .iter()
-            .find(|p| p.number == u32::from(playlist));
+            .find(|p| p.clip_index == *clip_index && p.page_id == *page_id);
 
-        // Print playlist metadata with PlayPl variant info
-        let variant_suffix = match button.branch_opt {
-            1 => format!(" @mark {}", button.mark_or_pi),
-            2 => format!(" @PI {}", button.mark_or_pi),
-            _ => String::new(),
+        // Page header
+        let orphan_label = if group_buttons.first().is_some_and(|btn| btn.orphan) {
+            " [orphan]"
+        } else {
+            ""
         };
-
-        if let Some(info) = pl_info {
-            let duration = format_identify_duration(info.duration);
-            let streams = format_identify_streams(&info.streams);
+        if multiple_clips {
             eprintln!(
-                "Playlist {playlist:03}{variant_suffix}: {duration}  {streams}  {} ch",
-                info.chapters
+                "── clip {clip_index} page {page_id}{orphan_label} ({} items) ──",
+                group_buttons.len()
             );
         } else {
-            eprintln!("Playlist {playlist:03}{variant_suffix}:");
+            eprintln!(
+                "── page {page_id}{orphan_label} ({} items) ──",
+                group_buttons.len()
+            );
         }
 
-        // Render bitmap
-        if !no_images {
-            render_bitmap(button.width, button.height, &button.rgba);
+        // Render page overview (no highlight) — shows all labels/thumbnails
+        if !no_images && let Some(p) = page {
+            let bg = backgrounds.get(&p.clip_index).map(Vec::as_slice);
+            let canvas = composite_page(p, None, bg);
+            render_bitmap(p.canvas_width, p.canvas_height, &canvas);
         }
-
-        // Prompt for name
-        eprint!("  Name: ");
-        let mut name = String::new();
-        if stdin.read_line(&mut name).is_err() {
-            break;
-        }
-        let name = name.trim().to_string();
-
-        if name == "q" {
-            break;
-        }
-
-        items.push(NamedItem {
-            playlist,
-            branch_opt: button.branch_opt,
-            mark_or_pi: button.mark_or_pi,
-            name,
-        });
-
         eprintln!();
+
+        // Each content button with its own highlighted image
+        for button in group_buttons {
+            let Some(playlist) = button.playlist else {
+                continue;
+            };
+
+            let pl_info = analysis
+                .playlists
+                .iter()
+                .find(|p| p.number == u32::from(playlist));
+
+            let variant_suffix = match button.branch_opt {
+                1 => format!(" @mark {}", button.mark_or_pi),
+                2 => format!(" @PI {}", button.mark_or_pi),
+                _ => String::new(),
+            };
+
+            if let Some(info) = pl_info {
+                let duration = format_identify_duration(info.duration);
+                let streams = format_identify_streams(&info.streams);
+                eprintln!(
+                    "  Playlist {playlist:03}{variant_suffix}: {duration}  {streams}  {} ch",
+                    info.chapters
+                );
+            } else {
+                eprintln!("  Playlist {playlist:03}{variant_suffix}:");
+            }
+
+            // Render page with this button highlighted + border
+            if !no_images && let Some(p) = page {
+                let highlight_id = button
+                    .breadcrumb
+                    .last()
+                    .map_or(button.button_id, |s| s.button_id);
+                let bg = backgrounds.get(&p.clip_index).map(Vec::as_slice);
+                let mut canvas = composite_page(p, Some(highlight_id), bg);
+
+                // Draw a visible border so the user can locate the button
+                // even when the selected-state bitmap is invisible.
+                if let Some(btn_comp) = p.buttons.iter().find(|b| b.button_id == highlight_id) {
+                    let bmp = btn_comp
+                        .selected
+                        .as_ref()
+                        .or(btn_comp.normal.as_ref());
+                    if let Some(bmp) = bmp {
+                        draw_highlight_border(
+                            &mut canvas,
+                            usize::from(p.canvas_width),
+                            usize::from(p.canvas_height),
+                            usize::from(btn_comp.x),
+                            usize::from(btn_comp.y),
+                            usize::from(bmp.width),
+                            usize::from(bmp.height),
+                        );
+                    }
+                }
+
+                render_bitmap(p.canvas_width, p.canvas_height, &canvas);
+            }
+
+            // Prompt for name
+            eprint!("  Name: ");
+            let mut name = String::new();
+            if stdin.read_line(&mut name).is_err() {
+                return items;
+            }
+            let name = name.trim().to_string();
+
+            if name == "q" {
+                return items;
+            }
+
+            items.push(NamedItem {
+                playlist,
+                branch_opt: button.branch_opt,
+                mark_or_pi: button.mark_or_pi,
+                name,
+            });
+
+            eprintln!();
+        }
     }
 
     items
@@ -2026,6 +2703,94 @@ fn prompt_fallback_buttons(
     items
 }
 
+// ── Video background extraction ──────────────────────────────────────
+
+/// Extracts the first video frame from an m2ts clip as RGBA pixel data.
+///
+/// Uses `ffmpeg` to decode one video frame, scaled to the given dimensions.
+/// Returns `None` if `ffmpeg` is not available or frame extraction fails.
+/// Callers fall back to a black background (the pre-existing behavior).
+#[allow(clippy::print_stderr, reason = "CLI diagnostic output")]
+fn extract_video_frame(clip_data: &[u8], width: u16, height: u16) -> Option<Vec<u8>> {
+    use std::io::Write;
+
+    // Use ~/tmp if it exists (avoids tmpfs/ramdisk pressure for large clips),
+    // otherwise fall back to the system temp directory.
+    let temp_dir = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join("tmp"))
+        .filter(|d| d.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let temp_path = temp_dir.join(format!("reliquary_menu_{}.m2ts", std::process::id()));
+
+    std::fs::File::create(&temp_path)
+        .and_then(|mut f| f.write_all(clip_data))
+        .ok()?;
+
+    let output = std::process::Command::new("ffmpeg")
+        .arg("-v")
+        .arg("quiet")
+        .arg("-i")
+        .arg(&temp_path)
+        .arg("-vframes")
+        .arg("1")
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pix_fmt")
+        .arg("rgba")
+        .arg("-s")
+        .arg(format!("{width}x{height}"))
+        .arg("pipe:1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok();
+
+    let _ = std::fs::remove_file(&temp_path);
+
+    let output = output?;
+    let expected = usize::from(width) * usize::from(height) * 4;
+    if output.status.success() && output.stdout.len() == expected {
+        Some(output.stdout)
+    } else {
+        None
+    }
+}
+
+// ── Image scaling ────────────────────────────────────────────────────
+
+/// Scales an RGBA canvas to fit within `max_width` pixels, preserving
+/// aspect ratio via nearest-neighbor sampling.
+///
+/// Returns the original data unchanged if already within bounds.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "scaled dimensions are bounded by max_width which fits u16"
+)]
+fn scale_canvas(width: u16, height: u16, rgba: &[u8], max_width: usize) -> (u16, u16, Vec<u8>) {
+    let w = usize::from(width);
+    let h = usize::from(height);
+
+    if w <= max_width {
+        return (width, height, rgba.to_vec());
+    }
+
+    let new_w = max_width;
+    let new_h = (h * new_w / w).max(1);
+
+    let mut scaled = Vec::with_capacity(new_w * new_h * 4);
+    for row in 0..new_h {
+        for col in 0..new_w {
+            let src_x = (col * w / new_w).min(w - 1);
+            let src_y = (row * h / new_h).min(h - 1);
+            let off = (src_y * w + src_x) * 4;
+            scaled.extend_from_slice(&rgba[off..off + 4]);
+        }
+    }
+
+    (new_w as u16, new_h as u16, scaled)
+}
+
 // ── Terminal image rendering ───────────────────────────────────────────
 
 /// Graphics protocol for inline image rendering.
@@ -2078,12 +2843,23 @@ fn detect_graphics_protocol() -> GraphicsProtocol {
 /// Renders an RGBA bitmap inline in the terminal.
 ///
 /// Auto-detects the terminal graphics protocol and uses the best
-/// available: Kitty > Sixel > halfblock.
+/// available: Kitty > Sixel > halfblock. Pre-scales the image to
+/// fit within the terminal width for pixel-based protocols.
 #[allow(clippy::print_stderr, reason = "CLI bitmap rendering")]
 fn render_bitmap(width: u16, height: u16, rgba: &[u8]) {
-    match detect_graphics_protocol() {
-        GraphicsProtocol::Kitty => render_kitty(width, height, rgba),
-        GraphicsProtocol::Sixel => render_sixel(width, height, rgba),
+    let protocol = detect_graphics_protocol();
+    match protocol {
+        GraphicsProtocol::Kitty | GraphicsProtocol::Sixel => {
+            // Scale to fit terminal: approximate cell width of 8 pixels,
+            // capped at 960px to keep data transfer reasonable.
+            let max_w = (terminal_columns() * 8).min(960);
+            let (sw, sh, scaled) = scale_canvas(width, height, rgba, max_w);
+            if matches!(protocol, GraphicsProtocol::Kitty) {
+                render_kitty(sw, sh, &scaled);
+            } else {
+                render_sixel(sw, sh, &scaled);
+            }
+        }
         GraphicsProtocol::Halfblock => render_halfblock(width, height, rgba),
     }
 }
@@ -2093,9 +2869,11 @@ fn render_bitmap(width: u16, height: u16, rgba: &[u8]) {
 /// Renders via the Kitty graphics protocol (APC escape sequences).
 ///
 /// Sends raw RGBA data base64-encoded. Chunks at 4096 bytes to stay
-/// within protocol limits.
+/// within protocol limits. Uses the `c=` placement parameter to
+/// constrain the image to the terminal width.
 #[allow(clippy::print_stderr, reason = "CLI bitmap rendering")]
 fn render_kitty(width: u16, height: u16, rgba: &[u8]) {
+    let cols = terminal_columns();
     let encoded = base64_encode(rgba);
     let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(4096).collect();
 
@@ -2103,7 +2881,7 @@ fn render_kitty(width: u16, height: u16, rgba: &[u8]) {
         let more = u8::from(i < chunks.len() - 1);
         let chunk_str = std::str::from_utf8(chunk).unwrap_or("");
         if i == 0 {
-            eprint!("\x1b_Gf=32,s={width},v={height},a=T,m={more};{chunk_str}\x1b\\");
+            eprint!("\x1b_Gf=32,s={width},v={height},a=T,c={cols},m={more};{chunk_str}\x1b\\");
         } else {
             eprint!("\x1b_Gm={more};{chunk_str}\x1b\\");
         }
@@ -2433,9 +3211,22 @@ fn output_dump(
         .iter()
         .filter_map(|b| {
             let pl = b.playlist?;
+            let breadcrumb_json: Vec<serde_json::Value> = b
+                .breadcrumb
+                .iter()
+                .map(|step| {
+                    serde_json::json!({
+                        "clip": step.clip_index,
+                        "page": step.page_id,
+                        "button": step.button_id,
+                    })
+                })
+                .collect();
             let mut entry = serde_json::json!({
                 "playlist": pl,
                 "button_id": b.button_id,
+                "breadcrumb": breadcrumb_json,
+                "orphan": b.orphan,
             });
 
             if b.branch_opt != 0 {
@@ -3386,7 +4177,11 @@ mod tests {
                 branch_opt: 0,
                 mark_or_pi: 0,
                 playlist: Some(203),
+                clip_index: 0,
+                page_id: 0,
                 button_id: 1,
+                breadcrumb: Vec::new(),
+                orphan: false,
                 width: 2,
                 height: 1,
                 rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
@@ -3395,7 +4190,11 @@ mod tests {
                 branch_opt: 0,
                 mark_or_pi: 0,
                 playlist: Some(203), // duplicate playlist
+                clip_index: 0,
+                page_id: 0,
                 button_id: 2,
+                breadcrumb: Vec::new(),
+                orphan: false,
                 width: 2,
                 height: 1,
                 rgba: vec![0, 0, 255, 255, 255, 255, 0, 255],
@@ -3404,7 +4203,11 @@ mod tests {
                 branch_opt: 0,
                 mark_or_pi: 0,
                 playlist: Some(204),
+                clip_index: 0,
+                page_id: 0,
                 button_id: 3,
+                breadcrumb: Vec::new(),
+                orphan: false,
                 width: 2,
                 height: 1,
                 rgba: vec![0, 0, 0, 255, 255, 255, 255, 255],
@@ -3444,7 +4247,11 @@ mod tests {
                 branch_opt: 0,
                 mark_or_pi: 0,
                 playlist: Some(203),
+                clip_index: 0,
+                page_id: 0,
                 button_id: 1,
+                breadcrumb: Vec::new(),
+                orphan: false,
                 width: 1,
                 height: 1,
                 rgba: vec![0, 0, 0, 255],
@@ -3453,7 +4260,11 @@ mod tests {
                 branch_opt: 0,
                 mark_or_pi: 0,
                 playlist: Some(999), // not in valid set
+                clip_index: 0,
+                page_id: 0,
                 button_id: 2,
+                breadcrumb: Vec::new(),
+                orphan: false,
                 width: 1,
                 height: 1,
                 rgba: vec![0, 0, 0, 255],
@@ -3462,7 +4273,11 @@ mod tests {
                 branch_opt: 0,
                 mark_or_pi: 0,
                 playlist: None, // no PlayPl
+                clip_index: 0,
+                page_id: 0,
                 button_id: 3,
+                breadcrumb: Vec::new(),
+                orphan: false,
                 width: 1,
                 height: 1,
                 rgba: vec![0, 0, 0, 255],
