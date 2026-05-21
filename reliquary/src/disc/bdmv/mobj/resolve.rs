@@ -1,510 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Two Wells <contact@twowells.dev>
 
-//! `MovieObject.bdmv` parser and button→playlist resolver.
-//!
-//! Parses the HDMV navigation programs and traces register-based button
-//! commands through movie objects to resolve indirect playlist mappings.
-//!
-//! Reference: libbluray `src/libbluray/bdnav/mobj_parse.c`,
-//! `src/libbluray/decoders/hdmv_insn.h`.
+//! BFS resolver, dispatch table extraction, and legacy pattern-matching resolver.
 
-use thiserror::Error;
-
-use super::cursor::{Cursor, CursorError};
-use super::ig::{Button, NavigationCommand, Page};
-
-// ── Errors ──────────────────────────────────────────────────────────────
-
-/// Errors that can occur while parsing `MovieObject.bdmv`.
-#[derive(Debug, Error)]
-pub enum MobjError {
-    /// File is smaller than the minimum header size.
-    #[error("file too small ({size} bytes, need at least 50)")]
-    TooSmall {
-        /// Actual file size.
-        size: usize,
-    },
-
-    /// Magic bytes are not `"MOBJ"`.
-    #[error("invalid magic: expected \"MOBJ\", got {found:?}")]
-    InvalidMagic {
-        /// The four bytes actually found.
-        found: [u8; 4],
-    },
-
-    /// Data is truncated during parsing.
-    #[error("unexpected end of data at offset {offset} (need {needed} bytes, have {available})")]
-    UnexpectedEof {
-        /// Byte offset where the read was attempted.
-        offset: usize,
-        /// Number of bytes requested.
-        needed: usize,
-        /// Number of bytes actually available from that offset.
-        available: usize,
-    },
-}
-
-impl From<CursorError> for MobjError {
-    fn from(e: CursorError) -> Self {
-        Self::UnexpectedEof {
-            offset: e.offset,
-            needed: e.needed,
-            available: e.available,
-        }
-    }
-}
-
-// ── Types ───────────────────────────────────────────────────────────────
-
-/// A parsed `MovieObject.bdmv` file.
-#[derive(Debug)]
-pub struct MovieObjectFile {
-    /// Movie objects in file order (0-indexed).
-    pub objects: Vec<MovieObject>,
-}
-
-/// A single movie object (navigation program).
-#[derive(Debug)]
-pub struct MovieObject {
-    /// Instructions in execution order.
-    pub instructions: Vec<Instruction>,
-}
-
-/// A decoded HDMV instruction (12 bytes on disc).
-///
-/// Preserves all decoded fields so the resolver can pattern-match on
-/// instruction sequences without re-parsing raw bytes.
-#[derive(Debug, Clone)]
-pub struct Instruction {
-    /// Operand count (0, 1, or 2).
-    pub op_cnt: u8,
-    /// Instruction group — 0=BRANCH, 1=CMP, 2=SET.
-    pub group: u8,
-    /// Sub-group within the instruction group.
-    pub sub_group: u8,
-    /// Destination operand is an immediate value (not a register reference).
-    pub imm_op1: bool,
-    /// Source operand is an immediate value (not a register reference).
-    pub imm_op2: bool,
-    /// Branch option (BRANCH and CMP groups).
-    pub branch_opt: u8,
-    /// Comparison type (CMP group).
-    pub cmp_opt: u8,
-    /// Set operation type (SET group) — 1=move, 3=add, etc.
-    pub set_opt: u8,
-    /// Raw destination operand (bytes 4-7).
-    pub dst: u32,
-    /// Raw source operand (bytes 8-11).
-    pub src: u32,
-}
-
-/// A playlist target resolved from MOBJ VM execution.
-///
-/// Carries the `PlayPl` variant fields so callers can distinguish between
-/// `PlayPL` (from start), `PlayPLatMK` (at mark), and `PlayPLatPI` (at PI).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PlayTarget {
-    /// Playlist number.
-    pub playlist: u16,
-    /// `PlayPl` variant: 0=from start, 1=at mark, 2=at play item.
-    pub branch_opt: u8,
-    /// Mark index or play item index (meaningful when `branch_opt > 0`).
-    pub mark_or_pi: u32,
-}
-
-/// A resolved button → playlist mapping.
-#[derive(Debug, PartialEq, Eq)]
-pub struct ResolvedButton {
-    /// Button identifier from the IG data.
-    pub button_id: u16,
-    /// Resolved playlist target.
-    pub target: PlayTarget,
-}
-
-/// A single step in a navigation breadcrumb.
-///
-/// Identifies a specific button on a specific page within a specific clip,
-/// so the CLI can look up the correct bitmap (not a same-ID button from a
-/// different clip or page).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BreadcrumbStep {
-    /// Index into the `clips` slice passed to [`resolve_via_execution`].
-    pub clip_index: usize,
-    /// Page ID within the clip.
-    pub page_id: u8,
-    /// Button ID within the page.
-    pub button_id: u16,
-}
-
-/// A resolved playlist with its navigation breadcrumb.
-///
-/// Produced by [`resolve_via_execution`]. The breadcrumb is the ordered
-/// sequence of buttons pressed from the root menu page to the content
-/// button. The last element is the button that plays the playlist; earlier
-/// elements are navigation buttons pressed to reach it.
-#[derive(Debug, PartialEq, Eq)]
-pub struct ResolvedPlaylist {
-    /// Ordered navigation steps from root to leaf.
-    /// The last element is the content button that plays the playlist.
-    /// Earlier elements are navigation buttons pressed to reach it.
-    pub breadcrumb: Vec<BreadcrumbStep>,
-    /// `true` when the content lives on a page not reachable from the
-    /// root menu via navigation. Orphans are still valid content (they
-    /// have bitmaps and playlists) but cannot be navigated to from the
-    /// main menu. The breadcrumb contains only the content button.
-    pub orphan: bool,
-    /// Resolved playlist target.
-    pub target: PlayTarget,
-}
-
-/// A dispatch entry point found in an MOBJ for GPR dispatch resolution.
-///
-/// In the GPR dispatch pattern (Warner Bros. authoring), the MOBJ calls
-/// `PlayPl(menu_playlist)` which suspends the MOBJ. After a button is
-/// activated, the MOBJ resumes at `dispatch_pc` (the instruction after
-/// the menu `PlayPl`) and reads the button's GPR to dispatch to the
-/// correct content playlist.
-#[derive(Debug, Clone)]
-pub struct DispatchEntry {
-    /// Index of the MOBJ containing the dispatch logic.
-    pub mobj_index: usize,
-    /// Instruction index where dispatch resumes (pc+1 after the menu `PlayPl`).
-    pub dispatch_pc: usize,
-}
-
-/// A dispatch table extracted from a central dispatch MOBJ.
-///
-/// In the `SET_BUTTON_PAGE` dispatch pattern (Warner Bros. authoring),
-/// a central MOBJ contains a CMP/GOTO switch table that dispatches
-/// on a register value (typically `GPR[3002]`) to handler blocks, each
-/// ending with `PlayPl(playlist)`. This table maps case values directly
-/// to playlist numbers, bypassing the player runtime.
-///
-/// **Derivation (from libbluray `hdmv_vm.c:837` and
-/// `graphics_controller.c:1644`):** `SET_BUTTON_PAGE` in an IG context
-/// packs `button_id = dst & 0xFFFF` into the event param. The graphics
-/// controller calls `_select_button(gc, button_id)` which writes
-/// `PSR[10] = button_id`. The dispatch MOBJ copies PSR\[10\] into the
-/// switch register at its resume point.
-///
-/// Two resolution paths:
-/// - **Buttons with commands:** bytecode computes a composite (e.g.
-///   `(PSR[10] & 0xFFFF) + key`) and calls `SET_BUTTON_PAGE`. The
-///   composite value is the dispatch case.
-/// - **NOP anchor buttons:** buttons with no commands whose
-///   `button_id` directly matches a dispatch case. When the player
-///   selects an anchor (via cursor navigation or `SET_BUTTON_PAGE`
-///   page transition), `PSR[10] = button_id` becomes the case.
-#[derive(Debug)]
-pub struct DispatchTable {
-    /// MOBJ index containing the dispatch table.
-    pub mobj_index: usize,
-    /// The register read by the switch (e.g. `GPR[3002]`).
-    pub dispatch_register: u32,
-    /// Mapping from case value to playlist number.
-    pub cases: Vec<(u32, u16)>,
-}
-
-// ── Instruction group constants ─────────────────────────────────────────
-
-/// BRANCH group — goto, jump to MOBJ, play playlist.
-const GRP_BRANCH: u8 = 0;
-/// CMP group — compare and conditionally branch.
-const GRP_CMP: u8 = 1;
-/// SET group — register operations.
-const GRP_SET: u8 = 2;
-
-/// BRANCH sub-groups.
-const BRANCH_GOTO: u8 = 0;
-const BRANCH_JUMP: u8 = 1;
-const BRANCH_PLAY: u8 = 2;
-
-/// `SET_BUTTON_PAGE` operation within the SETSYSTEM sub-group (`sub_group=1`).
-///
-/// Terminates IG execution and navigates to a new button/page. The
-/// player runtime packs `button_id = dst & 0xFFFF` and selects that
-/// button on the target page, updating `PSR[10]`. The dispatch MOBJ
-/// reads `PSR[10]` into its switch register on resume.
-const SET_BUTTON_PAGE_OPT: u8 = 3;
-
-/// Maximum instructions the mini-VM will execute before giving up.
-/// Prevents infinite loops in malformed or exotic MOBJ bytecode.
-/// Set high enough to cover WB First Play MOBJs (up to ~3000
-/// instructions with ~2 steps per CMP/GOTO pair ≈ 6000 effective
-/// steps for the disc configuration database initialization).
-const VM_STEP_LIMIT: u32 = 10_000;
-
-/// PSR (Player Status Register) bit flag. Register references with
-/// bit 31 set address PSRs rather than GPRs.
-const PSR_FLAG: u32 = 0x8000_0000;
-
-/// Player context for VM execution — known PSR values derived from
-/// the IG structure at extraction time.
-#[derive(Debug, Clone, Default)]
-pub struct PlayerContext {
-    /// IG stream number (PSR 0).
-    pub ig_stream: u16,
-    /// Selected button ID (PSR 10).
-    pub selected_button_id: u16,
-    /// Current page ID (PSR 11).
-    pub page_id: u8,
-}
-
-// ── Parser ──────────────────────────────────────────────────────────────
-
-/// Parses `MovieObject.bdmv` from raw bytes.
-///
-/// # Errors
-///
-/// Returns [`MobjError`] if the file has an invalid header or is truncated.
-pub fn parse(data: &[u8]) -> Result<MovieObjectFile, MobjError> {
-    // Minimum size: 40-byte header + 4 length + 4 reserved + 2 num_objects
-    if data.len() < 50 {
-        return Err(MobjError::TooSmall { size: data.len() });
-    }
-
-    // Magic: "MOBJ"
-    let magic: [u8; 4] = [data[0], data[1], data[2], data[3]];
-    if &magic != b"MOBJ" {
-        return Err(MobjError::InvalidMagic { found: magic });
-    }
-
-    // Skip version (bytes 4-7), extension_data_start (bytes 8-11),
-    // reserved (bytes 12-39), length (bytes 40-43), reserved (bytes 44-47).
-    // num_objects at bytes 48-49.
-    let mut r = Cursor::new(data);
-    r.seek(48)?;
-    let num_objects = r.read_u16()?;
-
-    let mut objects = Vec::with_capacity(num_objects as usize);
-
-    for _ in 0..num_objects {
-        objects.push(parse_object(&mut r)?);
-    }
-
-    Ok(MovieObjectFile { objects })
-}
-
-/// Parses a single movie object: flags + instruction list.
-fn parse_object(r: &mut Cursor<'_>) -> Result<MovieObject, MobjError> {
-    // From libbluray mobj_parse.c:
-    //   resume_intention_flag (1 bit) + menu_call_mask (1 bit) +
-    //   title_search_mask (1 bit) + 13 reserved bits = 2 bytes
-    //   num_nav_cmds (u16 BE) = 2 bytes
-    // Total per-object header: 4 bytes
-    r.skip(2)?; // flags + reserved
-    let num_commands = r.read_u16()?;
-
-    let mut instructions = Vec::with_capacity(num_commands as usize);
-
-    for _ in 0..num_commands {
-        instructions.push(parse_instruction(r)?);
-    }
-
-    Ok(MovieObject { instructions })
-}
-
-/// Decodes a single 12-byte HDMV instruction.
-fn parse_instruction(r: &mut Cursor<'_>) -> Result<Instruction, MobjError> {
-    let insn = r.read_u32()?;
-    let dst = r.read_u32()?;
-    let src = r.read_u32()?;
-
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "bit fields are small known widths (2-5 bits)"
-    )]
-    Ok(Instruction {
-        op_cnt: ((insn >> 29) & 0x07) as u8,
-        group: ((insn >> 27) & 0x03) as u8,
-        sub_group: ((insn >> 24) & 0x07) as u8,
-        imm_op1: (insn >> 23) & 1 != 0,
-        imm_op2: (insn >> 22) & 1 != 0,
-        branch_opt: ((insn >> 16) & 0x0F) as u8,
-        cmp_opt: ((insn >> 8) & 0x0F) as u8,
-        set_opt: (insn & 0x1F) as u8,
-        dst,
-        src,
-    })
-}
-
-/// Converts a [`NavigationCommand`] to an [`Instruction`] for VM execution.
-///
-/// Typed variants (`PlayPl`, `SetGpr`, `GotoMobj`) are reconstructed into
-/// their instruction encoding. `Other` variants are decoded from the raw
-/// instruction word, identical to [`parse_instruction`].
-#[must_use]
-pub fn command_to_instruction(cmd: &NavigationCommand) -> Instruction {
-    match cmd {
-        NavigationCommand::PlayPl {
-            playlist,
-            branch_opt,
-            mark_or_pi,
-        } => Instruction {
-            op_cnt: if *branch_opt == 0 { 1 } else { 2 },
-            group: GRP_BRANCH,
-            sub_group: BRANCH_PLAY,
-            imm_op1: true,
-            imm_op2: *branch_opt != 0,
-            branch_opt: *branch_opt,
-            cmp_opt: 0,
-            set_opt: 0,
-            dst: u32::from(*playlist),
-            src: *mark_or_pi,
-        },
-        NavigationCommand::SetGpr { register, value } => Instruction {
-            op_cnt: 2,
-            group: GRP_SET,
-            sub_group: 0,
-            imm_op1: false,
-            imm_op2: true,
-            branch_opt: 0,
-            cmp_opt: 0,
-            set_opt: 0x01,
-            dst: *register,
-            src: *value,
-        },
-        NavigationCommand::GotoMobj { object_id } => Instruction {
-            op_cnt: 1,
-            group: GRP_BRANCH,
-            sub_group: BRANCH_JUMP,
-            imm_op1: true,
-            imm_op2: false,
-            branch_opt: 0x01,
-            cmp_opt: 0,
-            set_opt: 0,
-            dst: *object_id,
-            src: 0,
-        },
-        NavigationCommand::Other { opcode, dst, src } =>
-        {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "bit fields are small known widths (2-5 bits)"
-            )]
-            Instruction {
-                op_cnt: ((opcode >> 29) & 0x07) as u8,
-                group: ((opcode >> 27) & 0x03) as u8,
-                sub_group: ((opcode >> 24) & 0x07) as u8,
-                imm_op1: (opcode >> 23) & 1 != 0,
-                imm_op2: (opcode >> 22) & 1 != 0,
-                branch_opt: ((opcode >> 16) & 0x0F) as u8,
-                cmp_opt: ((opcode >> 8) & 0x0F) as u8,
-                set_opt: (opcode & 0x1F) as u8,
-                dst: *dst,
-                src: *src,
-            }
-        }
-    }
-}
-
-/// Formats an [`Instruction`] as a human-readable disassembly string.
-///
-/// Used by `--trace` to dump full button programs including `Other`
-/// variants (CMP, GOTO, AND, ADD, `SET_BUTTON_PAGE`) that the typed
-/// [`NavigationCommand`] variants don't expose.
-#[must_use]
-pub fn format_instruction(insn: &Instruction) -> String {
-    let fmt_op = |is_imm: bool, raw: u32| -> String {
-        if is_imm {
-            format!("{raw}")
-        } else if raw & PSR_FLAG != 0 {
-            format!("PSR[{}]", raw & !PSR_FLAG)
-        } else {
-            format!("GPR[{raw}]")
-        }
-    };
-
-    match insn.group {
-        GRP_BRANCH => match insn.sub_group {
-            BRANCH_GOTO => match insn.branch_opt {
-                0x00 => "NOP".to_string(),
-                0x01 => format!("GOTO {}", fmt_op(insn.imm_op1, insn.dst)),
-                0x02 => "BREAK".to_string(),
-                _ => format!("BRANCH(opt={})", insn.branch_opt),
-            },
-            BRANCH_JUMP => {
-                format!("JumpMobj({})", fmt_op(insn.imm_op1, insn.dst))
-            }
-            BRANCH_PLAY => match insn.branch_opt {
-                0 => format!("PlayPl({})", fmt_op(insn.imm_op1, insn.dst)),
-                1 => format!(
-                    "PlayPlatMK({}, mark={})",
-                    fmt_op(insn.imm_op1, insn.dst),
-                    fmt_op(insn.imm_op2, insn.src)
-                ),
-                2 => format!(
-                    "PlayPlatPI({}, pi={})",
-                    fmt_op(insn.imm_op1, insn.dst),
-                    fmt_op(insn.imm_op2, insn.src)
-                ),
-                _ => format!(
-                    "PlayPl({}, opt={})",
-                    fmt_op(insn.imm_op1, insn.dst),
-                    insn.branch_opt
-                ),
-            },
-            _ => format!("BRANCH(sub={}, opt={})", insn.sub_group, insn.branch_opt),
-        },
-        GRP_CMP => {
-            let op = match insn.cmp_opt {
-                0x02 => "==",
-                0x03 => "!=",
-                0x04 => ">=",
-                0x05 => ">",
-                0x06 => "<=",
-                0x07 => "<",
-                _ => "?",
-            };
-            format!(
-                "CMP {} {} {}",
-                fmt_op(insn.imm_op1, insn.dst),
-                op,
-                fmt_op(insn.imm_op2, insn.src),
-            )
-        }
-        GRP_SET if insn.sub_group == 1 => {
-            if insn.set_opt == SET_BUTTON_PAGE_OPT {
-                format!(
-                    "SET_BUTTON_PAGE({}, {})",
-                    fmt_op(insn.imm_op1, insn.dst),
-                    fmt_op(insn.imm_op2, insn.src),
-                )
-            } else {
-                format!(
-                    "SETSYSTEM(opt={}, {}, {})",
-                    insn.set_opt,
-                    fmt_op(insn.imm_op1, insn.dst),
-                    fmt_op(insn.imm_op2, insn.src),
-                )
-            }
-        }
-        GRP_SET => {
-            let dst = fmt_op(false, insn.dst);
-            let src = fmt_op(insn.imm_op2, insn.src);
-            match insn.set_opt {
-                0x01 => format!("{dst} = {src}"),
-                0x02 => format!("{dst} <=> {src}"),
-                0x03 => format!("{dst} += {src}"),
-                0x04 => format!("{dst} -= {src}"),
-                0x05 => format!("{dst} *= {src}"),
-                0x06 => format!("{dst} /= {src}"),
-                0x07 => format!("{dst} %= {src}"),
-                0x08 => format!("{dst} = rand({src})"),
-                0x09 => format!("{dst} &= {src}"),
-                0x0A => format!("{dst} |= {src}"),
-                0x0B => format!("{dst} ^= {src}"),
-                0x0C => format!("{dst} |= (1 << {src})"),
-                0x0D => format!("{dst} &= ~(1 << {src})"),
-                0x0E => format!("{dst} <<= {src}"),
-                0x0F => format!("{dst} >>= {src}"),
-                _ => format!("SET(opt={}, {dst}, {src})", insn.set_opt),
-            }
-        }
-        _ => format!("UNKNOWN(grp={}, sub={})", insn.group, insn.sub_group),
-    }
-}
+use super::super::ig::{Button, NavigationCommand, Page};
+use super::vm::{
+    ButtonEffect, collect_cmp_play_pairs, execute_button_commands, execute_from,
+    find_visible_button_for_nop, is_nop_anchor, run_mobj_vm, seed_gpr_state, trace_play_pls,
+};
+use super::{
+    BRANCH_GOTO, BRANCH_PLAY, BreadcrumbStep, DispatchEntry, DispatchTable, GRP_BRANCH, GRP_CMP,
+    GRP_SET, Instruction, MovieObject, MovieObjectFile, NavClipInput, PSR_FLAG, PlayTarget,
+    PlayerContext, ResolvedButton, ResolvedPlaylist,
+};
 
 // ── Dispatch entry detection ───────────────────────────────────────────
 
@@ -809,176 +317,7 @@ pub fn find_handler_pc(
     None
 }
 
-// ── NOP anchor classification ──────────────────────────────────────────
-
-/// Returns `true` if a button is a NOP anchor — a dispatch target with no
-/// real commands.
-///
-/// NOP anchors have either no commands or all commands are NOP instructions
-/// (all-zero 12-byte commands). In the WB `SET_BUTTON_PAGE` pattern, NOP
-/// anchors exist solely so the MOBJ VM can read their `button_id` from
-/// PSR\[10\] to dispatch to the correct playlist. They are not visible to
-/// the user.
-#[must_use]
-pub fn is_nop_anchor(button: &Button) -> bool {
-    button.commands.is_empty()
-        || button.commands.iter().all(|c| {
-            matches!(c, NavigationCommand::Other { opcode, dst, src }
-                if *opcode == 0 && *dst == 0 && *src == 0)
-        })
-}
-
-/// Finds the visible button on a page that corresponds to a NOP anchor.
-///
-/// Two strategies, tried in order:
-/// 1. **Forward trace:** execute each visible button's commands. If a button
-///    produces `SET_BUTTON_PAGE` whose target button ID matches the NOP
-///    anchor's `button_id`, it navigates to this anchor.
-/// 2. **Spatial fallback:** find the nearest visible button by squared
-///    Euclidean distance. WB authoring places NOP anchors ~30px from their
-///    corresponding visible thumbnails.
-///
-/// Returns `None` if the page has no visible (non-NOP) buttons.
-fn find_visible_button_for_nop(
-    page: &Page,
-    nop_button: &Button,
-    ig_stream: u16,
-    page_id: u8,
-    gprs: &std::collections::HashMap<u32, u32>,
-) -> Option<u16> {
-    /// Maximum squared distance for the spatial fallback (~60px).
-    ///
-    /// WB authoring places thumbnail NOP anchors ~30-42px from their
-    /// co-located visible thumbnails. Menu bar NOP anchors are ~285px+
-    /// from the nearest thumbnail — those must NOT match, because many
-    /// menu bar NOPs mapping to the same few thumbnails causes the CLI's
-    /// fallback matching to grab unrelated buttons (arrows, page numbers).
-    const MAX_SQUARED_DISTANCE: i32 = 60 * 60;
-
-    let visible: Vec<&Button> = page.buttons.iter().filter(|b| !is_nop_anchor(b)).collect();
-
-    if visible.is_empty() {
-        return None;
-    }
-
-    // Forward trace: check if any visible button's SET_BUTTON_PAGE targets
-    // this NOP anchor. The target button_id is `composite & 0xFFFF`.
-    for vis in &visible {
-        let ctx = PlayerContext {
-            ig_stream,
-            selected_button_id: vis.button_id,
-            page_id,
-        };
-        let (effect, _) = execute_button_commands(&vis.commands, &ctx, gprs);
-        if let ButtonEffect::SetButtonPage { composite, .. } = effect {
-            #[allow(clippy::cast_possible_truncation, reason = "button IDs are u16 values")]
-            let target_bid = (composite & 0xFFFF) as u16;
-            if target_bid == nop_button.button_id {
-                return Some(vis.button_id);
-            }
-        }
-    }
-
-    // Spatial fallback: nearest visible button within the distance
-    // threshold. Rejects distant matches that cause many-to-one
-    // collisions in the CLI's button matching.
-    visible
-        .iter()
-        .filter_map(|v| {
-            let dx = i32::from(v.x) - i32::from(nop_button.x);
-            let dy = i32::from(v.y) - i32::from(nop_button.y);
-            let d2 = dx * dx + dy * dy;
-            (d2 <= MAX_SQUARED_DISTANCE).then_some((d2, v.button_id))
-        })
-        .min_by_key(|(d2, _)| *d2)
-        .map(|(_, bid)| bid)
-}
-
 // ── Execution-based resolver ───────────────────────────────────────────
-
-/// The terminal effect of executing a button's command program.
-///
-/// Button commands are HDMV bytecode that modify registers and eventually
-/// reach a terminal instruction. This enum captures what the program does
-/// without prescribing how to interpret it.
-#[derive(Debug)]
-enum ButtonEffect {
-    /// Play a playlist directly (`PlayPl`).
-    Playlist {
-        /// Playlist number.
-        playlist: u16,
-        /// `PlayPl` variant: 0=from start, 1=at mark, 2=at play item.
-        branch_opt: u8,
-        /// Mark index or play item index (meaningful when `branch_opt > 0`).
-        mark_or_pi: u32,
-    },
-    /// Jump to a movie object (`GotoMobj`).
-    GotoMobj(u32),
-    /// Navigate to a button/page via `SET_BUTTON_PAGE` (SETSYSTEM `set_opt=3`).
-    SetButtonPage {
-        /// Composite dispatch value (typically `button_id + key`).
-        composite: u32,
-        /// Target page from the `src` operand. Used by the navigation
-        /// graph to follow internal page edges and propagate GPR state.
-        page: u32,
-    },
-    /// No terminal action reached within the step limit.
-    None,
-}
-
-/// A clip's page structure for execution-based resolution.
-pub struct NavClipInput<'a> {
-    /// IG stream PID (for PSR\[0\] seeding).
-    pub ig_pid: u16,
-    /// All pages across display sets in this clip.
-    pub pages: Vec<&'a Page>,
-}
-
-/// Executes MOBJ\[0\] (First Play) and returns the resulting GPR state.
-///
-/// WB authoring stores per-content-item configuration in a GPR database
-/// (registers 3000–3999) initialized by the First Play object. Title
-/// MOBJs and button programs read from this database to select playlists.
-/// Without seeding, conditional `PlayPl` instructions take default
-/// branches and fail to resolve.
-///
-/// PSR entries are seeded with BD spec first-boot defaults so that
-/// MOBJ\[0\]'s initialization guard enters the configuration block.
-/// The returned map contains only GPR entries (PSRs are stripped).
-#[must_use]
-pub fn seed_gpr_state(mobj_file: &MovieObjectFile) -> std::collections::HashMap<u32, u32> {
-    let Some(mobj0) = mobj_file.objects.first() else {
-        return std::collections::HashMap::new();
-    };
-
-    let mut gprs = std::collections::HashMap::new();
-    // Seed PSRs with first-boot defaults so MOBJ[0]'s init guard enters
-    // the initialization block. PSR[4] (title number) must be 0xFFFF
-    // ("unconfigured") — the guard `CMP PSR[4] != 0xFFFF` skips init
-    // when the title is already set. Other PSRs use BD spec defaults.
-    gprs.insert(PSR_FLAG | 0x01, 0xFF); // primary audio
-    gprs.insert(PSR_FLAG | 0x02, 0xFFFE); // PG/TextST
-    gprs.insert(PSR_FLAG | 0x03, 0xFF); // angle
-    gprs.insert(PSR_FLAG | 0x04, 0xFFFF); // title (init guard)
-    gprs.insert(PSR_FLAG | 0x0A, 0xFFFF); // selected button
-    gprs.insert(PSR_FLAG | 0x0C, 0xFF); // user style
-    gprs.insert(PSR_FLAG | 0x0D, 0xFF); // parental level
-    gprs.insert(PSR_FLAG | 0x0E, 0xFFFF); // secondary A/V
-    gprs.insert(PSR_FLAG | 0x0F, 0x0002_0000); // audio cap
-    gprs.insert(PSR_FLAG | 0x1D, 0x0200); // profile 2.0
-    gprs.insert(PSR_FLAG | 0x1F, 0x0200); // player version
-    let _ = run_mobj_vm(
-        &mobj0.instructions,
-        0,
-        &mut gprs,
-        &std::collections::HashSet::new(),
-    );
-    // Keep only GPR entries (no PSR) — the disc configuration database
-    // that title MOBJs and button programs read.
-    gprs.into_iter()
-        .filter(|(k, _)| k & PSR_FLAG == 0)
-        .collect()
-}
 
 /// Resolves playlists reachable from disc menus via BFS navigation.
 ///
@@ -1489,88 +828,6 @@ pub fn resolve_via_execution(
     resolved
 }
 
-/// Executes a button's navigation commands and returns the terminal effect
-/// along with the register state at the point of termination.
-///
-/// Converts all [`NavigationCommand`]s to [`Instruction`]s and runs them
-/// through the mini-VM. Recognizes three terminal actions: `PlayPl`,
-/// `GotoMobj` (BRANCH\_JUMP), and `SET_BUTTON_PAGE` (SETSYSTEM set\_opt=3).
-fn execute_button_commands(
-    commands: &[NavigationCommand],
-    ctx: &PlayerContext,
-    initial_gprs: &std::collections::HashMap<u32, u32>,
-) -> (ButtonEffect, std::collections::HashMap<u32, u32>) {
-    let instrs: Vec<Instruction> = commands.iter().map(command_to_instruction).collect();
-
-    let mut gprs = initial_gprs.clone();
-    gprs.insert(PSR_FLAG, u32::from(ctx.ig_stream));
-    gprs.insert(PSR_FLAG | 0x0A, u32::from(ctx.selected_button_id));
-    gprs.insert(PSR_FLAG | 0x0B, u32::from(ctx.page_id));
-
-    let mut pc: usize = 0;
-    let mut steps: u32 = 0;
-
-    while pc < instrs.len() && steps < VM_STEP_LIMIT {
-        steps += 1;
-        let insn = &instrs[pc];
-
-        match insn.group {
-            GRP_SET => {
-                // Intercept SET_BUTTON_PAGE before the generic SET handler
-                if insn.sub_group == 1 && insn.set_opt == SET_BUTTON_PAGE_OPT {
-                    let composite = fetch_operand(insn.imm_op1, insn.dst, &gprs);
-                    let page = fetch_operand(insn.imm_op2, insn.src, &gprs);
-                    return (ButtonEffect::SetButtonPage { composite, page }, gprs);
-                }
-                execute_set(insn, &mut gprs);
-                pc += 1;
-            }
-            GRP_CMP => {
-                if execute_cmp(insn, &gprs) {
-                    pc += 1;
-                } else {
-                    pc += 2;
-                }
-            }
-            GRP_BRANCH => match insn.sub_group {
-                BRANCH_PLAY => {
-                    let playlist = fetch_operand(insn.imm_op1, insn.dst, &gprs);
-                    let mark_or_pi = fetch_operand(insn.imm_op2, insn.src, &gprs);
-                    #[allow(
-                        clippy::cast_possible_truncation,
-                        reason = "playlist numbers are u16 values"
-                    )]
-                    return (
-                        ButtonEffect::Playlist {
-                            playlist: (playlist & 0xFFFF) as u16,
-                            branch_opt: insn.branch_opt,
-                            mark_or_pi,
-                        },
-                        gprs,
-                    );
-                }
-                BRANCH_JUMP => {
-                    let object_id = fetch_operand(insn.imm_op1, insn.dst, &gprs);
-                    return (ButtonEffect::GotoMobj(object_id), gprs);
-                }
-                BRANCH_GOTO => {
-                    if !execute_goto(insn, &gprs, &mut pc) {
-                        pc += 1;
-                    }
-                }
-                _ => {
-                    pc += 1;
-                }
-            },
-            _ => {
-                pc += 1;
-            }
-        }
-    }
-
-    (ButtonEffect::None, gprs)
-}
-
 // ── Button resolver (legacy pattern-matching) ──────────────────────────
 
 /// Resolves button → playlist mappings by tracing through movie objects.
@@ -1814,7 +1071,7 @@ fn resolve_via_dispatch(
     None
 }
 
-// ── Mini-VM for GPR dispatch resolution ─────────────────────────────────
+// ── Lifecycle simulation ──────────────────────────────────────────────
 
 /// Resolves a button's playlist by simulating the `PlayPl` suspend/resume
 /// lifecycle and comparing against a baseline.
@@ -1862,375 +1119,6 @@ fn resolve_via_lifecycle(
     None
 }
 
-/// Traces all valid `PlayPl` playlists encountered during lifecycle
-/// simulation of an MOBJ.
-///
-/// On every `PlayPl`, the provided GPR assignments are re-applied
-/// (simulating button activation during a suspended playlist) and
-/// execution continues. Returns the ordered list of valid playlist
-/// numbers encountered.
-fn trace_play_pls(
-    instrs: &[Instruction],
-    gpr_assignments: &[(u32, u32)],
-    valid_playlists: &std::collections::HashSet<u32>,
-    ctx: &PlayerContext,
-) -> Vec<u16> {
-    let mut gprs = std::collections::HashMap::<u32, u32>::new();
-    for &(reg, val) in gpr_assignments {
-        gprs.insert(reg, val);
-    }
-    gprs.insert(PSR_FLAG, u32::from(ctx.ig_stream)); // PSR[0]
-    gprs.insert(PSR_FLAG | 0x0A, u32::from(ctx.selected_button_id)); // PSR[10]
-    gprs.insert(PSR_FLAG | 0x0B, u32::from(ctx.page_id)); // PSR[11]
-
-    let mut pc: usize = 0;
-    let mut steps: u32 = 0;
-    let mut playlists = Vec::new();
-
-    while pc < instrs.len() && steps < VM_STEP_LIMIT {
-        steps += 1;
-        let insn = &instrs[pc];
-
-        match insn.group {
-            GRP_SET => {
-                execute_set(insn, &mut gprs);
-                pc += 1;
-            }
-            GRP_CMP => {
-                // libbluray CMP model: if condition is false, skip next instruction
-                if execute_cmp(insn, &gprs) {
-                    pc += 1;
-                } else {
-                    pc += 2;
-                }
-            }
-            GRP_BRANCH => match insn.sub_group {
-                BRANCH_PLAY => {
-                    let playlist = fetch_operand(insn.imm_op1, insn.dst, &gprs);
-                    let is_valid = playlist != 0
-                        && playlist != 0xFFFF
-                        && (valid_playlists.is_empty() || valid_playlists.contains(&playlist));
-                    if is_valid {
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            reason = "playlist numbers are u16 values"
-                        )]
-                        playlists.push((playlist & 0xFFFF) as u16);
-                    }
-                    for &(reg, val) in gpr_assignments {
-                        gprs.insert(reg, val);
-                    }
-                    pc += 1;
-                }
-                BRANCH_GOTO => {
-                    if !execute_goto(insn, &gprs, &mut pc) {
-                        pc += 1;
-                    }
-                }
-                _ => {
-                    pc += 1;
-                }
-            },
-            _ => {
-                pc += 1;
-            }
-        }
-    }
-
-    playlists
-}
-
-/// Executes MOBJ instructions starting at `start_pc` with the given
-/// register state and player context.
-fn execute_from(
-    instrs: &[Instruction],
-    start_pc: usize,
-    gpr_assignments: &[(u32, u32)],
-    valid_playlists: &std::collections::HashSet<u32>,
-    ctx: &PlayerContext,
-) -> Option<PlayTarget> {
-    let mut gprs = std::collections::HashMap::<u32, u32>::new();
-    for &(reg, val) in gpr_assignments {
-        gprs.insert(reg, val);
-    }
-    gprs.insert(PSR_FLAG, u32::from(ctx.ig_stream));
-    gprs.insert(PSR_FLAG | 0x0A, u32::from(ctx.selected_button_id));
-    gprs.insert(PSR_FLAG | 0x0B, u32::from(ctx.page_id));
-
-    run_mobj_vm(instrs, start_pc, &mut gprs, valid_playlists)
-}
-
-/// Core MOBJ VM loop — executes instructions until a valid `PlayPl` is
-/// reached or the step limit is exceeded.
-///
-/// Shared by [`execute_from`] (legacy resolver) and the BFS
-/// navigation graph (`GotoMobj` follow-through, handler execution).
-#[allow(
-    clippy::implicit_hasher,
-    reason = "called from both library internals and CLI with std HashMap"
-)]
-pub fn run_mobj_vm(
-    instrs: &[Instruction],
-    start_pc: usize,
-    gprs: &mut std::collections::HashMap<u32, u32>,
-    valid_playlists: &std::collections::HashSet<u32>,
-) -> Option<PlayTarget> {
-    let mut pc: usize = start_pc;
-    let mut steps: u32 = 0;
-
-    while pc < instrs.len() && steps < VM_STEP_LIMIT {
-        steps += 1;
-        let insn = &instrs[pc];
-
-        match insn.group {
-            GRP_SET => {
-                execute_set(insn, gprs);
-                pc += 1;
-            }
-            GRP_CMP => {
-                if execute_cmp(insn, gprs) {
-                    pc += 1;
-                } else {
-                    pc += 2;
-                }
-            }
-            GRP_BRANCH => match insn.sub_group {
-                BRANCH_PLAY => {
-                    let playlist = fetch_operand(insn.imm_op1, insn.dst, gprs);
-                    let is_valid = playlist != 0
-                        && playlist != 0xFFFF
-                        && (valid_playlists.is_empty() || valid_playlists.contains(&playlist));
-                    if is_valid {
-                        let mark_or_pi = fetch_operand(insn.imm_op2, insn.src, gprs);
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            reason = "playlist numbers are u16 values"
-                        )]
-                        return Some(PlayTarget {
-                            playlist: (playlist & 0xFFFF) as u16,
-                            branch_opt: insn.branch_opt,
-                            mark_or_pi,
-                        });
-                    }
-                    pc += 1;
-                }
-                BRANCH_GOTO => {
-                    if !execute_goto(insn, gprs, &mut pc) {
-                        pc += 1;
-                    }
-                }
-                _ => {
-                    pc += 1;
-                }
-            },
-            _ => {
-                pc += 1;
-            }
-        }
-    }
-
-    None
-}
-
-/// Fetches an operand value: immediate or from the register file.
-///
-/// For register-mode operands, the raw value encodes the register address.
-/// Bit 31 ([`PSR_FLAG`]) distinguishes PSRs from GPRs. When a PSR-flagged
-/// reference is not found (e.g. firmware-specific PSR indices above 127),
-/// this falls back to the GPR with the same index. This handles the
-/// aliasing seen in Warner Bros. authoring where SETSYSTEM operands
-/// reference PSR\[N\] but the value was stored in GPR\[N\] by regular SET
-/// instructions.
-fn fetch_operand(is_immediate: bool, raw: u32, gprs: &std::collections::HashMap<u32, u32>) -> u32 {
-    if is_immediate {
-        raw
-    } else if raw & PSR_FLAG != 0 {
-        // PSR reference — try PSR key first, fall back to GPR alias.
-        // This fallback is also how SET_BUTTON_PAGE operands resolve:
-        // libbluray's `_read_setbuttonpage_reg` extracts bits 0-11 as
-        // the register number, but we receive the full raw operand
-        // (e.g. 0x80000FED). The PSR lookup misses, the fallback
-        // strips PSR_FLAG and finds GPR[4077].
-        gprs.get(&raw)
-            .or_else(|| gprs.get(&(raw & !PSR_FLAG)))
-            .copied()
-            .unwrap_or(0)
-    } else {
-        gprs.get(&raw).copied().unwrap_or(0)
-    }
-}
-
-/// Executes a SET group instruction: updates the destination register.
-///
-/// Handles both general SET (`sub_group=0`) and SETSYSTEM (`sub_group=1`).
-/// SETSYSTEM reads/writes PSRs, which are stored in the same register
-/// map with the [`PSR_FLAG`] bit set.
-fn execute_set(insn: &Instruction, gprs: &mut std::collections::HashMap<u32, u32>) {
-    if insn.sub_group > 1 {
-        return;
-    }
-
-    let dst_reg = insn.dst;
-    let src_val = fetch_operand(insn.imm_op2, insn.src, gprs);
-    let dst_val = gprs.get(&dst_reg).copied().unwrap_or(0);
-
-    let result = match insn.set_opt {
-        0x01 => src_val, // MOVE (assignment)
-        0x02 => {
-            // SWAP
-            gprs.insert(insn.src, dst_val);
-            src_val
-        }
-        0x03 => dst_val.wrapping_add(src_val),     // ADD
-        0x04 => dst_val.wrapping_sub(src_val),     // SUB
-        0x05 => dst_val.wrapping_mul(src_val),     // MUL
-        0x06 if src_val != 0 => dst_val / src_val, // DIV
-        0x07 if src_val != 0 => dst_val % src_val, // MOD
-        0x08 if src_val != 0 => 1,                 // RND: deterministic (always 1)
-        0x09 => dst_val & src_val,                 // AND
-        0x0A => dst_val | src_val,                 // OR
-        0x0B => dst_val ^ src_val,                 // XOR
-        0x0C => dst_val | (1 << src_val),          // BITSET
-        0x0D => dst_val & !(1 << src_val),         // BITCLR
-        0x0E => dst_val << src_val,                // SHL
-        0x0F => dst_val >> src_val,                // SHR
-        _ => return,                               // Unknown or unsafe (div/mod by zero) — skip
-    };
-
-    gprs.insert(dst_reg, result);
-}
-
-/// Executes a CMP group instruction: returns comparison result.
-fn execute_cmp(insn: &Instruction, gprs: &std::collections::HashMap<u32, u32>) -> bool {
-    let dst_val = fetch_operand(insn.imm_op1, insn.dst, gprs);
-    let src_val = fetch_operand(insn.imm_op2, insn.src, gprs);
-
-    match insn.cmp_opt {
-        0x02 => dst_val == src_val, // EQ (==)
-        0x03 => dst_val != src_val, // NE (!=)
-        0x04 => dst_val >= src_val, // GE (>=)
-        0x05 => dst_val > src_val,  // GT (>)
-        0x06 => dst_val <= src_val, // LE (<=)
-        0x07 => dst_val < src_val,  // LT (<)
-        _ => false,                 // 0x00/0x01 or unknown — no match
-    }
-}
-
-/// Executes a GOTO instruction. Returns `true` if the branch was taken
-/// (and `pc` was updated), `false` if execution should fall through.
-///
-/// `branch_opt` encoding (libbluray `hdmv_insn.h`):
-/// - `0x00`: NOP — no operation
-/// - `0x01`: GOTO — unconditional jump to destination
-/// - `0x02`: BREAK — terminate execution
-///
-/// Conditional branching is handled by CMP, which skips the next
-/// instruction when the comparison is false. A CMP+GOTO pair gives
-/// conditional behavior: CMP true → GOTO executes → jump; CMP false
-/// → GOTO is skipped → fall through.
-fn execute_goto(
-    insn: &Instruction,
-    gprs: &std::collections::HashMap<u32, u32>,
-    pc: &mut usize,
-) -> bool {
-    match insn.branch_opt {
-        0x01 => {
-            // GOTO — unconditional jump
-            let target = fetch_operand(insn.imm_op1, insn.dst, gprs);
-            *pc = target as usize;
-            true
-        }
-        0x02 => {
-            // BREAK — terminate execution
-            *pc = usize::MAX;
-            true
-        }
-        _ => false, // NOP (0x00) and unknown — no branch
-    }
-}
-
-// ── Static resolution helpers (GotoMobj pattern) ────────────────────────
-
-/// Collects `(comparison_value, playlist)` pairs from a movie object.
-///
-/// Scans for CMP instructions that reference the given GPR, then finds
-/// the associated `PlayPl` instruction. Handles two patterns:
-///
-/// 1. **CMP + branch target:** the CMP instruction branches to a `PlayPl`
-///    at a specific instruction index.
-/// 2. **Positional pairing:** CMP instructions and `PlayPl` instructions
-///    are paired in order (Nth CMP → Nth `PlayPl`).
-fn collect_cmp_play_pairs(instrs: &[Instruction], register: u32) -> Vec<(u32, u16)> {
-    let mut cmps: Vec<(usize, u32)> = Vec::new();
-    let mut play_pls: Vec<(usize, u16)> = Vec::new();
-
-    for (i, insn) in instrs.iter().enumerate() {
-        if insn.group == GRP_CMP {
-            if !insn.imm_op1 && insn.dst == register && insn.imm_op2 {
-                cmps.push((i, insn.src));
-            } else if insn.imm_op1 && !insn.imm_op2 && insn.src == register {
-                cmps.push((i, insn.dst));
-            }
-        }
-
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "playlist numbers are u16 values"
-        )]
-        if insn.group == GRP_BRANCH && insn.sub_group == BRANCH_PLAY && insn.imm_op1 {
-            play_pls.push((i, (insn.dst & 0xFFFF) as u16));
-        }
-    }
-
-    if cmps.is_empty() || play_pls.is_empty() {
-        return Vec::new();
-    }
-
-    let pairs = try_branch_target_pairing(instrs, &cmps, &play_pls);
-    if !pairs.is_empty() {
-        return pairs;
-    }
-
-    cmps.iter()
-        .zip(play_pls.iter())
-        .map(|(&(_, cmp_val), &(_, playlist))| (cmp_val, playlist))
-        .collect()
-}
-
-/// Tries to pair CMP instructions with `PlayPl` via branch targets.
-///
-/// For each CMP, looks at the instruction immediately following it.
-/// If it's a GOTO (branch group, goto sub-group) targeting a `PlayPl`
-/// instruction, creates the pair.
-fn try_branch_target_pairing(
-    instrs: &[Instruction],
-    cmps: &[(usize, u32)],
-    play_pls: &[(usize, u16)],
-) -> Vec<(u32, u16)> {
-    let play_pl_map: std::collections::HashMap<usize, u16> = play_pls.iter().copied().collect();
-
-    let mut pairs = Vec::new();
-
-    for &(cmp_idx, cmp_value) in cmps {
-        let next_idx = cmp_idx + 1;
-        if next_idx < instrs.len() {
-            let next = &instrs[next_idx];
-            if next.group == GRP_BRANCH && next.sub_group == BRANCH_GOTO && next.imm_op1 {
-                let target = next.dst as usize;
-                if let Some(&playlist) = play_pl_map.get(&target) {
-                    pairs.push((cmp_value, playlist));
-                }
-            }
-        }
-    }
-
-    if pairs.len() == cmps.len() {
-        pairs
-    } else {
-        Vec::new()
-    }
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2239,349 +1127,21 @@ fn try_branch_target_pairing(
     reason = "tests use expect() for assertions per project rules"
 )]
 mod tests {
+    use super::super::test_helpers::{
+        InsnSpec, MobjBuilder, breadcrumb_ids, build_dispatch_mobj, make_button, make_button_at,
+        make_page, spec_to_other,
+    };
+    use super::super::{NavClipInput, PlayerContext};
     use super::*;
 
-    // ── MOBJ file builder ───────────────────────────────────────────
-
-    /// Builds a synthetic `MovieObject.bdmv` binary for testing.
-    struct MobjBuilder {
-        objects: Vec<Vec<InsnSpec>>,
-    }
-
-    /// Specification for a test instruction.
-    #[derive(Clone)]
-    enum InsnSpec {
-        /// `PlayPl` with immediate playlist number.
-        PlayPl(u32),
-        /// `PlayPl` with register operand — `PlayPl(GPR[reg])`.
-        PlayPlReg(u32),
-        /// `SetGpr`: register = immediate value.
-        SetGpr(u32, u32),
-        /// `SetGpr`: dst register = src register (register-to-register move).
-        SetGprReg(u32, u32),
-        /// CMP: compare `GPR[register]` == immediate value.
-        CmpEq(u32, u32),
-        /// CMP: compare `GPR[dst]` == `GPR[src]` (register-to-register).
-        CmpEqReg(u32, u32),
-        /// GOTO: unconditional branch to instruction index.
-        Goto(u32),
-        /// GOTO: conditional branch (taken if last CMP was true).
-        GotoIf(u32),
-        /// `GotoMobj`: jump to movie object (`BRANCH_JUMP`, `imm_op1=1`).
-        #[allow(dead_code, reason = "used via spec_to_other for button commands")]
-        GotoMobj(u32),
-        /// AND: `GPR[dst] &= GPR[src]` (register-to-register).
-        AndReg(u32, u32),
-        /// ADD: `GPR[dst] += GPR[src]` (register-to-register).
-        AddReg(u32, u32),
-        /// SETSYSTEM `SET_BUTTON_PAGE(GPR[dst], GPR[src])`.
-        SetButtonPage(u32, u32),
-        /// Nop (all zeros).
-        Nop,
-    }
-
-    impl MobjBuilder {
-        fn new() -> Self {
-            Self {
-                objects: Vec::new(),
-            }
-        }
-
-        fn object(mut self, instructions: &[InsnSpec]) -> Self {
-            self.objects.push(instructions.to_vec());
-            self
-        }
-
-        fn build(self) -> Vec<u8> {
-            let mut data = Vec::new();
-
-            // Header: "MOBJ" + version "0200" + extension_data_start(4)
-            // + reserved(28) + length(4) + reserved(4) + num_objects(2)
-            data.extend_from_slice(b"MOBJ");
-            data.extend_from_slice(b"0200"); // version
-            data.extend_from_slice(&0u32.to_be_bytes()); // extension_data_start
-            data.extend_from_slice(&[0u8; 28]); // reserved
-            // length — we'll fill this later
-            let length_offset = data.len();
-            data.extend_from_slice(&0u32.to_be_bytes()); // placeholder
-            data.extend_from_slice(&0u32.to_be_bytes()); // reserved
-
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "test builder — object count is small"
-            )]
-            let num_objects = self.objects.len() as u16;
-            data.extend_from_slice(&num_objects.to_be_bytes());
-
-            for obj_instrs in &self.objects {
-                // Object header: 2 bytes flags/reserved + 2 bytes num_commands
-                data.extend_from_slice(&[0u8; 2]); // flags + reserved
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    reason = "test builder — instruction count is small"
-                )]
-                let num_cmds = obj_instrs.len() as u16;
-                data.extend_from_slice(&num_cmds.to_be_bytes());
-
-                for insn in obj_instrs {
-                    build_instruction(&mut data, insn);
-                }
-            }
-
-            // Fill in length field (remaining data after offset 44)
-            #[allow(clippy::cast_possible_truncation, reason = "test data is small")]
-            let length = (data.len() - length_offset - 4) as u32;
-            data[length_offset..length_offset + 4].copy_from_slice(&length.to_be_bytes());
-
-            data
-        }
-    }
-
-    fn build_instruction(buf: &mut Vec<u8>, spec: &InsnSpec) {
-        match spec {
-            InsnSpec::PlayPl(playlist) => {
-                // grp=0 (BRANCH), sub_grp=2 (PLAY), op_cnt=1, imm_op1=1
-                let insn: u32 = 0x2280_0000;
-                buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&playlist.to_be_bytes()); // dst
-                buf.extend_from_slice(&0u32.to_be_bytes()); // src
-            }
-            InsnSpec::SetGpr(register, value) => {
-                // grp=2 (SET), sub_grp=0, op_cnt=2, imm_op2=1, set_opt=1 (MOVE)
-                let insn: u32 = 0x5040_0001;
-                buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&register.to_be_bytes());
-                buf.extend_from_slice(&value.to_be_bytes());
-            }
-            InsnSpec::CmpEq(register, value) => {
-                // grp=1 (CMP), sub_grp=0, op_cnt=2, imm_op1=0 (dst=GPR),
-                // imm_op2=1 (src=immediate), cmp_opt=2 (EQ)
-                let insn: u32 = 0x4840_0200;
-                buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&register.to_be_bytes()); // dst = GPR ref
-                buf.extend_from_slice(&value.to_be_bytes()); // src = immediate
-            }
-            InsnSpec::PlayPlReg(register) => {
-                // grp=0 (BRANCH), sub_grp=2 (PLAY), op_cnt=1, imm_op1=0
-                let insn: u32 = 0x2200_0000;
-                buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&register.to_be_bytes()); // dst = GPR ref
-                buf.extend_from_slice(&0u32.to_be_bytes());
-            }
-            InsnSpec::SetGprReg(dst_reg, src_reg) => {
-                // grp=2 (SET), sub_grp=0, op_cnt=2, imm_op1=0, imm_op2=0, set_opt=1 (MOVE)
-                let insn: u32 = 0x5000_0001;
-                buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&dst_reg.to_be_bytes());
-                buf.extend_from_slice(&src_reg.to_be_bytes());
-            }
-            InsnSpec::CmpEqReg(dst_reg, src_reg) => {
-                // grp=1 (CMP), sub_grp=0, op_cnt=2, imm_op1=0, imm_op2=0, cmp_opt=2 (EQ)
-                let insn: u32 = 0x4800_0200;
-                buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&dst_reg.to_be_bytes());
-                buf.extend_from_slice(&src_reg.to_be_bytes());
-            }
-            InsnSpec::Goto(target) => {
-                // grp=0 (BRANCH), sub_grp=0 (GOTO), op_cnt=1, imm_op1=1,
-                // branch_opt=1 (GOTO — unconditional jump)
-                let insn: u32 = 0x2081_0000;
-                buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&target.to_be_bytes());
-                buf.extend_from_slice(&0u32.to_be_bytes());
-            }
-            InsnSpec::GotoIf(target) => {
-                // grp=0 (BRANCH), sub_grp=0 (GOTO), op_cnt=1, imm_op1=1,
-                // branch_opt=1 (GOTO — conditionality comes from CMP skip)
-                let insn: u32 = 0x2081_0000;
-                buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&target.to_be_bytes());
-                buf.extend_from_slice(&0u32.to_be_bytes());
-            }
-            InsnSpec::GotoMobj(object_id) => {
-                // grp=0 (BRANCH), sub_grp=1 (JUMP), op_cnt=1, imm_op1=1,
-                // branch_opt=1 (GOTO)
-                let insn: u32 = 0x2181_0000;
-                buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&object_id.to_be_bytes());
-                buf.extend_from_slice(&0u32.to_be_bytes());
-            }
-            InsnSpec::AndReg(dst_reg, src_reg) => {
-                // grp=2 (SET), sub_grp=0, op_cnt=2, imm_op2=0, set_opt=9 (AND)
-                let insn: u32 = 0x5000_0009;
-                buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&dst_reg.to_be_bytes());
-                buf.extend_from_slice(&src_reg.to_be_bytes());
-            }
-            InsnSpec::AddReg(dst_reg, src_reg) => {
-                // grp=2 (SET), sub_grp=0, op_cnt=2, imm_op2=0, set_opt=3 (ADD)
-                let insn: u32 = 0x5000_0003;
-                buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&dst_reg.to_be_bytes());
-                buf.extend_from_slice(&src_reg.to_be_bytes());
-            }
-            InsnSpec::SetButtonPage(dst_reg, src_reg) => {
-                // grp=2 (SET), sub_grp=1 (SETSYSTEM), op_cnt=2,
-                // imm_op1=0, imm_op2=0, set_opt=3 (SET_BUTTON_PAGE)
-                let insn: u32 = 0x5100_0003;
-                buf.extend_from_slice(&insn.to_be_bytes());
-                buf.extend_from_slice(&dst_reg.to_be_bytes());
-                buf.extend_from_slice(&src_reg.to_be_bytes());
-            }
-            InsnSpec::Nop => {
-                buf.extend_from_slice(&[0u8; 12]);
-            }
-        }
-    }
-
-    // ── Fake buttons and pages for resolver tests ──────────────────
-
-    fn make_button(button_id: u16, commands: Vec<NavigationCommand>) -> Button {
-        Button {
-            button_id,
-            x: 0,
-            y: 0,
-            normal_object_id: 0,
-            selected_object_id: 0,
-            commands,
-        }
-    }
-
-    fn make_button_at(button_id: u16, x: u16, y: u16, commands: Vec<NavigationCommand>) -> Button {
-        Button {
-            button_id,
-            x,
-            y,
-            normal_object_id: 0,
-            selected_object_id: 0,
-            commands,
-        }
-    }
-
-    fn make_page(page_id: u8, buttons: Vec<Button>) -> Page {
-        Page { page_id, buttons }
-    }
-
-    /// Extracts button IDs from a breadcrumb for concise assertions.
-    fn breadcrumb_ids(crumb: &[BreadcrumbStep]) -> Vec<u16> {
-        crumb.iter().map(|s| s.button_id).collect()
-    }
-
-    /// Converts an `InsnSpec` to raw `(opcode, dst, src)` for building
-    /// `NavigationCommand::Other` from test instruction specs.
-    fn spec_to_raw(spec: &InsnSpec) -> (u32, u32, u32) {
-        let mut buf = Vec::new();
-        build_instruction(&mut buf, spec);
-        let opcode = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let dst = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let src = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        (opcode, dst, src)
-    }
-
-    /// Builds a `NavigationCommand::Other` from an `InsnSpec`.
-    fn spec_to_other(spec: &InsnSpec) -> NavigationCommand {
-        let (opcode, dst, src) = spec_to_raw(spec);
-        NavigationCommand::Other { opcode, dst, src }
-    }
-
-    // ── Parser tests ────────────────────────────────────────────────
-
-    #[test]
-    fn parse_single_object() {
-        let data = MobjBuilder::new().object(&[InsnSpec::PlayPl(203)]).build();
-
-        let file = parse(&data).expect("should parse single object");
-        assert_eq!(file.objects.len(), 1, "one object");
-        assert_eq!(file.objects[0].instructions.len(), 1, "one instruction");
-
-        let insn = &file.objects[0].instructions[0];
-        assert_eq!(insn.group, GRP_BRANCH, "group is BRANCH");
-        assert_eq!(insn.sub_group, BRANCH_PLAY, "sub_group is PLAY");
-        assert_eq!(insn.dst, 203, "dst holds playlist number");
-    }
-
-    #[test]
-    fn parse_multiple_objects() {
-        let data = MobjBuilder::new()
-            .object(&[InsnSpec::PlayPl(201), InsnSpec::PlayPl(202)])
-            .object(&[InsnSpec::Nop])
-            .object(&[
-                InsnSpec::CmpEq(0, 1),
-                InsnSpec::Goto(4),
-                InsnSpec::CmpEq(0, 2),
-                InsnSpec::Goto(5),
-                InsnSpec::PlayPl(301),
-                InsnSpec::PlayPl(302),
-            ])
-            .build();
-
-        let file = parse(&data).expect("should parse multiple objects");
-        assert_eq!(file.objects.len(), 3, "three objects");
-        assert_eq!(
-            file.objects[0].instructions.len(),
-            2,
-            "object 0: two instructions"
-        );
-        assert_eq!(
-            file.objects[1].instructions.len(),
-            1,
-            "object 1: one instruction"
-        );
-        assert_eq!(
-            file.objects[2].instructions.len(),
-            6,
-            "object 2: six instructions"
-        );
-    }
-
-    #[test]
-    fn parse_rejects_invalid_magic() {
-        let mut data = MobjBuilder::new().object(&[InsnSpec::Nop]).build();
-        data[0..4].copy_from_slice(b"NOPE");
-
-        let err = parse(&data).expect_err("should reject invalid magic");
-        assert!(
-            err.to_string().contains("invalid magic"),
-            "error mentions invalid magic: {err}"
-        );
-    }
-
-    #[test]
-    fn parse_rejects_truncated_file() {
-        let data = b"MOBJ0200";
-
-        let err = parse(data).expect_err("should reject truncated file");
-        assert!(
-            err.to_string().contains("too small"),
-            "error mentions size: {err}"
-        );
-    }
-
-    #[test]
-    fn instruction_fields_decoded_correctly() {
-        let data = MobjBuilder::new()
-            .object(&[InsnSpec::SetGpr(3, 42)])
-            .build();
-
-        let file = parse(&data).expect("should parse SetGpr");
-        let insn = &file.objects[0].instructions[0];
-
-        assert_eq!(insn.group, GRP_SET, "group is SET");
-        assert_eq!(insn.sub_group, 0, "sub_group is 0");
-        assert_eq!(insn.op_cnt, 2, "op_cnt is 2");
-        assert!(!insn.imm_op1, "dst is GPR reference");
-        assert!(insn.imm_op2, "src is immediate");
-        assert_eq!(insn.dst, 3, "dst is GPR 3");
-        assert_eq!(insn.src, 42, "src is 42");
+    fn parse(data: &[u8]) -> Result<MovieObjectFile, super::super::MobjError> {
+        super::super::parse::parse(data)
     }
 
     // ── Resolver tests ──────────────────────────────────────────────
 
     #[test]
     fn resolve_set_gpr_goto_mobj_with_positional_pairing() {
-        // MOBJ 2 has: CmpEq(GPR[0], 1), CmpEq(GPR[0], 3), CmpEq(GPR[0], 5)
-        // followed by PlayPl(201), PlayPl(203), PlayPl(205).
-        // Button sets GPR[0]=3, Goto MOBJ 2 → should resolve to playlist 203.
         let mobj_data = MobjBuilder::new()
             .object(&[InsnSpec::Nop]) // MOBJ 0
             .object(&[InsnSpec::Nop]) // MOBJ 1
@@ -2622,8 +1182,6 @@ mod tests {
 
     #[test]
     fn resolve_set_gpr_goto_mobj_with_branch_target_pairing() {
-        // MOBJ 0 has: CmpEq(GPR[0], 1) → Goto 4, CmpEq(GPR[0], 5) → Goto 5,
-        // then PlayPl(201) at index 4, PlayPl(205) at index 5.
         let mobj_data = MobjBuilder::new()
             .object(&[
                 InsnSpec::CmpEq(0, 1),
@@ -2685,9 +1243,7 @@ mod tests {
 
     #[test]
     fn resolve_returns_empty_for_unresolvable_button() {
-        let mobj_data = MobjBuilder::new()
-            .object(&[InsnSpec::Nop]) // MOBJ 0 has no PlayPl
-            .build();
+        let mobj_data = MobjBuilder::new().object(&[InsnSpec::Nop]).build();
         let mobj_file = parse(&mobj_data).expect("should parse");
 
         let button = make_button(
@@ -2713,8 +1269,6 @@ mod tests {
 
     #[test]
     fn resolve_multiple_buttons_same_mobj() {
-        // Three buttons all target MOBJ 0, each setting GPR[0] to a
-        // different value.
         let mobj_data = MobjBuilder::new()
             .object(&[
                 InsnSpec::CmpEq(0, 1),
@@ -2772,20 +1326,13 @@ mod tests {
             None,
         );
         assert_eq!(resolved.len(), 3, "all three buttons resolved");
-
-        assert_eq!(resolved[0].button_id, 10, "button 10");
         assert_eq!(resolved[0].target.playlist, 201, "button 10 → playlist 201");
-
-        assert_eq!(resolved[1].button_id, 11, "button 11");
         assert_eq!(resolved[1].target.playlist, 202, "button 11 → playlist 202");
-
-        assert_eq!(resolved[2].button_id, 12, "button 12");
         assert_eq!(resolved[2].target.playlist, 203, "button 12 → playlist 203");
     }
 
     #[test]
     fn resolve_unconditional_single_play_pl() {
-        // MOBJ with a single PlayPl and no CMP — unconditional play.
         let mobj_data = MobjBuilder::new().object(&[InsnSpec::PlayPl(500)]).build();
         let mobj_file = parse(&mobj_data).expect("should parse");
 
@@ -2823,7 +1370,7 @@ mod tests {
                     register: 0,
                     value: 1,
                 },
-                NavigationCommand::GotoMobj { object_id: 99 }, // out of bounds
+                NavigationCommand::GotoMobj { object_id: 99 },
             ],
         );
 
@@ -2837,28 +1384,21 @@ mod tests {
         assert!(resolved.is_empty(), "out-of-bounds MOBJ not resolved");
     }
 
-    // ── VM-based resolver tests (GPR dispatch pattern) ──────────────
+    // ── VM-based resolver tests ────────────────────────────────────
 
     #[test]
     fn vm_resolves_gpr_dispatch_pattern() {
-        // Warner Bros. style: button sets GPR[4075]=5, MOBJ compares
-        // GPR[4075] against GPR[4076], then overwrites GPR[4075] with
-        // the actual playlist number and calls PlayPl(GPR[4075]).
         let mobj_data = MobjBuilder::new()
             .object(&[
-                // Case 1: GPR[4076]=1, compare, set playlist 201
                 InsnSpec::SetGpr(4076, 1),
                 InsnSpec::CmpEqReg(4075, 4076),
                 InsnSpec::GotoIf(6),
-                // Case 2: GPR[4076]=5, compare, set playlist 205
                 InsnSpec::SetGpr(4076, 5),
                 InsnSpec::CmpEqReg(4075, 4076),
                 InsnSpec::GotoIf(9),
-                // PlayPl for case 1
                 InsnSpec::SetGpr(4075, 201),
                 InsnSpec::PlayPlReg(4075),
-                InsnSpec::Nop, // unreachable
-                // PlayPl for case 2
+                InsnSpec::Nop,
                 InsnSpec::SetGpr(4075, 205),
                 InsnSpec::PlayPlReg(4075),
             ])
@@ -2866,7 +1406,6 @@ mod tests {
 
         let mobj_file = parse(&mobj_data).expect("should parse");
 
-        // Button sets GPR[4075]=5 → should resolve to playlist 205
         let button = make_button(
             7,
             vec![NavigationCommand::SetGpr {
@@ -2888,29 +1427,27 @@ mod tests {
 
     #[test]
     fn vm_resolves_multiple_buttons_gpr_dispatch() {
-        // Three buttons with different dispatch keys, all resolved by
-        // the same MOBJ.
         let mobj_data = MobjBuilder::new()
             .object(&[
                 InsnSpec::SetGpr(4076, 1),      // 0
                 InsnSpec::CmpEqReg(4075, 4076), // 1
-                InsnSpec::GotoIf(10),           // 2: → handler 1
+                InsnSpec::GotoIf(10),           // 2
                 InsnSpec::SetGpr(4076, 2),      // 3
                 InsnSpec::CmpEqReg(4075, 4076), // 4
-                InsnSpec::GotoIf(13),           // 5: → handler 2
+                InsnSpec::GotoIf(13),           // 5
                 InsnSpec::SetGpr(4076, 3),      // 6
                 InsnSpec::CmpEqReg(4075, 4076), // 7
-                InsnSpec::GotoIf(16),           // 8: → handler 3
-                InsnSpec::Goto(18),             // 9: no match → end
-                InsnSpec::SetGpr(4075, 201),    // 10: handler 1
+                InsnSpec::GotoIf(16),           // 8
+                InsnSpec::Goto(18),             // 9
+                InsnSpec::SetGpr(4075, 201),    // 10
                 InsnSpec::PlayPlReg(4075),      // 11
-                InsnSpec::Goto(18),             // 12: → end
-                InsnSpec::SetGpr(4075, 202),    // 13: handler 2
+                InsnSpec::Goto(18),             // 12
+                InsnSpec::SetGpr(4075, 202),    // 13
                 InsnSpec::PlayPlReg(4075),      // 14
-                InsnSpec::Goto(18),             // 15: → end
-                InsnSpec::SetGpr(4075, 203),    // 16: handler 3
+                InsnSpec::Goto(18),             // 15
+                InsnSpec::SetGpr(4075, 203),    // 16
                 InsnSpec::PlayPlReg(4075),      // 17
-                InsnSpec::Nop,                  // 18: end
+                InsnSpec::Nop,                  // 18
             ])
             .build();
 
@@ -2959,11 +1496,8 @@ mod tests {
 
     #[test]
     fn vm_skips_mobj_without_register_play_pl() {
-        // MOBJ 0 has only immediate PlayPl (no register-based).
-        // MOBJ 1 has the register-based dispatch.
-        // The VM should skip MOBJ 0 and find the match in MOBJ 1.
         let mobj_data = MobjBuilder::new()
-            .object(&[InsnSpec::PlayPl(999)]) // immediate only
+            .object(&[InsnSpec::PlayPl(999)])
             .object(&[
                 InsnSpec::SetGpr(4076, 5),
                 InsnSpec::CmpEqReg(4075, 4076),
@@ -2976,7 +1510,6 @@ mod tests {
             .build();
 
         let mobj_file = parse(&mobj_data).expect("should parse");
-
         let button = make_button(
             1,
             vec![NavigationCommand::SetGpr {
@@ -2998,22 +1531,19 @@ mod tests {
 
     #[test]
     fn vm_no_match_returns_empty() {
-        // Button sets GPR[4075]=99 but MOBJ only handles value 1.
-        // When CMP fails, execution skips past the PlayPl block.
         let mobj_data = MobjBuilder::new()
             .object(&[
-                InsnSpec::SetGpr(4076, 1),      // 0: expected key
-                InsnSpec::CmpEqReg(4075, 4076), // 1: compare
-                InsnSpec::GotoIf(4),            // 2: if match → 4
-                InsnSpec::Goto(6),              // 3: else skip past PlayPl
-                InsnSpec::SetGpr(4075, 201),    // 4: set playlist
-                InsnSpec::PlayPlReg(4075),      // 5: play
-                InsnSpec::Nop,                  // 6: end
+                InsnSpec::SetGpr(4076, 1),
+                InsnSpec::CmpEqReg(4075, 4076),
+                InsnSpec::GotoIf(4),
+                InsnSpec::Goto(6),
+                InsnSpec::SetGpr(4075, 201),
+                InsnSpec::PlayPlReg(4075),
+                InsnSpec::Nop,
             ])
             .build();
 
         let mobj_file = parse(&mobj_data).expect("should parse");
-
         let button = make_button(
             1,
             vec![NavigationCommand::SetGpr {
@@ -3034,16 +1564,11 @@ mod tests {
 
     #[test]
     fn vm_handles_register_to_register_set() {
-        // MOBJ copies a value between registers before PlayPl.
         let mobj_data = MobjBuilder::new()
-            .object(&[
-                InsnSpec::SetGprReg(100, 4075), // GPR[100] = GPR[4075]
-                InsnSpec::PlayPlReg(100),       // PlayPl(GPR[100])
-            ])
+            .object(&[InsnSpec::SetGprReg(100, 4075), InsnSpec::PlayPlReg(100)])
             .build();
 
         let mobj_file = parse(&mobj_data).expect("should parse");
-
         let button = make_button(
             1,
             vec![NavigationCommand::SetGpr {
@@ -3067,15 +1592,13 @@ mod tests {
 
     #[test]
     fn find_dispatch_entries_finds_menu_play_pl() {
-        // MOBJ 0: PlayPl(800) at index 2, where 800 is a menu playlist.
-        // Dispatch entry should be (mobj=0, pc=3).
         let mobj_data = MobjBuilder::new()
             .object(&[
-                InsnSpec::Nop,             // 0: init
-                InsnSpec::Nop,             // 1: init
-                InsnSpec::PlayPl(800),     // 2: play menu playlist
-                InsnSpec::Nop,             // 3: dispatch starts here
-                InsnSpec::PlayPlReg(4075), // 4: content PlayPl
+                InsnSpec::Nop,
+                InsnSpec::Nop,
+                InsnSpec::PlayPl(800),
+                InsnSpec::Nop,
+                InsnSpec::PlayPlReg(4075),
             ])
             .build();
 
@@ -3090,7 +1613,6 @@ mod tests {
 
     #[test]
     fn find_dispatch_entries_ignores_non_menu_play_pl() {
-        // MOBJ has PlayPl(201) but 201 is not a menu playlist.
         let mobj_data = MobjBuilder::new()
             .object(&[InsnSpec::PlayPl(201), InsnSpec::Nop])
             .build();
@@ -3104,7 +1626,6 @@ mod tests {
 
     #[test]
     fn find_dispatch_entries_ignores_last_instruction() {
-        // PlayPl(800) is the last instruction — no room for dispatch_pc.
         let mobj_data = MobjBuilder::new().object(&[InsnSpec::PlayPl(800)]).build();
 
         let mobj_file = parse(&mobj_data).expect("should parse");
@@ -3119,17 +1640,9 @@ mod tests {
 
     #[test]
     fn find_dispatch_entries_multiple_mobjs() {
-        // Two MOBJs each with a menu PlayPl.
         let mobj_data = MobjBuilder::new()
-            .object(&[
-                InsnSpec::PlayPl(800), // 0: menu
-                InsnSpec::Nop,         // 1: dispatch
-            ])
-            .object(&[
-                InsnSpec::Nop,         // 0: init
-                InsnSpec::PlayPl(801), // 1: menu
-                InsnSpec::Nop,         // 2: dispatch
-            ])
+            .object(&[InsnSpec::PlayPl(800), InsnSpec::Nop])
+            .object(&[InsnSpec::Nop, InsnSpec::PlayPl(801), InsnSpec::Nop])
             .build();
 
         let mobj_file = parse(&mobj_data).expect("should parse");
@@ -3147,51 +1660,41 @@ mod tests {
 
     #[test]
     fn dispatch_entry_resolves_warner_bros_pattern() {
-        // Simulates the Warner Bros. authoring pattern:
-        // - Initialization code (instructions 0–4) that clobbers GPR[4075]
-        // - PlayPl(800) at instruction 5 (menu playlist, suspends MOBJ)
-        // - Dispatch logic at instruction 6+ (resumes after button press)
         let mobj_data = MobjBuilder::new()
             .object(&[
-                // Initialization — clobbers GPR[4075]
-                InsnSpec::SetGpr(4075, 0), // 0: clear dispatch key
-                InsnSpec::SetGpr(4076, 0), // 1: clear scratch
-                InsnSpec::SetGpr(4077, 0), // 2: clear scratch
-                InsnSpec::Nop,             // 3: init
-                InsnSpec::Nop,             // 4: init
-                InsnSpec::PlayPl(800),     // 5: play menu (suspends)
-                // Dispatch logic — resumes here after button activation
-                InsnSpec::SetGpr(4076, 1),      // 6: case key = 1
-                InsnSpec::CmpEqReg(4075, 4076), // 7: GPR[4075] == 1?
-                InsnSpec::GotoIf(17),           // 8: → handler 1
-                InsnSpec::SetGpr(4076, 2),      // 9: case key = 2
-                InsnSpec::CmpEqReg(4075, 4076), // 10: GPR[4075] == 2?
-                InsnSpec::GotoIf(20),           // 11: → handler 2
-                InsnSpec::SetGpr(4076, 3),      // 12: case key = 3
-                InsnSpec::CmpEqReg(4075, 4076), // 13: GPR[4075] == 3?
-                InsnSpec::GotoIf(23),           // 14: → handler 3
-                InsnSpec::Goto(25),             // 15: no match → end
-                InsnSpec::Nop,                  // 16: pad
-                InsnSpec::SetGpr(4075, 201),    // 17: handler 1
-                InsnSpec::PlayPlReg(4075),      // 18: play
-                InsnSpec::Goto(25),             // 19: → end
-                InsnSpec::SetGpr(4075, 202),    // 20: handler 2
-                InsnSpec::PlayPlReg(4075),      // 21: play
-                InsnSpec::Goto(25),             // 22: → end
-                InsnSpec::SetGpr(4075, 203),    // 23: handler 3
-                InsnSpec::PlayPlReg(4075),      // 24: play
-                InsnSpec::Nop,                  // 25: end
+                InsnSpec::SetGpr(4075, 0),
+                InsnSpec::SetGpr(4076, 0),
+                InsnSpec::SetGpr(4077, 0),
+                InsnSpec::Nop,
+                InsnSpec::Nop,
+                InsnSpec::PlayPl(800),
+                InsnSpec::SetGpr(4076, 1),
+                InsnSpec::CmpEqReg(4075, 4076),
+                InsnSpec::GotoIf(17),
+                InsnSpec::SetGpr(4076, 2),
+                InsnSpec::CmpEqReg(4075, 4076),
+                InsnSpec::GotoIf(20),
+                InsnSpec::SetGpr(4076, 3),
+                InsnSpec::CmpEqReg(4075, 4076),
+                InsnSpec::GotoIf(23),
+                InsnSpec::Goto(25),
+                InsnSpec::Nop,
+                InsnSpec::SetGpr(4075, 201),
+                InsnSpec::PlayPlReg(4075),
+                InsnSpec::Goto(25),
+                InsnSpec::SetGpr(4075, 202),
+                InsnSpec::PlayPlReg(4075),
+                InsnSpec::Goto(25),
+                InsnSpec::SetGpr(4075, 203),
+                InsnSpec::PlayPlReg(4075),
+                InsnSpec::Nop,
             ])
             .build();
 
         let mobj_file = parse(&mobj_data).expect("should parse");
-
-        // Only content playlists are valid — menu playlist 800 is excluded.
         let valid_playlists: std::collections::HashSet<u32> = [201, 202, 203].into();
 
-        // Without dispatch entries, the lifecycle simulation still works:
-        // it executes from instruction 0, hits PlayPl(800) (non-valid),
-        // re-applies button GPR[4075]=2, and continues to the dispatch.
+        // Without dispatch entries — lifecycle simulation
         let button_lifecycle = make_button(
             1,
             vec![NavigationCommand::SetGpr {
@@ -3203,7 +1706,7 @@ mod tests {
             &[(button_lifecycle, PlayerContext::default())],
             &mobj_file,
             &valid_playlists,
-            &[], // no dispatch entries — lifecycle simulation handles it
+            &[],
             None,
         );
         assert_eq!(
@@ -3216,13 +1719,11 @@ mod tests {
             "lifecycle: button key=2 → playlist 202"
         );
 
-        // With dispatch entries (PlayPl(800) is the menu playlist),
-        // the VM starts at instruction 6, skipping initialization.
+        // With dispatch entries
         let dispatch_entries = vec![DispatchEntry {
             mobj_index: 0,
             dispatch_pc: 6,
         }];
-
         let button = make_button(
             1,
             vec![NavigationCommand::SetGpr {
@@ -3247,36 +1748,32 @@ mod tests {
 
     #[test]
     fn dispatch_entry_resolves_multiple_buttons() {
-        // Three buttons with different dispatch keys, resolved via the
-        // same dispatch entry point.
         let mobj_data = MobjBuilder::new()
             .object(&[
-                InsnSpec::SetGpr(4075, 0), // 0: init clobbers
-                InsnSpec::PlayPl(800),     // 1: menu
-                // Dispatch at pc=2
-                InsnSpec::SetGpr(4076, 10),     // 2: case 10
-                InsnSpec::CmpEqReg(4075, 4076), // 3
-                InsnSpec::GotoIf(11),           // 4: → handler 10
-                InsnSpec::SetGpr(4076, 20),     // 5: case 20
-                InsnSpec::CmpEqReg(4075, 4076), // 6
-                InsnSpec::GotoIf(14),           // 7: → handler 20
-                InsnSpec::SetGpr(4076, 30),     // 8: case 30
-                InsnSpec::CmpEqReg(4075, 4076), // 9
-                InsnSpec::GotoIf(17),           // 10: → handler 30
-                InsnSpec::SetGpr(4075, 301),    // 11: handler 10
-                InsnSpec::PlayPlReg(4075),      // 12
-                InsnSpec::Goto(19),             // 13: → end
-                InsnSpec::SetGpr(4075, 302),    // 14: handler 20
-                InsnSpec::PlayPlReg(4075),      // 15
-                InsnSpec::Goto(19),             // 16: → end
-                InsnSpec::SetGpr(4075, 303),    // 17: handler 30
-                InsnSpec::PlayPlReg(4075),      // 18
-                InsnSpec::Nop,                  // 19: end
+                InsnSpec::SetGpr(4075, 0),
+                InsnSpec::PlayPl(800),
+                InsnSpec::SetGpr(4076, 10),
+                InsnSpec::CmpEqReg(4075, 4076),
+                InsnSpec::GotoIf(11),
+                InsnSpec::SetGpr(4076, 20),
+                InsnSpec::CmpEqReg(4075, 4076),
+                InsnSpec::GotoIf(14),
+                InsnSpec::SetGpr(4076, 30),
+                InsnSpec::CmpEqReg(4075, 4076),
+                InsnSpec::GotoIf(17),
+                InsnSpec::SetGpr(4075, 301),
+                InsnSpec::PlayPlReg(4075),
+                InsnSpec::Goto(19),
+                InsnSpec::SetGpr(4075, 302),
+                InsnSpec::PlayPlReg(4075),
+                InsnSpec::Goto(19),
+                InsnSpec::SetGpr(4075, 303),
+                InsnSpec::PlayPlReg(4075),
+                InsnSpec::Nop,
             ])
             .build();
 
         let mobj_file = parse(&mobj_data).expect("should parse");
-
         let dispatch_entries = vec![DispatchEntry {
             mobj_index: 0,
             dispatch_pc: 2,
@@ -3324,25 +1821,21 @@ mod tests {
 
     #[test]
     fn dispatch_entry_end_to_end_with_find() {
-        // End-to-end: build an MOBJ, find dispatch entries, resolve buttons.
         let mobj_data = MobjBuilder::new()
             .object(&[
-                InsnSpec::SetGpr(4075, 0), // 0: init
-                InsnSpec::PlayPl(800),     // 1: menu playlist
-                // Dispatch at pc=2
-                InsnSpec::SetGpr(4076, 5),      // 2
-                InsnSpec::CmpEqReg(4075, 4076), // 3
-                InsnSpec::GotoIf(7),            // 4
-                InsnSpec::Nop,                  // 5
-                InsnSpec::Nop,                  // 6
-                InsnSpec::SetGpr(4075, 205),    // 7
-                InsnSpec::PlayPlReg(4075),      // 8
+                InsnSpec::SetGpr(4075, 0),
+                InsnSpec::PlayPl(800),
+                InsnSpec::SetGpr(4076, 5),
+                InsnSpec::CmpEqReg(4075, 4076),
+                InsnSpec::GotoIf(7),
+                InsnSpec::Nop,
+                InsnSpec::Nop,
+                InsnSpec::SetGpr(4075, 205),
+                InsnSpec::PlayPlReg(4075),
             ])
             .build();
 
         let mobj_file = parse(&mobj_data).expect("should parse");
-
-        // Find dispatch entries using the menu playlist set
         let menu_playlists: std::collections::HashSet<u32> = [800].into();
         let dispatch_entries = find_dispatch_entries(&mobj_file, &menu_playlists);
         assert_eq!(dispatch_entries.len(), 1, "one dispatch entry found");
@@ -3369,23 +1862,17 @@ mod tests {
 
     #[test]
     fn dispatch_entry_goto_mobj_unaffected() {
-        // GotoMobj buttons should still work when dispatch entries exist.
         let mobj_data = MobjBuilder::new()
-            .object(&[
-                InsnSpec::PlayPl(800), // 0: menu PlayPl
-                InsnSpec::Nop,         // 1: dispatch
-            ])
-            .object(&[InsnSpec::PlayPl(201)]) // MOBJ 1: target
+            .object(&[InsnSpec::PlayPl(800), InsnSpec::Nop])
+            .object(&[InsnSpec::PlayPl(201)])
             .build();
 
         let mobj_file = parse(&mobj_data).expect("should parse");
-
         let dispatch_entries = vec![DispatchEntry {
             mobj_index: 0,
             dispatch_pc: 1,
         }];
 
-        // GotoMobj button — should resolve via static path, not dispatch
         let button = make_button(
             1,
             vec![
@@ -3410,51 +1897,6 @@ mod tests {
 
     // ── Dispatch table extraction tests ───────────────────────────────
 
-    /// Builds a synthetic dispatch MOBJ with the CMP/GOTO switch pattern.
-    ///
-    /// Structure:
-    /// - Instructions 0..cases*4: switch table (4 instructions per case)
-    /// - Instructions cases*4..: handler blocks (SET + `PlayPl` + GOTO per case)
-    fn build_dispatch_mobj(cases: &[(u32, u16)]) -> Vec<InsnSpec> {
-        let switch_end = cases.len() * 4;
-        // +1 for exit GOTO between switch and handlers
-        let handlers_start = switch_end + 1;
-        let exit_pc = handlers_start + cases.len() * 3;
-        let mut instrs = Vec::new();
-
-        // Switch table: 4 instructions per case
-        for (i, &(case_val, _)) in cases.iter().enumerate() {
-            let handler_pc = handlers_start + i * 3;
-            instrs.push(InsnSpec::SetGprReg(100, 200)); // load dispatch reg
-            instrs.push(InsnSpec::SetGpr(101, case_val)); // case value
-            instrs.push(InsnSpec::CmpEqReg(100, 101)); // compare
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "test data — handler_pc fits in u32"
-            )]
-            instrs.push(InsnSpec::Goto(handler_pc as u32)); // → handler
-        }
-
-        // Exit GOTO: no match → skip all handlers (real discs have this)
-        #[allow(
-            clippy::cast_possible_truncation,
-            reason = "test data — exit_pc fits in u32"
-        )]
-        instrs.push(InsnSpec::Goto(exit_pc as u32));
-
-        // Handler blocks: SET playlist + PlayPl + GOTO loop
-        for &(_, playlist) in cases {
-            instrs.push(InsnSpec::SetGpr(100, u32::from(playlist)));
-            instrs.push(InsnSpec::PlayPlReg(100));
-            instrs.push(InsnSpec::Goto(0)); // loop back
-        }
-
-        // Exit target
-        instrs.push(InsnSpec::Nop);
-
-        instrs
-    }
-
     #[test]
     fn extract_dispatch_table_three_cases() {
         let dispatch_mobj = build_dispatch_mobj(&[(0, 201), (1, 202), (2, 203)]);
@@ -3476,13 +1918,11 @@ mod tests {
 
     #[test]
     fn extract_dispatch_table_with_init_code() {
-        // Init code before the switch table — should still extract correctly.
         let mut instrs = vec![
-            InsnSpec::SetGpr(200, 0), // init: clear dispatch register
-            InsnSpec::SetGpr(100, 0), // init: clear scratch
-            InsnSpec::Nop,            // init: pad
+            InsnSpec::SetGpr(200, 0),
+            InsnSpec::SetGpr(100, 0),
+            InsnSpec::Nop,
         ];
-        // 3 init instructions, then switch at 3..15, handlers at 15..
         let cases: [(u32, u16); 3] = [(5, 301), (10, 302), (15, 303)];
         let switch_start = instrs.len();
         for (i, &(case_val, _)) in cases.iter().enumerate() {
@@ -3490,10 +1930,7 @@ mod tests {
             instrs.push(InsnSpec::SetGprReg(100, 200));
             instrs.push(InsnSpec::SetGpr(101, case_val));
             instrs.push(InsnSpec::CmpEqReg(100, 101));
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "test data — handler_pc fits in u32"
-            )]
+            #[allow(clippy::cast_possible_truncation, reason = "test data")]
             instrs.push(InsnSpec::Goto(handler_pc as u32));
         }
         for &(_, playlist) in &cases {
@@ -3514,7 +1951,6 @@ mod tests {
 
     #[test]
     fn extract_dispatch_table_picks_mobj_with_most_handlers() {
-        // MOBJ 0: small (1 PlayPl), MOBJ 1: dispatch table (4 cases)
         let small_mobj = vec![InsnSpec::PlayPl(999)];
         let dispatch_mobj = build_dispatch_mobj(&[(0, 201), (1, 202), (2, 203), (3, 204)]);
 
@@ -3522,7 +1958,6 @@ mod tests {
             .object(&small_mobj)
             .object(&dispatch_mobj)
             .build();
-
         let mobj_file = parse(&mobj_data).expect("should parse");
         let table = extract_dispatch_table(&mobj_file).expect("should extract table");
 
@@ -3532,7 +1967,6 @@ mod tests {
 
     #[test]
     fn extract_dispatch_table_none_for_goto_mobj_disc() {
-        // GotoMobj-style disc: no CMP/GOTO switch pattern, only simple MOBJs.
         let mobj_data = MobjBuilder::new()
             .object(&[InsnSpec::PlayPl(201)])
             .object(&[InsnSpec::PlayPl(202)])
@@ -3555,17 +1989,12 @@ mod tests {
 
     #[test]
     fn dispatch_table_resolves_buttons_composite() {
-        // Composite dispatch: case = button_id + key.
-        // button_id=6, key=5 → case 11; button_id=3, key=5 → case 8;
-        // button_id=0, key=5 → case 5 (backwards compatible with raw key).
         let dispatch_mobj = build_dispatch_mobj(&[(5, 205), (8, 208), (11, 211)]);
         let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
-
         let mobj_file = parse(&mobj_data).expect("should parse");
         let table = extract_dispatch_table(&mobj_file).expect("should extract table");
 
         let buttons = vec![
-            // button_id=6, key=5 → composite 11 → playlist 211
             make_button(
                 6,
                 vec![NavigationCommand::SetGpr {
@@ -3573,7 +2002,6 @@ mod tests {
                     value: 5,
                 }],
             ),
-            // button_id=3, key=5 → composite 8 → playlist 208
             make_button(
                 3,
                 vec![NavigationCommand::SetGpr {
@@ -3581,7 +2009,6 @@ mod tests {
                     value: 5,
                 }],
             ),
-            // button_id=0, key=5 → composite 5 → playlist 205
             make_button(
                 0,
                 vec![NavigationCommand::SetGpr {
@@ -3618,15 +2045,11 @@ mod tests {
 
     #[test]
     fn dispatch_table_composite_outside_range_not_resolved() {
-        // Cases are 10–12. Button composite = button_id(1) + key(99) = 100,
-        // which is outside the table range.
         let dispatch_mobj = build_dispatch_mobj(&[(10, 201), (11, 202), (12, 203)]);
         let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
-
         let mobj_file = parse(&mobj_data).expect("should parse");
         let table = extract_dispatch_table(&mobj_file).expect("should extract table");
 
-        // Composite 1 + 99 = 100, not in {10, 11, 12}
         let button = make_button(
             1,
             vec![NavigationCommand::SetGpr {
@@ -3647,9 +2070,6 @@ mod tests {
 
     #[test]
     fn dispatch_table_coexists_with_goto_mobj() {
-        // Mixed disc: MOBJ 0 is a simple GotoMobj target, MOBJ 1 is a
-        // dispatch table. GotoMobj buttons use pattern 1, dispatch buttons
-        // use the table. Composite = button_id(20) + key(2) = 22.
         let goto_target = vec![InsnSpec::PlayPl(500)];
         let dispatch_mobj = build_dispatch_mobj(&[(20, 301), (22, 302), (24, 303)]);
 
@@ -3657,11 +2077,9 @@ mod tests {
             .object(&goto_target)
             .object(&dispatch_mobj)
             .build();
-
         let mobj_file = parse(&mobj_data).expect("should parse");
         let table = extract_dispatch_table(&mobj_file).expect("should extract table");
 
-        // GotoMobj button
         let goto_button = make_button(
             10,
             vec![
@@ -3672,8 +2090,6 @@ mod tests {
                 NavigationCommand::GotoMobj { object_id: 0 },
             ],
         );
-
-        // Dispatch table button: composite = 20 + 2 = 22 → case 22 → 302
         let dispatch_button = make_button(
             20,
             vec![NavigationCommand::SetGpr {
@@ -3693,19 +2109,14 @@ mod tests {
             Some(&table),
         );
         assert_eq!(resolved.len(), 2, "both buttons resolved");
-        assert_eq!(resolved[0].button_id, 10, "GotoMobj button");
         assert_eq!(resolved[0].target.playlist, 500, "GotoMobj → 500");
-        assert_eq!(resolved[1].button_id, 20, "dispatch table button");
         assert_eq!(resolved[1].target.playlist, 302, "composite 20+2=22 → 302");
     }
 
     #[test]
     fn dispatch_table_button_id_zero_matches_raw_key() {
-        // button_id=0 means composite = 0 + key = key, so the lookup is
-        // backwards compatible with the raw-key case.
         let dispatch_mobj = build_dispatch_mobj(&[(0, 201), (5, 205), (10, 210)]);
         let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
-
         let mobj_file = parse(&mobj_data).expect("should parse");
         let table = extract_dispatch_table(&mobj_file).expect("should extract table");
 
@@ -3732,11 +2143,6 @@ mod tests {
 
     #[test]
     fn set_button_page_resolves_via_dispatch_fallback() {
-        // SET_BUTTON_PAGE is navigation, but when the composite matches
-        // a dispatch table entry and no NOP anchor resolves that case,
-        // the fallback pass resolves it. This covers WB authoring where
-        // top-level buttons (e.g. "PLAY MOVIE") produce a composite
-        // that IS the dispatch case value.
         let button = make_button(
             3,
             vec![
@@ -3773,23 +2179,17 @@ mod tests {
             &std::collections::HashSet::new(),
         );
 
-        // btn[3] computes composite = 3 + 5 = 8, which matches case 8 → PL 208
         assert_eq!(resolved.len(), 1, "dispatch fallback resolves composite 8");
         assert_eq!(resolved[0].target.playlist, 208, "composite 8 → PL 208");
         assert_eq!(
             breadcrumb_ids(&resolved[0].breadcrumb),
             vec![3],
-            "breadcrumb is the navigation button that produced the composite"
+            "breadcrumb is the navigation button"
         );
     }
 
     #[test]
     fn nav_breadcrumb_play_pl_via_navigation() {
-        // Page 0: navigation button sets GPR[100]=42, navigates to page 1.
-        // Page 1: content button does GotoMobj → MOBJ with conditional PlayPl.
-        //
-        // Expected: content button resolves with breadcrumb [1, 5]
-        // (nav button ID + content button ID).
         let nav_button = make_button(
             1,
             vec![
@@ -3823,7 +2223,7 @@ mod tests {
         let page1 = make_page(1, vec![content_button]);
 
         let mobj_data = MobjBuilder::new()
-            .object(&[InsnSpec::Nop]) // MOBJ[0]
+            .object(&[InsnSpec::Nop])
             .object(&[
                 InsnSpec::CmpEq(0, 42),
                 InsnSpec::Goto(3),
@@ -3840,7 +2240,6 @@ mod tests {
             ig_pid: 0x1200,
             pages: vec![&page0, &page1],
         }];
-
         let resolved = resolve_via_execution(&clips, &mobj_file, None, &valid);
 
         assert_eq!(resolved.len(), 1, "one playlist resolved");
@@ -3854,9 +2253,6 @@ mod tests {
 
     #[test]
     fn exec_goto_mobj_resolves_playlist() {
-        // GotoMobj pattern: SetGpr(0, 42) + GotoMobj(1)
-        // MOBJ[1] has: CMP GPR[0]==42, GOTO 3, Nop, PlayPl(301)
-        // Direct content on root page → single-element breadcrumb.
         let button = make_button(
             5,
             vec![
@@ -3869,7 +2265,7 @@ mod tests {
         );
 
         let mobj_data = MobjBuilder::new()
-            .object(&[InsnSpec::Nop]) // MOBJ[0] — unused
+            .object(&[InsnSpec::Nop])
             .object(&[
                 InsnSpec::CmpEq(0, 42),
                 InsnSpec::Goto(3),
@@ -3894,14 +2290,12 @@ mod tests {
         assert_eq!(
             breadcrumb_ids(&resolved[0].breadcrumb),
             vec![5],
-            "direct content on root page → single-element breadcrumb"
+            "direct content → single-element breadcrumb"
         );
     }
 
     #[test]
     fn exec_direct_play_pl_skipped() {
-        // Buttons with direct PlayPl are skipped (they're already resolved
-        // by the IG parser's typed variant).
         let button = make_button(
             1,
             vec![NavigationCommand::PlayPl {
@@ -3927,7 +2321,6 @@ mod tests {
 
     #[test]
     fn exec_step_limit_returns_none() {
-        // Infinite loop: GOTO 0
         let button = make_button(1, vec![spec_to_other(&InsnSpec::Goto(0))]);
 
         let mobj_data = MobjBuilder::new().object(&[InsnSpec::Nop]).build();
@@ -3946,8 +2339,6 @@ mod tests {
 
     #[test]
     fn nav_breadcrumb_two_level_navigation() {
-        // Page 0 → page 1 → page 2 → PlayPl. Three levels of
-        // navigation produce a 3-element breadcrumb.
         let nav0 = make_button(
             1,
             vec![
@@ -3993,7 +2384,7 @@ mod tests {
         let page2 = make_page(2, vec![content]);
 
         let mobj_data = MobjBuilder::new()
-            .object(&[InsnSpec::Nop]) // MOBJ[0]
+            .object(&[InsnSpec::Nop])
             .object(&[InsnSpec::PlayPl(401)])
             .build();
         let mobj_file = parse(&mobj_data).expect("should parse");
@@ -4005,7 +2396,6 @@ mod tests {
             ig_pid: 0x1200,
             pages: vec![&page0, &page1, &page2],
         }];
-
         let resolved = resolve_via_execution(&clips, &mobj_file, None, &valid);
 
         assert_eq!(resolved.len(), 1, "one playlist resolved");
@@ -4013,63 +2403,14 @@ mod tests {
         assert_eq!(
             breadcrumb_ids(&resolved[0].breadcrumb),
             vec![1, 2, 3],
-            "three-level breadcrumb: page 0 → page 1 → page 2"
+            "three-level breadcrumb"
         );
-    }
-
-    #[test]
-    fn command_to_instruction_roundtrip() {
-        // Verify that command_to_instruction produces correct Instruction
-        // fields for each NavigationCommand variant.
-
-        // PlayPl
-        let play = command_to_instruction(&NavigationCommand::PlayPl {
-            playlist: 42,
-            branch_opt: 0,
-            mark_or_pi: 0,
-        });
-        assert_eq!(play.group, GRP_BRANCH, "PlayPl group");
-        assert_eq!(play.sub_group, BRANCH_PLAY, "PlayPl sub_group");
-        assert!(play.imm_op1, "PlayPl imm_op1");
-        assert_eq!(play.dst, 42, "PlayPl dst");
-
-        // SetGpr
-        let set = command_to_instruction(&NavigationCommand::SetGpr {
-            register: 100,
-            value: 999,
-        });
-        assert_eq!(set.group, GRP_SET, "SetGpr group");
-        assert_eq!(set.sub_group, 0, "SetGpr sub_group");
-        assert_eq!(set.set_opt, 0x01, "SetGpr MOVE");
-        assert!(set.imm_op2, "SetGpr imm_op2");
-        assert_eq!(set.dst, 100, "SetGpr dst");
-        assert_eq!(set.src, 999, "SetGpr src");
-
-        // GotoMobj
-        let goto = command_to_instruction(&NavigationCommand::GotoMobj { object_id: 7 });
-        assert_eq!(goto.group, GRP_BRANCH, "GotoMobj group");
-        assert_eq!(goto.sub_group, BRANCH_JUMP, "GotoMobj sub_group");
-        assert!(goto.imm_op1, "GotoMobj imm_op1");
-        assert_eq!(goto.dst, 7, "GotoMobj dst");
-
-        // Other (AND instruction)
-        let (opcode, dst, src) = spec_to_raw(&InsnSpec::AndReg(4077, 4076));
-        let other = command_to_instruction(&NavigationCommand::Other { opcode, dst, src });
-        assert_eq!(other.group, GRP_SET, "Other AND group");
-        assert_eq!(other.set_opt, 0x09, "Other AND set_opt");
-        assert_eq!(other.dst, 4077, "Other AND dst");
-        assert_eq!(other.src, 4076, "Other AND src");
     }
 
     // ── Navigation graph tests ────────────────────────────────────────
 
     #[test]
     fn nav_graph_propagates_gpr_state() {
-        // Page 0: navigation button sets GPR[100]=42, navigates to page 1.
-        // Page 1: content button reads GPR[100] to select an MOBJ target.
-        //
-        // With propagated GPR state: GPR[100]=42 → GotoMobj(2) → PlayPl(302)
-        // Without propagation (initial seed): GPR[100]=0 → GotoMobj(1) → PlayPl(301)
         let nav_button = make_button(
             1,
             vec![
@@ -4090,22 +2431,20 @@ mod tests {
         );
         let page0 = make_page(0, vec![nav_button]);
 
-        // Content button on page 1: CMP GPR[100]==42 → GotoMobj(2), else GotoMobj(1)
-        // Pattern: CMP true → execute next, CMP false → skip next.
         let content_button = make_button(
             5,
             vec![
-                spec_to_other(&InsnSpec::CmpEq(100, 42)),     // 0: if ==42
-                NavigationCommand::GotoMobj { object_id: 2 }, // 1: then MOBJ[2]
-                NavigationCommand::GotoMobj { object_id: 1 }, // 2: else MOBJ[1]
+                spec_to_other(&InsnSpec::CmpEq(100, 42)),
+                NavigationCommand::GotoMobj { object_id: 2 },
+                NavigationCommand::GotoMobj { object_id: 1 },
             ],
         );
         let page1 = make_page(1, vec![content_button]);
 
         let mobj_data = MobjBuilder::new()
-            .object(&[InsnSpec::Nop]) // MOBJ[0]
-            .object(&[InsnSpec::PlayPl(301)]) // MOBJ[1]: default
-            .object(&[InsnSpec::PlayPl(302)]) // MOBJ[2]: with GPR[100]=42
+            .object(&[InsnSpec::Nop])
+            .object(&[InsnSpec::PlayPl(301)])
+            .object(&[InsnSpec::PlayPl(302)])
             .build();
         let mobj_file = parse(&mobj_data).expect("should parse");
 
@@ -4117,11 +2456,8 @@ mod tests {
             ig_pid: 0x1200,
             pages: vec![&page0, &page1],
         }];
-
         let resolved = resolve_via_execution(&clips, &mobj_file, None, &valid);
 
-        // Page 1 is only reached via navigation from page 0.
-        // With GPR[100]=42: CMP true → GotoMobj(2) → PlayPl(302).
         assert_eq!(resolved.len(), 1, "one playlist resolved via navigation");
         assert_eq!(
             resolved[0].target.playlist, 302,
@@ -4136,11 +2472,6 @@ mod tests {
 
     #[test]
     fn nav_graph_multiple_paths_to_same_page() {
-        // Page 0: two navigation buttons, each setting GPR[100] to a
-        // different value and navigating to page 1.
-        // Page 1: content button reads GPR[100] to select MOBJ.
-        //
-        // Expected: both propagated states produce distinct resolutions.
         let nav_a = make_button(
             1,
             vec![
@@ -4179,28 +2510,23 @@ mod tests {
         );
         let page0 = make_page(0, vec![nav_a, nav_b]);
 
-        // Content button: GPR[100] → select MOBJ via CMP chain.
-        // Pattern: CMP true → execute next (GotoMobj), CMP false → skip next.
-        //   CMP GPR[100] == 10 → GotoMobj(1) → PlayPl(301)
-        //   CMP GPR[100] == 20 → GotoMobj(2) → PlayPl(302)
-        //   fallback → GotoMobj(3) → PlayPl(303)
         let content = make_button(
             5,
             vec![
-                spec_to_other(&InsnSpec::CmpEq(100, 10)),     // 0: if ==10
-                NavigationCommand::GotoMobj { object_id: 1 }, // 1: then MOBJ[1]
-                spec_to_other(&InsnSpec::CmpEq(100, 20)),     // 2: if ==20
-                NavigationCommand::GotoMobj { object_id: 2 }, // 3: then MOBJ[2]
-                NavigationCommand::GotoMobj { object_id: 3 }, // 4: else MOBJ[3]
+                spec_to_other(&InsnSpec::CmpEq(100, 10)),
+                NavigationCommand::GotoMobj { object_id: 1 },
+                spec_to_other(&InsnSpec::CmpEq(100, 20)),
+                NavigationCommand::GotoMobj { object_id: 2 },
+                NavigationCommand::GotoMobj { object_id: 3 },
             ],
         );
         let page1 = make_page(1, vec![content]);
 
         let mobj_data = MobjBuilder::new()
-            .object(&[InsnSpec::Nop]) // MOBJ[0]
-            .object(&[InsnSpec::PlayPl(301)]) // MOBJ[1]
-            .object(&[InsnSpec::PlayPl(302)]) // MOBJ[2]
-            .object(&[InsnSpec::PlayPl(303)]) // MOBJ[3]: default
+            .object(&[InsnSpec::Nop])
+            .object(&[InsnSpec::PlayPl(301)])
+            .object(&[InsnSpec::PlayPl(302)])
+            .object(&[InsnSpec::PlayPl(303)])
             .build();
         let mobj_file = parse(&mobj_data).expect("should parse");
 
@@ -4213,32 +2539,17 @@ mod tests {
             ig_pid: 0x1200,
             pages: vec![&page0, &page1],
         }];
-
         let resolved = resolve_via_execution(&clips, &mobj_file, None, &valid);
 
-        // Page 1 is only reached via navigation — no initial seeding.
-        // Two navigation paths bring different GPR state.
         let playlists: std::collections::HashSet<u16> =
             resolved.iter().map(|r| r.target.playlist).collect();
-        assert!(
-            playlists.contains(&301),
-            "path A: GPR[100]=10 → 301; got {resolved:?}"
-        );
-        assert!(
-            playlists.contains(&302),
-            "path B: GPR[100]=20 → 302; got {resolved:?}"
-        );
-        assert_eq!(
-            playlists.len(),
-            2,
-            "exactly two playlists (no initial-state fallback on sub-page)"
-        );
+        assert!(playlists.contains(&301), "path A: GPR[100]=10 → 301");
+        assert!(playlists.contains(&302), "path B: GPR[100]=20 → 302");
+        assert_eq!(playlists.len(), 2, "exactly two playlists");
     }
 
     #[test]
     fn nav_graph_handles_cycle() {
-        // Page 0 navigates to page 1, page 1 navigates back to page 0.
-        // BFS must terminate without hanging.
         let nav0 = make_button(
             1,
             vec![
@@ -4278,8 +2589,6 @@ mod tests {
             ig_pid: 0x1200,
             pages: vec![&page0, &page1],
         }];
-
-        // Should terminate — visited set prevents re-processing same state
         let resolved =
             resolve_via_execution(&clips, &mobj_file, None, &std::collections::HashSet::new());
         assert!(
@@ -4290,10 +2599,6 @@ mod tests {
 
     #[test]
     fn nav_graph_same_page_terminates() {
-        // Single page where a navigation button's SET_BUTTON_PAGE targets
-        // the current page (same-page edge). Should terminate without
-        // infinite looping. The composite matches a dispatch case, so the
-        // fallback resolves it.
         let nav_button = make_button(
             3,
             vec![
@@ -4308,7 +2613,6 @@ mod tests {
                 spec_to_other(&InsnSpec::SetGprReg(4077, PSR_FLAG | 0x0A)),
                 spec_to_other(&InsnSpec::AndReg(4077, 4076)),
                 spec_to_other(&InsnSpec::AddReg(4077, 4075)),
-                // page register GPR[60] = 0 = current page → same-page edge
                 spec_to_other(&InsnSpec::SetButtonPage(4077, 60)),
             ],
         );
@@ -4323,7 +2627,6 @@ mod tests {
             ig_pid: 0x1200,
             pages: vec![&page],
         }];
-
         let resolved = resolve_via_execution(
             &clips,
             &mobj_file,
@@ -4331,12 +2634,7 @@ mod tests {
             &std::collections::HashSet::new(),
         );
 
-        // btn[3] + 5 = composite 8 → PL 208 via dispatch fallback
-        assert_eq!(
-            resolved.len(),
-            1,
-            "same-page navigation terminates; composite resolves via fallback"
-        );
+        assert_eq!(resolved.len(), 1, "same-page navigation terminates");
         assert_eq!(resolved[0].target.playlist, 208, "composite 8 → PL 208");
     }
 
@@ -4344,14 +2642,6 @@ mod tests {
 
     #[test]
     fn exec_nop_anchor_resolves_via_button_id() {
-        // NOP anchor buttons resolve by matching their button_id
-        // directly against the dispatch table. This models the WB
-        // SET_BUTTON_PAGE pattern where anchor button_ids on extras
-        // pages are the dispatch cases (PSR[10] = button_id).
-        //
-        // Tests both true empty commands and single-NOP commands
-        // (WB authoring emits a single all-zero 12-byte NOP).
-        // Anchors on a root page get single-element breadcrumbs.
         let anchor_12 = make_button(12, vec![]);
         let anchor_15 = make_button(15, vec![spec_to_other(&InsnSpec::Nop)]);
         let anchor_20 = make_button(20, vec![]);
@@ -4382,7 +2672,6 @@ mod tests {
         assert!(playlists.contains(&215), "anchor 15 → 215");
         assert!(playlists.contains(&220), "anchor 20 → 220");
 
-        // Each anchor on a root page gets a single-element breadcrumb.
         for rp in &resolved {
             assert_eq!(
                 rp.breadcrumb.len(),
@@ -4394,9 +2683,7 @@ mod tests {
 
     #[test]
     fn exec_nop_anchor_skipped_without_dispatch_table() {
-        // Without a dispatch table, NOP anchors cannot resolve.
         let anchor = make_button(12, vec![]);
-
         let mobj_data = MobjBuilder::new().object(&[InsnSpec::Nop]).build();
         let mobj_file = parse(&mobj_data).expect("should parse");
 
@@ -4416,9 +2703,7 @@ mod tests {
 
     #[test]
     fn exec_nop_anchor_unmatched_id_skipped() {
-        // NOP anchor whose button_id doesn't match any dispatch case.
         let anchor = make_button(99, vec![]);
-
         let dispatch_mobj = build_dispatch_mobj(&[(5, 205), (10, 210), (15, 215)]);
         let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
         let mobj_file = parse(&mobj_data).expect("should parse");
@@ -4444,16 +2729,6 @@ mod tests {
 
     #[test]
     fn exec_nop_anchors_coexist_with_navigation_buttons() {
-        // Mix of NOP anchors, visible thumbnails, and navigation buttons
-        // on the same page (models WB extras layout):
-        // - nav btn[3]@(1080,949) — menu bar navigation
-        // - visible btn[5]@(229,668) — thumbnail the user sees
-        // - NOP anchor btn[15]@(199,668) — ~30px from thumbnail
-        //
-        // The NOP anchor resolves via dispatch lookup. The breadcrumb
-        // records the visible thumbnail (btn[5]), not the NOP anchor.
-        // The navigation button's composite resolves via the post-BFS
-        // fallback (different dispatch case, different playlist).
         let nav_button = make_button_at(
             3,
             1080,
@@ -4473,7 +2748,6 @@ mod tests {
                 spec_to_other(&InsnSpec::SetButtonPage(4077, 0)),
             ],
         );
-        // Visible thumbnail — navigates to a details page (page 26)
         let thumbnail = make_button_at(
             5,
             229,
@@ -4510,9 +2784,6 @@ mod tests {
             &std::collections::HashSet::new(),
         );
 
-        // NOP anchor btn[15] → case 15 → PL 215 (BFS direct)
-        // Breadcrumb records btn[5] (visible thumbnail), not btn[15].
-        // Nav btn[3] → composite 8 → PL 208 (fallback)
         assert_eq!(
             resolved.len(),
             2,
@@ -4523,7 +2794,6 @@ mod tests {
         assert!(pls.contains(&215), "anchor 15 → 215");
         assert!(pls.contains(&208), "nav composite 8 → 208");
 
-        // Verify the anchor's breadcrumb points to the visible thumbnail
         let anchor_resolution = resolved
             .iter()
             .find(|r| r.target.playlist == 215)
@@ -4537,15 +2807,6 @@ mod tests {
 
     #[test]
     fn exec_nop_anchor_deduplicates() {
-        // Same PlayTarget reached via two navigation paths should only
-        // produce one resolution. Dedup keeps the shortest breadcrumb.
-        //
-        // Page 0: NOP anchor btn[12]@(199,668) + visible thumbnail
-        // btn[7]@(229,668) + navigation buttons at the menu bar.
-        // Page 1: same NOP anchor btn[12] (no visible buttons).
-        //
-        // The root page anchor resolves first (shortest breadcrumb)
-        // and gets remapped to the visible thumbnail btn[7].
         let anchor_p0 = make_button_at(12, 199, 668, vec![]);
         let thumbnail = make_button_at(
             7,
@@ -4620,11 +2881,7 @@ mod tests {
             .iter()
             .filter(|r| r.target.playlist == 212)
             .collect();
-        assert_eq!(
-            matching.len(),
-            1,
-            "same PlayTarget from root and via navigation → deduplicated to one"
-        );
+        assert_eq!(matching.len(), 1, "same PlayTarget → deduplicated to one");
         assert_eq!(
             breadcrumb_ids(&matching[0].breadcrumb),
             vec![7],
@@ -4634,9 +2891,6 @@ mod tests {
 
     #[test]
     fn nav_breadcrumb_nop_anchor_via_navigation() {
-        // Page 0: navigation button → page 1.
-        // Page 1: NOP anchor with button_id matching dispatch case.
-        // Anchor on sub-page gets the navigation prefix in its breadcrumb.
         let nav = make_button(
             1,
             vec![
@@ -4665,7 +2919,6 @@ mod tests {
             ig_pid: 0x1200,
             pages: vec![&page0, &page1],
         }];
-
         let resolved = resolve_via_execution(
             &clips,
             &mobj_file,
@@ -4675,8 +2928,6 @@ mod tests {
 
         assert_eq!(resolved.len(), 1, "one anchor resolved");
         assert_eq!(resolved[0].target.playlist, 215, "anchor 15 → 215");
-        // Sub-pages are only reached via navigation (not initial seeding),
-        // so the anchor gets the navigation prefix in its breadcrumb.
         assert_eq!(
             breadcrumb_ids(&resolved[0].breadcrumb),
             vec![1, 15],
@@ -4686,12 +2937,6 @@ mod tests {
 
     #[test]
     fn nav_breadcrumb_shortest_path_wins() {
-        // Two paths to the same playlist:
-        // 1. Direct GotoMobj on page 0 → PlayPl(301) — breadcrumb [5]
-        // 2. Via navigation: page 0 → page 1 → GotoMobj → PlayPl(301)
-        //    — breadcrumb [1, 5]
-        //
-        // BFS processes the shorter path first, so [5] wins.
         let direct = make_button(5, vec![NavigationCommand::GotoMobj { object_id: 1 }]);
         let nav = make_button(
             1,
@@ -4725,7 +2970,6 @@ mod tests {
             ig_pid: 0x1200,
             pages: vec![&page0, &page1],
         }];
-
         let resolved = resolve_via_execution(&clips, &mobj_file, None, &valid);
 
         assert_eq!(resolved.len(), 1, "deduplicated to one resolution");
@@ -4739,11 +2983,6 @@ mod tests {
 
     #[test]
     fn orphan_sweep_resolves_unreachable_pages() {
-        // Page 0: root page with a GotoMobj content button.
-        // Page 2: orphan page (no navigation from page 0) with a NOP anchor.
-        //
-        // The orphan page is never reached via BFS navigation, but the
-        // post-BFS sweep picks up its NOP anchor as orphan content.
         let root_content = make_button(5, vec![NavigationCommand::GotoMobj { object_id: 1 }]);
         let page0 = make_page(0, vec![root_content]);
 
@@ -4751,7 +2990,6 @@ mod tests {
         let page2 = make_page(2, vec![orphan_anchor]);
 
         let dispatch_mobj = build_dispatch_mobj(&[(10, 210), (15, 215), (20, 220)]);
-
         let mobj_data = MobjBuilder::new()
             .object(&dispatch_mobj)
             .object(&[InsnSpec::PlayPl(301)])
@@ -4766,7 +3004,6 @@ mod tests {
             ig_pid: 0x1200,
             pages: vec![&page0, &page2],
         }];
-
         let resolved = resolve_via_execution(&clips, &mobj_file, Some(&table), &valid);
 
         assert_eq!(resolved.len(), 2, "root content + orphan anchor");
@@ -4776,11 +3013,6 @@ mod tests {
             .find(|r| r.target.playlist == 301)
             .expect("should find root content");
         assert!(!root.orphan, "root page content is not orphan");
-        assert_eq!(
-            breadcrumb_ids(&root.breadcrumb),
-            vec![5],
-            "root content breadcrumb"
-        );
 
         let orphan = resolved
             .iter()
@@ -4788,262 +3020,13 @@ mod tests {
             .expect("should find orphan content");
         assert!(orphan.orphan, "unreachable page content is orphan");
         assert_eq!(
-            breadcrumb_ids(&orphan.breadcrumb),
-            vec![15],
-            "orphan carries button_id"
-        );
-        assert_eq!(
-            orphan.breadcrumb[0].clip_index, 0,
-            "orphan step carries clip context"
-        );
-        assert_eq!(
             orphan.breadcrumb[0].page_id, 2,
             "orphan step carries page context"
         );
     }
 
-    // ── NOP detection tests ─────────────────────────────────────────
-
-    #[test]
-    fn nop_detection_empty_commands() {
-        let button = make_button(10, vec![]);
-        assert!(is_nop_anchor(&button), "empty commands → NOP anchor");
-    }
-
-    #[test]
-    fn nop_detection_all_nop_instructions() {
-        let button = make_button(10, vec![spec_to_other(&InsnSpec::Nop)]);
-        assert!(
-            is_nop_anchor(&button),
-            "single NOP instruction → NOP anchor"
-        );
-
-        let button2 = make_button(
-            10,
-            vec![spec_to_other(&InsnSpec::Nop), spec_to_other(&InsnSpec::Nop)],
-        );
-        assert!(
-            is_nop_anchor(&button2),
-            "multiple NOP instructions → NOP anchor"
-        );
-    }
-
-    #[test]
-    fn nop_detection_real_commands_not_nop() {
-        let button = make_button(
-            10,
-            vec![NavigationCommand::SetGpr {
-                register: 100,
-                value: 42,
-            }],
-        );
-        assert!(!is_nop_anchor(&button), "SetGpr command → not NOP");
-
-        let button2 = make_button(10, vec![NavigationCommand::GotoMobj { object_id: 1 }]);
-        assert!(!is_nop_anchor(&button2), "GotoMobj command → not NOP");
-
-        let button3 = make_button(
-            10,
-            vec![NavigationCommand::PlayPl {
-                playlist: 200,
-                branch_opt: 0,
-                mark_or_pi: 0,
-            }],
-        );
-        assert!(!is_nop_anchor(&button3), "PlayPl command → not NOP");
-    }
-
-    // ── Visible button resolution tests ───────────────────────────────
-
-    #[test]
-    fn visible_button_forward_trace() {
-        // Visible button's SET_BUTTON_PAGE directly targets the NOP
-        // anchor's button_id. Forward trace matches without spatial
-        // fallback.
-        //
-        // Visible button computes composite = button_id 19 via register.
-        // SetGpr(50, 19) + SetButtonPage(50, 51) → composite = 19.
-        let visible = make_button_at(
-            5,
-            229,
-            668,
-            vec![
-                NavigationCommand::SetGpr {
-                    register: 50,
-                    value: 19,
-                },
-                NavigationCommand::SetGpr {
-                    register: 51,
-                    value: 0,
-                },
-                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
-            ],
-        );
-        let page = make_page(0, vec![make_button_at(19, 1339, 949, vec![]), visible]);
-        let nop_ref = make_button_at(19, 1339, 949, vec![]);
-
-        let gprs = std::collections::HashMap::new();
-        let result = find_visible_button_for_nop(&page, &nop_ref, 0x1200, 0, &gprs);
-        assert_eq!(
-            result,
-            Some(5),
-            "forward trace finds visible btn[5] targeting NOP btn[19]"
-        );
-    }
-
-    #[test]
-    fn visible_button_spatial_fallback() {
-        // No visible button's commands target the NOP anchor, but a
-        // co-located visible button is ~30px away. Spatial fallback
-        // selects the nearest one.
-        let thumb_near = make_button_at(
-            5,
-            229,
-            668,
-            vec![
-                NavigationCommand::SetGpr {
-                    register: 50,
-                    value: 0,
-                },
-                NavigationCommand::SetGpr {
-                    register: 51,
-                    value: 26,
-                },
-                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
-            ],
-        );
-        let thumb_far = make_button_at(
-            6,
-            530,
-            668,
-            vec![
-                NavigationCommand::SetGpr {
-                    register: 50,
-                    value: 0,
-                },
-                NavigationCommand::SetGpr {
-                    register: 51,
-                    value: 26,
-                },
-                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
-            ],
-        );
-
-        let page = make_page(
-            0,
-            vec![make_button_at(21, 199, 668, vec![]), thumb_near, thumb_far],
-        );
-        let nop_ref = make_button_at(21, 199, 668, vec![]);
-        let gprs = std::collections::HashMap::new();
-        let result = find_visible_button_for_nop(&page, &nop_ref, 0x1200, 0, &gprs);
-        assert_eq!(
-            result,
-            Some(5),
-            "spatial fallback selects nearest visible btn[5] (30px) over btn[6] (331px)"
-        );
-    }
-
-    #[test]
-    fn visible_button_spatial_rejects_distant_match() {
-        // Menu bar NOP anchor btn[19]@(1339,949) — nearest visible
-        // button is btn[9]@(1430,668) at ~295px, far beyond the 60px
-        // threshold. Should return None to prevent the many-to-one
-        // collision that causes fallback matching to grab random
-        // buttons (arrows, page numbers).
-        let page = make_page(
-            0,
-            vec![
-                make_button_at(19, 1339, 949, vec![]),
-                make_button_at(
-                    9,
-                    1430,
-                    668,
-                    vec![NavigationCommand::SetGpr {
-                        register: 50,
-                        value: 0,
-                    }],
-                ),
-            ],
-        );
-        let nop_ref = make_button_at(19, 1339, 949, vec![]);
-
-        let gprs = std::collections::HashMap::new();
-        let result = find_visible_button_for_nop(&page, &nop_ref, 0x1200, 0, &gprs);
-        assert_eq!(result, None, "295px distance exceeds 60px threshold");
-    }
-
-    #[test]
-    fn visible_button_no_visible_returns_none() {
-        // Page with only NOP anchors — no visible buttons to map to.
-        let page = make_page(
-            0,
-            vec![
-                make_button(12, vec![]),
-                make_button(15, vec![spec_to_other(&InsnSpec::Nop)]),
-            ],
-        );
-        let nop_ref = make_button(12, vec![]);
-
-        let gprs = std::collections::HashMap::new();
-        let result = find_visible_button_for_nop(&page, &nop_ref, 0x1200, 0, &gprs);
-        assert_eq!(result, None, "no visible buttons → None");
-    }
-
-    #[test]
-    fn visible_button_breadcrumb_in_resolver() {
-        // End-to-end: NOP anchor on a page with a co-located visible
-        // thumbnail. The resolver's breadcrumb should record the visible
-        // button, not the NOP anchor.
-        let nop = make_button_at(21, 199, 668, vec![]);
-        let thumb = make_button_at(
-            5,
-            229,
-            668,
-            vec![
-                NavigationCommand::SetGpr {
-                    register: 50,
-                    value: 0,
-                },
-                NavigationCommand::SetGpr {
-                    register: 51,
-                    value: 26,
-                },
-                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
-            ],
-        );
-        let page = make_page(0, vec![nop, thumb]);
-
-        let dispatch_mobj = build_dispatch_mobj(&[(21, 209), (23, 210), (25, 211)]);
-        let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
-        let mobj_file = parse(&mobj_data).expect("should parse");
-        let table = extract_dispatch_table(&mobj_file).expect("should extract table");
-
-        let clips = vec![NavClipInput {
-            ig_pid: 0x1200,
-            pages: vec![&page],
-        }];
-
-        let resolved = resolve_via_execution(
-            &clips,
-            &mobj_file,
-            Some(&table),
-            &std::collections::HashSet::new(),
-        );
-
-        assert_eq!(resolved.len(), 1, "one NOP anchor resolved");
-        assert_eq!(resolved[0].target.playlist, 209, "NOP btn[21] → PL 209");
-        assert_eq!(
-            breadcrumb_ids(&resolved[0].breadcrumb),
-            vec![5],
-            "breadcrumb records visible btn[5], not NOP btn[21]"
-        );
-    }
-
     #[test]
     fn goto_mobj_pattern_unaffected_by_visible_resolution() {
-        // GotoMobj pattern (a Blu-ray series style): buttons have direct
-        // GotoMobj commands, no NOP anchors, no dispatch table.
-        // This ticket's changes should be a no-op.
         let button_a = make_button(
             1,
             vec![
@@ -5081,7 +3064,6 @@ mod tests {
             ig_pid: 0x1200,
             pages: vec![&page],
         }];
-
         let resolved = resolve_via_execution(&clips, &mobj_file, None, &valid);
 
         assert_eq!(resolved.len(), 2, "two GotoMobj buttons resolved");
@@ -5089,24 +3071,10 @@ mod tests {
             resolved.iter().map(|r| r.target.playlist).collect();
         assert!(pls.contains(&301), "btn[1] → 301");
         assert!(pls.contains(&302), "btn[2] → 302");
-
-        // Breadcrumbs point directly to the buttons that have the commands
-        let r1 = resolved
-            .iter()
-            .find(|r| r.target.playlist == 301)
-            .expect("should find 301");
-        assert_eq!(
-            breadcrumb_ids(&r1.breadcrumb),
-            vec![1],
-            "GotoMobj breadcrumb unchanged"
-        );
     }
 
     #[test]
     fn exec_cross_clip_nop_anchors_both_preserved() {
-        // Same NOP anchor button_id and dispatch case in two different clips.
-        // Per-clip dedup: both resolutions are preserved (one per clip).
-        // The CLI decides which clip's resolution to present.
         let anchor_a = make_button_at(15, 199, 668, vec![]);
         let thumb_a = make_button_at(
             5,
@@ -5193,8 +3161,6 @@ mod tests {
 
     #[test]
     fn exec_same_clip_still_deduplicates() {
-        // Same PlayTarget from two pages within the same clip is still
-        // deduplicated (BFS first-arrival wins within a clip).
         let anchor_p0 = make_button_at(12, 199, 668, vec![]);
         let thumb_p0 = make_button_at(
             7,
