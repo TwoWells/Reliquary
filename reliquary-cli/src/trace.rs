@@ -878,10 +878,10 @@ pub fn trace_dispatch_handlers(
 
 /// Traces the GPR database state populated by MOBJ[0] (First Play).
 ///
-/// Executes MOBJ[0] with BD spec boot PSR defaults and dumps all
-/// GPR[3000–3999] registers — the per-content-item configuration
-/// database that data-driven button programs read. Highlights known
-/// content config registers (3563, 3773, 3774, 3775, 3776).
+/// Uses [`seed_gpr_state`] — the same function the resolver calls —
+/// so the trace always reflects the actual GPR state the BFS sees.
+/// Dumps GPR[3000–3999] (per-content-item configuration database)
+/// and GPR[4000–4999] (working registers).
 #[allow(clippy::print_stderr, reason = "diagnostic trace output")]
 pub fn trace_mobj0_database(mobj_file: &reliquary::disc::bdmv::mobj::MovieObjectFile) {
     use reliquary::disc::bdmv::mobj;
@@ -896,28 +896,7 @@ pub fn trace_mobj0_database(mobj_file: &reliquary::disc::bdmv::mobj::MovieObject
 
     eprintln!("{} instructions", mobj0.instructions.len());
 
-    // Execute MOBJ[0] with BD spec boot PSR defaults — same seeds
-    // as resolve_via_execution uses.
-    let psr: u32 = 0x8000_0000;
-    let mut gprs = std::collections::HashMap::<u32, u32>::new();
-    gprs.insert(psr | 0x01, 0xFF); // primary audio
-    gprs.insert(psr | 0x02, 0xFFFE); // PG/TextST
-    gprs.insert(psr | 0x03, 0xFF); // angle
-    gprs.insert(psr | 0x04, 0xFFFF); // title (init guard)
-    gprs.insert(psr | 0x0A, 0xFFFF); // selected button
-    gprs.insert(psr | 0x0C, 0xFF); // user style
-    gprs.insert(psr | 0x0D, 0xFF); // parental level
-    gprs.insert(psr | 0x0E, 0xFFFF); // secondary A/V
-    gprs.insert(psr | 0x0F, 0x0002_0000); // audio cap
-    gprs.insert(psr | 0x1D, 0x0200); // profile 2.0
-    gprs.insert(psr | 0x1F, 0x0200); // player version
-
-    let _ = mobj::run_mobj_vm(
-        &mobj0.instructions,
-        0,
-        &mut gprs,
-        &std::collections::HashSet::new(),
-    );
+    let gprs = mobj::seed_gpr_state(mobj_file);
 
     // Collect GPR[3xxx] entries (disc database)
     let mut db_entries: Vec<(u32, u32)> = gprs

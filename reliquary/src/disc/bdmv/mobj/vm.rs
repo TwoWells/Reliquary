@@ -162,12 +162,14 @@ pub fn seed_gpr_state(mobj_file: &MovieObjectFile) -> std::collections::HashMap<
     gprs.insert(PSR_FLAG | 0x0F, 0x0002_0000); // audio cap
     gprs.insert(PSR_FLAG | 0x1D, 0x0200); // profile 2.0
     gprs.insert(PSR_FLAG | 0x1F, 0x0200); // player version
-    let _ = run_mobj_vm(
-        &mobj0.instructions,
-        0,
-        &mut gprs,
-        &std::collections::HashSet::new(),
-    );
+    // Use a sentinel playlist set to reject all PlayPl instructions.
+    // With an empty set, `valid_playlists.is_empty()` is true and any
+    // non-zero playlist terminates execution — potentially before all
+    // GPR[3xxx] config registers are written. A non-empty set that
+    // matches nothing forces PlayPl to be skipped, allowing the entire
+    // init block to execute.
+    let reject_all_playlists = std::collections::HashSet::from([u32::MAX]);
+    let _ = run_mobj_vm(&mobj0.instructions, 0, &mut gprs, &reject_all_playlists);
     // Keep only GPR entries (no PSR) — the disc configuration database
     // that title MOBJs and button programs read.
     gprs.into_iter()
@@ -637,7 +639,8 @@ fn try_branch_target_pairing(
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
-    reason = "tests use expect() for assertions per project rules"
+    clippy::panic,
+    reason = "tests use expect() and panic!() for assertions per project rules"
 )]
 mod tests {
     use super::super::NavClipInput;
@@ -887,6 +890,152 @@ mod tests {
             super::super::test_helpers::breadcrumb_ids(&resolved[0].breadcrumb),
             vec![5],
             "breadcrumb records visible btn[5], not NOP btn[21]"
+        );
+    }
+
+    // ── Register-computed SET_BUTTON_PAGE tests ──────────────────────
+
+    #[test]
+    fn register_computed_set_button_page() {
+        // WB Special Features button command program (a WB Blu-ray title btn[4]):
+        //   1. GPR[4075] = 5              (nav bar offset, immediate)
+        //   2. GPR[4076] = 0xFFFF          (mask, immediate)
+        //   3. GPR[4077] = PSR[10]         (selected button ID, reg-to-reg)
+        //   4. GPR[4077] &= GPR[4076]      (mask to 16 bits)
+        //   5. GPR[4077] += GPR[4075]      (offset → composite dispatch key)
+        //   6. GPR[4075] = GPR[3051]        (page from config DB, reg-to-reg)
+        //   7. SET_BUTTON_PAGE(GPR[4077], GPR[4075])
+        //   8. NOP
+        //
+        // With btn[4] selected (PSR[10]=4) and GPR[3051]=6:
+        //   composite = (4 & 0xFFFF) + 5 = 9
+        //   page = GPR[3051] = 6
+        let commands = vec![
+            NavigationCommand::SetGpr {
+                register: 4075,
+                value: 5,
+            },
+            NavigationCommand::SetGpr {
+                register: 4076,
+                value: 0xFFFF,
+            },
+            spec_to_other(&InsnSpec::SetGprReg(4077, super::PSR_FLAG | 0x0A)),
+            spec_to_other(&InsnSpec::AndReg(4077, 4076)),
+            spec_to_other(&InsnSpec::AddReg(4077, 4075)),
+            spec_to_other(&InsnSpec::SetGprReg(4075, 3051)),
+            spec_to_other(&InsnSpec::SetButtonPage(4077, 4075)),
+            spec_to_other(&InsnSpec::Nop),
+        ];
+
+        let ctx = PlayerContext {
+            ig_stream: 0x1200,
+            selected_button_id: 4,
+            page_id: 1,
+        };
+
+        // GPR[3051] = 6 from MOBJ[0] init (page config for special features)
+        let mut gprs = std::collections::HashMap::new();
+        gprs.insert(3051_u32, 6_u32);
+
+        let (effect, _) = execute_button_commands(&commands, &ctx, &gprs);
+
+        match effect {
+            ButtonEffect::SetButtonPage { composite, page } => {
+                assert_eq!(composite, 9, "composite = PSR[10](4) & 0xFFFF + 5 = 9");
+                assert_eq!(page, 6, "page = GPR[3051] = 6");
+            }
+            ref other => panic!("expected SetButtonPage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_computed_set_button_page_without_seed() {
+        // Same command program but GPR[3051] is NOT seeded.
+        // GPR[3051] defaults to 0, so page = 0 instead of 6.
+        // This models the failure when seed_gpr_state doesn't
+        // initialize the config register.
+        let commands = vec![
+            NavigationCommand::SetGpr {
+                register: 4075,
+                value: 5,
+            },
+            NavigationCommand::SetGpr {
+                register: 4076,
+                value: 0xFFFF,
+            },
+            spec_to_other(&InsnSpec::SetGprReg(4077, super::PSR_FLAG | 0x0A)),
+            spec_to_other(&InsnSpec::AndReg(4077, 4076)),
+            spec_to_other(&InsnSpec::AddReg(4077, 4075)),
+            spec_to_other(&InsnSpec::SetGprReg(4075, 3051)),
+            spec_to_other(&InsnSpec::SetButtonPage(4077, 4075)),
+            spec_to_other(&InsnSpec::Nop),
+        ];
+
+        let ctx = PlayerContext {
+            ig_stream: 0x1200,
+            selected_button_id: 4,
+            page_id: 1,
+        };
+
+        let gprs = std::collections::HashMap::new(); // no seed
+
+        let (effect, _) = execute_button_commands(&commands, &ctx, &gprs);
+
+        match effect {
+            ButtonEffect::SetButtonPage { composite, page } => {
+                assert_eq!(
+                    composite, 9,
+                    "composite still computed correctly from PSR[10]"
+                );
+                assert_eq!(
+                    page, 0,
+                    "page = 0 when GPR[3051] uninitialized (wrong destination)"
+                );
+            }
+            ref other => panic!("expected SetButtonPage, got {other:?}"),
+        }
+    }
+
+    // ── seed_gpr_state tests ─────────────────────────────────────────
+
+    #[test]
+    fn seed_gpr_captures_registers_after_play_pl() {
+        // MOBJ[0] writes GPR[3051] = 6 AFTER a PlayPl instruction.
+        // Before the fix, PlayPl terminated execution and GPR[3051]
+        // was never captured. After the fix, PlayPl is skipped
+        // during seeding, so the entire init block executes.
+        let mobj_data = MobjBuilder::new()
+            .object(&[
+                // Init guard: CMP PSR[4] != 0xFFFF → skip init
+                InsnSpec::Nop, // simplified: no guard in test
+                // GPR database — writes before and after PlayPl
+                InsnSpec::SetGpr(3000, 42),
+                InsnSpec::SetGpr(3001, 99),
+                // Menu start (real discs play the menu playlist here)
+                InsnSpec::PlayPl(100),
+                // More GPR writes AFTER the PlayPl
+                InsnSpec::SetGpr(3051, 6),
+                InsnSpec::SetGpr(3052, 7),
+            ])
+            .build();
+
+        let mobj_file = super::super::parse::parse(&mobj_data).expect("should parse");
+        let gprs = seed_gpr_state(&mobj_file);
+
+        assert_eq!(
+            gprs.get(&3000).copied(),
+            Some(42),
+            "GPR[3000] captured before PlayPl"
+        );
+        assert_eq!(
+            gprs.get(&3051).copied(),
+            Some(6),
+            "GPR[3051] captured AFTER PlayPl (the fix)"
+        );
+        assert_eq!(
+            gprs.get(&3052).copied(),
+            Some(7),
+            "GPR[3052] captured after PlayPl"
         );
     }
 }

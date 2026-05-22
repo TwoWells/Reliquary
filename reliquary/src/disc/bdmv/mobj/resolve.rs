@@ -3205,4 +3205,118 @@ mod tests {
             "same clip, same PlayTarget → still deduplicated to one"
         );
     }
+
+    // ── Register-computed page navigation tests ─────────────────────
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "end-to-end test with multi-page disc structure is inherently long"
+    )]
+    fn register_computed_page_via_seeded_gprs() {
+        // End-to-end: MOBJ[0] writes GPR[3051] = 6 after a PlayPl.
+        // btn[4] on page 1 reads GPR[3051] to compute the page target.
+        //
+        // Before fix: seed_gpr_state terminated at the PlayPl, GPR[3051]
+        // was never captured, and btn[4]'s SET_BUTTON_PAGE got page=0.
+        // After fix: PlayPl is skipped during seeding, GPR[3051]=6 is
+        // captured, and btn[4] navigates to page 6.
+
+        // MOBJ[0]: init block with PlayPl before GPR[3051] write
+        let mobj0_instrs = vec![
+            InsnSpec::SetGpr(3000, 42),
+            InsnSpec::PlayPl(100), // menu start — previously terminated seeding
+            InsnSpec::SetGpr(3051, 6), // page config for special features
+        ];
+
+        // MOBJ[1]: dispatch table for NOP anchors (need 3+ cases)
+        let dispatch_mobj = build_dispatch_mobj(&[(30, 301), (31, 302), (32, 303)]);
+
+        let mobj_data = MobjBuilder::new()
+            .object(&mobj0_instrs)
+            .object(&dispatch_mobj)
+            .build();
+        let mobj_file = parse(&mobj_data).expect("should parse");
+        let table = extract_dispatch_table(&mobj_file);
+
+        // Page 0: root → page 1
+        let root_nav = make_button(
+            1,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 50,
+                    value: 0,
+                },
+                NavigationCommand::SetGpr {
+                    register: 51,
+                    value: 1,
+                },
+                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
+            ],
+        );
+        let page0 = make_page(0, vec![root_nav]);
+
+        // Page 1: btn[4] with register-computed SET_BUTTON_PAGE to page 6
+        let special_features_btn = make_button(
+            4,
+            vec![
+                NavigationCommand::SetGpr {
+                    register: 4075,
+                    value: 5,
+                },
+                NavigationCommand::SetGpr {
+                    register: 4076,
+                    value: 0xFFFF,
+                },
+                spec_to_other(&InsnSpec::SetGprReg(4077, PSR_FLAG | 0x0A)),
+                spec_to_other(&InsnSpec::AndReg(4077, 4076)),
+                spec_to_other(&InsnSpec::AddReg(4077, 4075)),
+                spec_to_other(&InsnSpec::SetGprReg(4075, 3051)),
+                spec_to_other(&InsnSpec::SetButtonPage(4077, 4075)),
+            ],
+        );
+        let page1 = make_page(1, vec![special_features_btn]);
+
+        // Page 6: special features (NOP anchors with text labels)
+        let extras_a = make_button(31, vec![]);
+        let extras_b = make_button(32, vec![]);
+        let extras_c = make_button(30, vec![]);
+        let page6 = make_page(6, vec![extras_a, extras_b, extras_c]);
+
+        let clips = vec![NavClipInput {
+            ig_pid: 0x1200,
+            pages: vec![&page0, &page1, &page6],
+        }];
+
+        let resolved = resolve_via_execution(
+            &clips,
+            &mobj_file,
+            table.as_ref(),
+            &valid_set(&[301, 302, 303]),
+        );
+
+        // Extras should resolve via page 6 through btn[4]
+        let extras: Vec<_> = resolved
+            .iter()
+            .filter(|r| !r.orphan && r.target.playlist == 302)
+            .collect();
+        assert_eq!(extras.len(), 1, "extras PL 302 resolved via navigation");
+
+        let crumb = breadcrumb_ids(&extras[0].breadcrumb);
+        assert!(
+            crumb.contains(&4),
+            "extras breadcrumb includes btn[4]: {crumb:?}"
+        );
+
+        let last_step = extras[0].breadcrumb.last().expect("non-empty breadcrumb");
+        assert_eq!(
+            last_step.page_id, 6,
+            "extras breadcrumb ends on page 6 (text labels, not filmstrips)"
+        );
+    }
+
+    /// Builds a valid playlist set from a slice of playlist numbers.
+    fn valid_set(playlists: &[u32]) -> std::collections::HashSet<u32> {
+        playlists.iter().copied().collect()
+    }
 }
