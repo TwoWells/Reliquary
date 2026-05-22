@@ -433,115 +433,99 @@ pub fn resolve_via_execution(
     }
 
     let mut iterations: u32 = 0;
+    let mut bootstrapped = false;
 
-    while let Some((clip_idx, page_id, gprs, breadcrumb)) = queue.pop_front() {
-        iterations += 1;
-        if iterations > NAV_GRAPH_LIMIT {
-            break;
-        }
-
-        let Some(&(page, ig_pid)) = page_lookup.get(&(clip_idx, page_id)) else {
-            continue;
-        };
-
-        for button in &page.buttons {
-            // Skip buttons with a direct immediate PlayPl
-            let has_direct_play_pl = button
-                .commands
-                .iter()
-                .any(|c| matches!(c, NavigationCommand::PlayPl { .. }));
-            if has_direct_play_pl {
-                continue;
+    loop {
+        while let Some((clip_idx, page_id, gprs, breadcrumb)) = queue.pop_front() {
+            iterations += 1;
+            if iterations > NAV_GRAPH_LIMIT {
+                break;
             }
 
-            // NOP anchor resolution: buttons whose only commands are
-            // NOPs are navigation anchors whose button_id IS the
-            // dispatch case.
-            //
-            // In the WB SET_BUTTON_PAGE pattern, the player runtime
-            // sets PSR[10] to the selected button_id. When a NOP
-            // anchor is selected (via SET_BUTTON_PAGE navigation or
-            // direct user cursor navigation) and activated, PSR[10]
-            // becomes the dispatch case. The dispatch MOBJ copies
-            // PSR[10] into its switch register and dispatches.
-            //
-            // The breadcrumb records the corresponding visible button
-            // (the one with the selected-state bitmap showing the
-            // content label), not the NOP anchor itself. This ensures
-            // the CLI highlights the correct thumbnail/label position.
-            if is_nop_anchor(button) {
-                if let Some(table) = dispatch_table {
-                    let bid = u32::from(button.button_id);
-                    if let Some(&(_, pl)) = table.cases.iter().find(|(cv, _)| *cv == bid) {
-                        let target = PlayTarget {
-                            playlist: pl,
-                            branch_opt: 0,
-                            mark_or_pi: 0,
-                        };
-                        if resolved_set.insert((clip_idx, target)) {
-                            let visible_bid =
-                                find_visible_button_for_nop(page, button, ig_pid, page_id, &gprs)
-                                    .unwrap_or(button.button_id);
-                            let mut crumb = breadcrumb.clone();
-                            crumb.push(BreadcrumbStep {
-                                clip_index: clip_idx,
-                                page_id,
-                                button_id: visible_bid,
-                            });
-                            resolved.push(ResolvedPlaylist {
-                                breadcrumb: crumb,
-                                orphan: false,
-                                target,
-                            });
-                        }
-                    }
-                }
+            let Some(&(page, ig_pid)) = page_lookup.get(&(clip_idx, page_id)) else {
                 continue;
-            }
-
-            let ctx = PlayerContext {
-                ig_stream: ig_pid,
-                selected_button_id: button.button_id,
-                page_id,
             };
 
-            let (effect, new_gprs) = execute_button_commands(&button.commands, &ctx, &gprs);
+            for button in &page.buttons {
+                // Skip buttons with a direct immediate PlayPl
+                let has_direct_play_pl = button
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, NavigationCommand::PlayPl { .. }));
+                if has_direct_play_pl {
+                    continue;
+                }
 
-            match effect {
-                ButtonEffect::Playlist {
-                    playlist: pl,
-                    branch_opt: bo,
-                    mark_or_pi: mpi,
-                } => {
-                    let target = PlayTarget {
+                // NOP anchor resolution: buttons whose only commands are
+                // NOPs are navigation anchors whose button_id IS the
+                // dispatch case.
+                //
+                // In the WB SET_BUTTON_PAGE pattern, the player runtime
+                // sets PSR[10] to the selected button_id. When a NOP
+                // anchor is selected (via SET_BUTTON_PAGE navigation or
+                // direct user cursor navigation) and activated, PSR[10]
+                // becomes the dispatch case. The dispatch MOBJ copies
+                // PSR[10] into its switch register and dispatches.
+                //
+                // The breadcrumb records the corresponding visible button
+                // (the one with the selected-state bitmap showing the
+                // content label), not the NOP anchor itself. This ensures
+                // the CLI highlights the correct thumbnail/label position.
+                if is_nop_anchor(button) {
+                    if let Some(table) = dispatch_table {
+                        let bid = u32::from(button.button_id);
+                        if let Some(&(_, pl)) = table.cases.iter().find(|(cv, _)| *cv == bid) {
+                            let target = PlayTarget {
+                                playlist: pl,
+                                branch_opt: 0,
+                                mark_or_pi: 0,
+                            };
+                            if resolved_set.insert((clip_idx, target)) {
+                                let visible_bid = find_visible_button_for_nop(
+                                    page, button, ig_pid, page_id, &gprs,
+                                )
+                                .unwrap_or(button.button_id);
+                                let mut crumb = breadcrumb.clone();
+                                crumb.push(BreadcrumbStep {
+                                    clip_index: clip_idx,
+                                    page_id,
+                                    button_id: visible_bid,
+                                });
+                                resolved.push(ResolvedPlaylist {
+                                    breadcrumb: crumb,
+                                    orphan: false,
+                                    target,
+                                });
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                let ctx = PlayerContext {
+                    ig_stream: ig_pid,
+                    selected_button_id: button.button_id,
+                    page_id,
+                };
+
+                let (effect, new_gprs) = execute_button_commands(&button.commands, &ctx, &gprs);
+
+                match effect {
+                    ButtonEffect::Playlist {
                         playlist: pl,
                         branch_opt: bo,
                         mark_or_pi: mpi,
-                    };
-                    let is_valid = pl != 0
-                        && pl != 0xFFFF
-                        && (valid_playlists.is_empty() || valid_playlists.contains(&u32::from(pl)));
-                    if is_valid && resolved_set.insert((clip_idx, target)) {
-                        let mut crumb = breadcrumb.clone();
-                        crumb.push(BreadcrumbStep {
-                            clip_index: clip_idx,
-                            page_id,
-                            button_id: button.button_id,
-                        });
-                        resolved.push(ResolvedPlaylist {
-                            breadcrumb: crumb,
-                            orphan: false,
-                            target,
-                        });
-                    }
-                }
-                ButtonEffect::GotoMobj(object_id) => {
-                    if let Some(mobj) = mobj_file.objects.get(object_id as usize) {
-                        let mut mobj_gprs = new_gprs;
-                        if let Some(target) =
-                            run_mobj_vm(&mobj.instructions, 0, &mut mobj_gprs, valid_playlists)
-                            && resolved_set.insert((clip_idx, target))
-                        {
+                    } => {
+                        let target = PlayTarget {
+                            playlist: pl,
+                            branch_opt: bo,
+                            mark_or_pi: mpi,
+                        };
+                        let is_valid = pl != 0
+                            && pl != 0xFFFF
+                            && (valid_playlists.is_empty()
+                                || valid_playlists.contains(&u32::from(pl)));
+                        if is_valid && resolved_set.insert((clip_idx, target)) {
                             let mut crumb = breadcrumb.clone();
                             crumb.push(BreadcrumbStep {
                                 clip_index: clip_idx,
@@ -555,105 +539,181 @@ pub fn resolve_via_execution(
                             });
                         }
                     }
-                }
-                ButtonEffect::SetButtonPage {
-                    composite,
-                    page: target_page,
-                } => {
-                    // SET_BUTTON_PAGE is navigation — it doesn't play
-                    // anything. The BFS follows the edge; content buttons
-                    // on the target page resolve themselves.
-
-                    // Record the composite for fallback dispatch resolution.
-                    // Only the first occurrence per composite is kept (BFS
-                    // guarantees shortest path). Used after the BFS to
-                    // resolve dispatch cases that have no NOP anchor.
-                    nav_composites.entry(composite).or_insert_with(|| {
-                        let mut crumb = breadcrumb.clone();
-                        crumb.push(BreadcrumbStep {
-                            clip_index: clip_idx,
-                            page_id,
-                            button_id: button.button_id,
-                        });
-                        (clip_idx, page_id, button.button_id, crumb)
-                    });
-
-                    // Navigation edge: propagate button GPR state and
-                    // breadcrumb to the target page. Pushed BEFORE handler
-                    // propagation so the BFS visits the target page with
-                    // the correct breadcrumb first. Includes same-page
-                    // edges (WB authoring: navigation buttons set GPR
-                    // state and loop back to the current page).
-                    #[allow(clippy::cast_possible_truncation, reason = "page IDs fit in u8")]
-                    let target_page_id = (target_page & 0xFF) as u8;
-                    if page_lookup.contains_key(&(clip_idx, target_page_id)) {
-                        let propagated: GprState = new_gprs
-                            .into_iter()
-                            .filter(|(k, _)| k & PSR_FLAG == 0)
-                            .collect();
-
-                        let mut nav_crumb = breadcrumb.clone();
-                        nav_crumb.push(BreadcrumbStep {
-                            clip_index: clip_idx,
-                            page_id,
-                            button_id: button.button_id,
-                        });
-
-                        let key = hash_gpr_state(&propagated);
-                        let states = visited.entry((clip_idx, target_page_id)).or_default();
-                        if states.insert(key) {
-                            queue.push_back((clip_idx, target_page_id, propagated, nav_crumb));
-                        }
-                    }
-
-                    // Execute the dispatch MOBJ handler for this case to
-                    // collect the GPR[3xxx] configuration state it sets.
-                    // WB authoring: each handler populates registers like
-                    // GPR[3563] (content index), GPR[3776] (expected
-                    // button_id) etc. before calling PlayPl to re-enter
-                    // the menu. Data-driven button programs on the menu
-                    // pages read these to compute their dispatch values.
-                    //
-                    // Start from the handler PC (not instruction 0) to
-                    // skip the MOBJ initialization code which clears
-                    // the dispatch register.
-                    if let Some(table) = dispatch_table
-                        && let Some(handler_pc) = find_handler_pc(
-                            &mobj_file.objects[table.mobj_index].instructions,
-                            composite,
-                            table.dispatch_register,
-                        )
-                    {
-                        let mut handler_gprs = GprState::new();
-
-                        // Run handler until PlayPl (accept any playlist).
-                        let _ = run_mobj_vm(
-                            &mobj_file.objects[table.mobj_index].instructions,
-                            handler_pc,
-                            &mut handler_gprs,
-                            &std::collections::HashSet::new(),
-                        );
-
-                        // Propagate handler state to already-visited pages
-                        // in this clip. Not pushed to unvisited pages to
-                        // avoid preempting navigation breadcrumbs.
-                        let handler_state: GprState = handler_gprs
-                            .into_iter()
-                            .filter(|(k, _)| k & PSR_FLAG == 0)
-                            .collect();
-
-                        let key = hash_gpr_state(&handler_state);
-                        for &(ci, pid) in page_lookup.keys() {
-                            if ci == clip_idx
-                                && let Some(states) = visited.get_mut(&(ci, pid))
-                                && states.insert(key)
+                    ButtonEffect::GotoMobj(object_id) => {
+                        if let Some(mobj) = mobj_file.objects.get(object_id as usize) {
+                            let mut mobj_gprs = new_gprs;
+                            if let Some(target) =
+                                run_mobj_vm(&mobj.instructions, 0, &mut mobj_gprs, valid_playlists)
+                                && resolved_set.insert((clip_idx, target))
                             {
-                                queue.push_back((ci, pid, handler_state.clone(), Vec::new()));
+                                let mut crumb = breadcrumb.clone();
+                                crumb.push(BreadcrumbStep {
+                                    clip_index: clip_idx,
+                                    page_id,
+                                    button_id: button.button_id,
+                                });
+                                resolved.push(ResolvedPlaylist {
+                                    breadcrumb: crumb,
+                                    orphan: false,
+                                    target,
+                                });
                             }
                         }
                     }
+                    ButtonEffect::SetButtonPage {
+                        composite,
+                        page: target_page,
+                    } => {
+                        // SET_BUTTON_PAGE is navigation — it doesn't play
+                        // anything. The BFS follows the edge; content buttons
+                        // on the target page resolve themselves.
+
+                        // Record the composite for fallback dispatch resolution.
+                        // Only the first occurrence per composite is kept (BFS
+                        // guarantees shortest path). Used after the BFS to
+                        // resolve dispatch cases that have no NOP anchor.
+                        nav_composites.entry(composite).or_insert_with(|| {
+                            let mut crumb = breadcrumb.clone();
+                            crumb.push(BreadcrumbStep {
+                                clip_index: clip_idx,
+                                page_id,
+                                button_id: button.button_id,
+                            });
+                            (clip_idx, page_id, button.button_id, crumb)
+                        });
+
+                        // Navigation edge: propagate button GPR state and
+                        // breadcrumb to the target page. Pushed BEFORE handler
+                        // propagation so the BFS visits the target page with
+                        // the correct breadcrumb first. Includes same-page
+                        // edges (WB authoring: navigation buttons set GPR
+                        // state and loop back to the current page).
+                        // BD spec: SET_BUTTON_PAGE page values are 1-based.
+                        // page=0 means "stay on current page" (no change).
+                        // page=N (N>0) targets page_id = N-1.
+                        let page_raw = target_page & 0xFF;
+                        #[allow(clippy::cast_possible_truncation, reason = "page IDs fit in u8")]
+                        let target_page_id = if page_raw == 0 {
+                            page_id
+                        } else {
+                            (page_raw - 1) as u8
+                        };
+                        if page_lookup.contains_key(&(clip_idx, target_page_id)) {
+                            let propagated: GprState = new_gprs
+                                .into_iter()
+                                .filter(|(k, _)| k & PSR_FLAG == 0)
+                                .collect();
+
+                            let mut nav_crumb = breadcrumb.clone();
+                            nav_crumb.push(BreadcrumbStep {
+                                clip_index: clip_idx,
+                                page_id,
+                                button_id: button.button_id,
+                            });
+
+                            let key = hash_gpr_state(&propagated);
+                            let states = visited.entry((clip_idx, target_page_id)).or_default();
+                            if states.insert(key) {
+                                queue.push_back((clip_idx, target_page_id, propagated, nav_crumb));
+                            }
+                        }
+
+                        // Execute the dispatch MOBJ handler for this case to
+                        // collect the GPR[3xxx] configuration state it sets.
+                        // WB authoring: each handler populates registers like
+                        // GPR[3563] (content index), GPR[3776] (expected
+                        // button_id) etc. before calling PlayPl to re-enter
+                        // the menu. Data-driven button programs on the menu
+                        // pages read these to compute their dispatch values.
+                        //
+                        // Start from the handler PC (not instruction 0) to
+                        // skip the MOBJ initialization code which clears
+                        // the dispatch register.
+                        if let Some(table) = dispatch_table
+                            && let Some(handler_pc) = find_handler_pc(
+                                &mobj_file.objects[table.mobj_index].instructions,
+                                composite,
+                                table.dispatch_register,
+                            )
+                        {
+                            let mut handler_gprs = GprState::new();
+
+                            // Run handler until PlayPl (accept any playlist).
+                            let _ = run_mobj_vm(
+                                &mobj_file.objects[table.mobj_index].instructions,
+                                handler_pc,
+                                &mut handler_gprs,
+                                &std::collections::HashSet::new(),
+                            );
+
+                            // Propagate handler state to already-visited pages
+                            // in this clip. Not pushed to unvisited pages to
+                            // avoid preempting navigation breadcrumbs.
+                            let handler_state: GprState = handler_gprs
+                                .into_iter()
+                                .filter(|(k, _)| k & PSR_FLAG == 0)
+                                .collect();
+
+                            let key = hash_gpr_state(&handler_state);
+                            for &(ci, pid) in page_lookup.keys() {
+                                if ci == clip_idx
+                                    && let Some(states) = visited.get_mut(&(ci, pid))
+                                    && states.insert(key)
+                                {
+                                    queue.push_back((ci, pid, handler_state.clone(), Vec::new()));
+                                }
+                            }
+                        }
+                    }
+                    ButtonEffect::None => {}
                 }
-                ButtonEffect::None => {}
+            }
+        }
+
+        if bootstrapped {
+            break;
+        }
+
+        // Bootstrap seeding: WB authoring uses a root page (page 0) with a
+        // single auto-action button that requires MOBJ lifecycle feedback
+        // (GPR[3807]) to navigate to the main menu page. Since the BFS can't
+        // simulate the full lifecycle (multiple PlayPl/resume cycles), root
+        // pages may be "stuck" — visited but unable to navigate to sub-pages.
+        //
+        // When a clip has only its root page visited after the BFS (no
+        // navigation edges followed to new pages) and produced no content,
+        // seed remaining pages as additional BFS roots. This preserves
+        // navigation breadcrumbs from those pages onwards while accepting the
+        // loss of the root→page1 prefix (the root page is just a bootstrap
+        // stub anyway).
+        bootstrapped = true;
+        for (clip_idx, clip) in clips.iter().enumerate() {
+            if clip.pages.len() <= 1 {
+                continue;
+            }
+            let Some(root_page) = clip.pages.iter().min_by_key(|p| p.page_id) else {
+                continue;
+            };
+            let clip_visited_count = visited.keys().filter(|(ci, _)| *ci == clip_idx).count();
+            let clip_has_content = resolved.iter().any(|r| {
+                r.breadcrumb
+                    .last()
+                    .is_some_and(|s| s.clip_index == clip_idx)
+            });
+            if clip_visited_count == 1
+                && visited.contains_key(&(clip_idx, root_page.page_id))
+                && !clip_has_content
+            {
+                for page in &clip.pages {
+                    if page.page_id == root_page.page_id {
+                        continue;
+                    }
+                    let key = hash_gpr_state(&init_gprs);
+                    let states = visited.entry((clip_idx, page.page_id)).or_default();
+                    if states.insert(key) {
+                        queue.push_back((clip_idx, page.page_id, init_gprs.clone(), Vec::new()));
+                    }
+                }
             }
         }
     }
@@ -2203,7 +2263,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 51,
-                    value: 1,
+                    value: 2,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
@@ -2348,7 +2408,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 51,
-                    value: 1,
+                    value: 2,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
@@ -2364,7 +2424,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 51,
-                    value: 2,
+                    value: 3,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
@@ -2424,7 +2484,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 51,
-                    value: 1,
+                    value: 2,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
@@ -2485,7 +2545,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 51,
-                    value: 1,
+                    value: 2,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
@@ -2503,7 +2563,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 51,
-                    value: 1,
+                    value: 2,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
@@ -2559,7 +2619,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 51,
-                    value: 1,
+                    value: 2,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
@@ -2575,7 +2635,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 51,
-                    value: 0,
+                    value: 1,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
@@ -2835,7 +2895,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 51,
-                    value: 1,
+                    value: 2,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
@@ -2851,7 +2911,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 52,
-                    value: 1,
+                    value: 2,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 52)),
             ],
@@ -2900,7 +2960,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 51,
-                    value: 1,
+                    value: 2,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
@@ -2947,7 +3007,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 51,
-                    value: 1,
+                    value: 2,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
@@ -3219,14 +3279,14 @@ mod tests {
         //
         // Before fix: seed_gpr_state terminated at the PlayPl, GPR[3051]
         // was never captured, and btn[4]'s SET_BUTTON_PAGE got page=0.
-        // After fix: PlayPl is skipped during seeding, GPR[3051]=6 is
-        // captured, and btn[4] navigates to page 6.
+        // After fix: PlayPl is skipped during seeding, GPR[3051]=7 is
+        // captured, and btn[4] navigates to page_id 6 (1-based: page=7).
 
         // MOBJ[0]: init block with PlayPl before GPR[3051] write
         let mobj0_instrs = vec![
             InsnSpec::SetGpr(3000, 42),
             InsnSpec::PlayPl(100), // menu start — previously terminated seeding
-            InsnSpec::SetGpr(3051, 6), // page config for special features
+            InsnSpec::SetGpr(3051, 7), // page config for special features (1-based: 7 → page_id 6)
         ];
 
         // MOBJ[1]: dispatch table for NOP anchors (need 3+ cases)
@@ -3249,7 +3309,7 @@ mod tests {
                 },
                 NavigationCommand::SetGpr {
                     register: 51,
-                    value: 1,
+                    value: 2,
                 },
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
