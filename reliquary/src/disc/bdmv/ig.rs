@@ -226,6 +226,8 @@ pub fn parse(data: &[u8]) -> Result<IgStream, IgError> {
     let mut current = CurrentDisplaySet::default();
     // Accumulator for multi-segment objects, keyed by object_id
     let mut object_acc: HashMap<u16, ObjectAccumulator> = HashMap::new();
+    // Accumulator for multi-segment compositions (at most one at a time)
+    let mut composition_acc: Option<CompositionAccumulator> = None;
 
     while r.remaining() >= 3 {
         let seg_type = r.read_u8()?;
@@ -257,9 +259,48 @@ pub fn parse(data: &[u8]) -> Result<IgStream, IgError> {
                 )?;
             }
             SEG_COMPOSITION => {
-                current
-                    .compositions
-                    .push(parse_interactive_composition(&mut Cursor::new(seg_data))?);
+                let mut seg_r = Cursor::new(seg_data);
+                // 9-byte segment-level header
+                let width = seg_r.read_u16()?;
+                let height = seg_r.read_u16()?;
+                seg_r.skip(1)?; // frame_rate_id + reserved
+                seg_r.skip(2)?; // composition_number
+                seg_r.skip(1)?; // composition_state + reserved
+                let seq_desc = seg_r.read_u8()?;
+                let body_chunk = seg_r.read_bytes(seg_r.remaining())?;
+
+                match seq_desc {
+                    SEQ_FIRST_AND_LAST => {
+                        current.compositions.push(parse_ic_body(
+                            width,
+                            height,
+                            &mut Cursor::new(body_chunk),
+                        )?);
+                    }
+                    SEQ_FIRST => {
+                        composition_acc = Some(CompositionAccumulator {
+                            width,
+                            height,
+                            body_data: body_chunk.to_vec(),
+                        });
+                    }
+                    SEQ_LAST => {
+                        if let Some(mut acc) = composition_acc.take() {
+                            acc.body_data.extend_from_slice(body_chunk);
+                            current.compositions.push(parse_ic_body(
+                                acc.width,
+                                acc.height,
+                                &mut Cursor::new(&acc.body_data),
+                            )?);
+                        }
+                    }
+                    _ => {
+                        // Middle segment (0x00)
+                        if let Some(acc) = composition_acc.as_mut() {
+                            acc.body_data.extend_from_slice(body_chunk);
+                        }
+                    }
+                }
             }
             SEG_END_OF_DISPLAY => {
                 // Finalize any in-progress multi-segment objects
@@ -316,6 +357,13 @@ struct ObjectAccumulator {
     width: u16,
     height: u16,
     rle_data: Vec<u8>,
+}
+
+/// Accumulates IC body data across multi-segment compositions.
+struct CompositionAccumulator {
+    width: u16,
+    height: u16,
+    body_data: Vec<u8>,
 }
 
 // ── Palette parsing ─────────────────────────────────────────────────────
@@ -449,32 +497,19 @@ fn read_u24(r: &mut Cursor<'_>) -> Result<u32, IgError> {
 
 // ── Interactive Composition parsing ─────────────────────────────────────
 
-/// Parses an Interactive Composition Segment (0x18).
+/// Parses the IC body (everything after the 9-byte segment-level header).
 ///
-/// The segment body has a 9-byte segment-level header (video descriptor,
-/// composition descriptor, sequence descriptor) followed by the IC body.
-/// The IC body starts with a `data_length` (u24) and model flags.
-///
-/// For multi-segment ICs, the `sequence_descriptor` indicates first
-/// (0x80), middle (0x00), or last (0x40) segments. Continuation
-/// segments repeat the 9-byte segment header. Page data that spans
-/// segment boundaries is parsed as far as each segment allows.
+/// `width` and `height` come from the segment header, read by the caller.
+/// `r` is a cursor over the reassembled IC body data — for multi-segment
+/// compositions, the caller accumulates body bytes from all segments
+/// before calling this function.
 ///
 /// Reference: libbluray `ig_decode.c`, `graphics_processor.c`.
-fn parse_interactive_composition(r: &mut Cursor<'_>) -> Result<InteractiveComposition, IgError> {
-    // ── Segment-level header (9 bytes) ──
-    let width = r.read_u16()?;
-    let height = r.read_u16()?;
-    // frame_rate_id (4 bits) + reserved (4 bits)
-    r.skip(1)?;
-    // composition_number (u16)
-    r.skip(2)?;
-    // composition_state (2 bits) + reserved (6 bits)
-    r.skip(1)?;
-    // sequence_descriptor
-    r.skip(1)?;
-
-    // ── IC body ──
+fn parse_ic_body(
+    width: u16,
+    height: u16,
+    r: &mut Cursor<'_>,
+) -> Result<InteractiveComposition, IgError> {
     // data_length (u24) — total IC body size across all segments
     let _data_length = read_u24(r)?;
 
@@ -496,9 +531,6 @@ fn parse_interactive_composition(r: &mut Cursor<'_>) -> Result<InteractiveCompos
 
     let num_pages = r.read_u8()?;
 
-    // The IC may be split across multiple segments. Parse as many pages
-    // as fit in this segment; continuation segments contribute their own
-    // pages as separate compositions that are merged by the caller.
     let mut pages = Vec::with_capacity(num_pages as usize);
     for _ in 0..num_pages {
         if r.remaining() == 0 {
@@ -872,6 +904,93 @@ pub(crate) mod tests {
             self
         }
 
+        /// Adds a multi-segment IC split at a page boundary.
+        ///
+        /// Pages `0..split_after` go in the first segment (`SEQ_FIRST`),
+        /// remaining pages in the last segment (`SEQ_LAST`). The IC body
+        /// (`data_length`, model flags, `num_pages`, page data) is split
+        /// across segments exactly as the BD spec allows.
+        pub(crate) fn composition_split(
+            mut self,
+            width: u16,
+            height: u16,
+            pages: &[PageSpec],
+            split_after: usize,
+        ) -> Self {
+            // Build IC body in two parts to find the natural split point
+            let mut ic_body_first = Vec::new();
+            build_ic_body_header(&mut ic_body_first, pages.len());
+            for page in &pages[..split_after] {
+                build_page(&mut ic_body_first, page);
+            }
+
+            let mut ic_body_last = Vec::new();
+            for page in &pages[split_after..] {
+                build_page(&mut ic_body_last, page);
+            }
+
+            self.segments.push(build_composition_segment(
+                width,
+                height,
+                SEQ_FIRST,
+                &ic_body_first,
+            ));
+            self.segments.push(build_composition_segment(
+                width,
+                height,
+                SEQ_LAST,
+                &ic_body_last,
+            ));
+            self
+        }
+
+        /// Adds a multi-segment IC split into three segments at two page
+        /// boundaries.
+        pub(crate) fn composition_split_three(
+            mut self,
+            width: u16,
+            height: u16,
+            pages: &[PageSpec],
+            split1: usize,
+            split2: usize,
+        ) -> Self {
+            let mut ic_body_first = Vec::new();
+            build_ic_body_header(&mut ic_body_first, pages.len());
+            for page in &pages[..split1] {
+                build_page(&mut ic_body_first, page);
+            }
+
+            let mut ic_body_middle = Vec::new();
+            for page in &pages[split1..split2] {
+                build_page(&mut ic_body_middle, page);
+            }
+
+            let mut ic_body_last = Vec::new();
+            for page in &pages[split2..] {
+                build_page(&mut ic_body_last, page);
+            }
+
+            self.segments.push(build_composition_segment(
+                width,
+                height,
+                SEQ_FIRST,
+                &ic_body_first,
+            ));
+            self.segments.push(build_composition_segment(
+                width,
+                height,
+                0x00, // middle
+                &ic_body_middle,
+            ));
+            self.segments.push(build_composition_segment(
+                width,
+                height,
+                SEQ_LAST,
+                &ic_body_last,
+            ));
+            self
+        }
+
         /// Adds an End of Display marker.
         pub(crate) fn end_of_display(mut self) -> Self {
             self.segments.push(build_segment(SEG_END_OF_DISPLAY, &[]));
@@ -1034,6 +1153,39 @@ pub(crate) mod tests {
                 buf.extend_from_slice(&0u32.to_be_bytes()); // src
             }
         }
+    }
+
+    /// Writes the IC body header (`stream_model=0` variant) into `buf`.
+    fn build_ic_body_header(buf: &mut Vec<u8>, num_pages: usize) {
+        buf.extend_from_slice(&[0u8; 3]); // data_length
+        buf.push(0); // stream_model=0, ui_model=0
+        buf.push(0); // uo_mask_flag + reserved
+        buf.extend_from_slice(&[0u8; 10]); // timeout PTSes (5+5)
+        buf.extend_from_slice(&[0u8; 3]); // user_timeout_duration
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "test page counts are small known constants"
+        )]
+        buf.push(num_pages as u8);
+    }
+
+    /// Builds a full composition segment (type + length + body) from a
+    /// 9-byte segment header and an IC body chunk.
+    fn build_composition_segment(
+        width: u16,
+        height: u16,
+        seq_desc: u8,
+        ic_body_chunk: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&width.to_be_bytes());
+        body.extend_from_slice(&height.to_be_bytes());
+        body.push(0); // frame_rate + reserved
+        body.extend_from_slice(&0u16.to_be_bytes()); // composition_number
+        body.push(0); // composition_state + reserved
+        body.push(seq_desc);
+        body.extend_from_slice(ic_body_chunk);
+        build_segment(SEG_COMPOSITION, &body)
     }
 
     // ── Segment iteration tests ─────────────────────────────────────
@@ -1236,6 +1388,167 @@ pub(crate) mod tests {
         assert_eq!(comp.pages[1].page_id, 1, "page 1 id");
         assert_eq!(comp.pages[0].buttons.len(), 1, "page 0 button count");
         assert_eq!(comp.pages[1].buttons.len(), 1, "page 1 button count");
+    }
+
+    #[test]
+    fn multi_segment_composition_first_last() {
+        // 3 pages split across two segments: pages 0–1 in first, page 2 in last
+        let data = IgBuilder::new()
+            .composition_split(
+                1920,
+                1080,
+                &[
+                    PageSpec {
+                        page_id: 0,
+                        buttons: vec![ButtonSpec {
+                            button_id: 0,
+                            x: 10,
+                            y: 20,
+                            normal_object_id: 0,
+                            selected_object_id: 1,
+                            commands: vec![CommandSpec::PlayPl(100)],
+                        }],
+                    },
+                    PageSpec {
+                        page_id: 1,
+                        buttons: vec![ButtonSpec {
+                            button_id: 1,
+                            x: 30,
+                            y: 40,
+                            normal_object_id: 2,
+                            selected_object_id: 3,
+                            commands: vec![CommandSpec::PlayPl(101)],
+                        }],
+                    },
+                    PageSpec {
+                        page_id: 2,
+                        buttons: vec![
+                            ButtonSpec {
+                                button_id: 2,
+                                x: 50,
+                                y: 60,
+                                normal_object_id: 4,
+                                selected_object_id: 5,
+                                commands: vec![CommandSpec::PlayPl(102)],
+                            },
+                            ButtonSpec {
+                                button_id: 3,
+                                x: 70,
+                                y: 80,
+                                normal_object_id: 6,
+                                selected_object_id: 7,
+                                commands: vec![CommandSpec::PlayPl(103)],
+                            },
+                        ],
+                    },
+                ],
+                2, // split after page 1
+            )
+            .end_of_display()
+            .build();
+
+        let stream = parse(&data).expect("should reassemble multi-segment composition");
+        assert_eq!(
+            stream.display_sets[0].compositions.len(),
+            1,
+            "one composition after reassembly"
+        );
+        let comp = &stream.display_sets[0].compositions[0];
+        assert_eq!(comp.width, 1920, "composition width");
+        assert_eq!(comp.height, 1080, "composition height");
+        assert_eq!(comp.pages.len(), 3, "all three pages reassembled");
+        assert_eq!(comp.pages[0].page_id, 0, "page 0 id");
+        assert_eq!(comp.pages[1].page_id, 1, "page 1 id");
+        assert_eq!(comp.pages[2].page_id, 2, "page 2 id");
+        assert_eq!(comp.pages[0].buttons.len(), 1, "page 0 button count");
+        assert_eq!(comp.pages[1].buttons.len(), 1, "page 1 button count");
+        assert_eq!(comp.pages[2].buttons.len(), 2, "page 2 button count");
+        assert_eq!(
+            comp.pages[2].buttons[0].commands,
+            vec![NavigationCommand::PlayPl {
+                playlist: 102,
+                branch_opt: 0,
+                mark_or_pi: 0,
+            }],
+            "page 2 button 0 command"
+        );
+    }
+
+    #[test]
+    fn multi_segment_composition_first_middle_last() {
+        // 4 pages split across three segments: page 0 in first, page 1 in middle, pages 2–3 in last
+        let data = IgBuilder::new()
+            .composition_split_three(
+                1920,
+                1080,
+                &[
+                    PageSpec {
+                        page_id: 0,
+                        buttons: vec![ButtonSpec {
+                            button_id: 0,
+                            x: 10,
+                            y: 20,
+                            normal_object_id: 0,
+                            selected_object_id: 1,
+                            commands: vec![CommandSpec::PlayPl(200)],
+                        }],
+                    },
+                    PageSpec {
+                        page_id: 1,
+                        buttons: vec![ButtonSpec {
+                            button_id: 1,
+                            x: 30,
+                            y: 40,
+                            normal_object_id: 2,
+                            selected_object_id: 3,
+                            commands: vec![CommandSpec::PlayPl(201)],
+                        }],
+                    },
+                    PageSpec {
+                        page_id: 2,
+                        buttons: vec![ButtonSpec {
+                            button_id: 2,
+                            x: 50,
+                            y: 60,
+                            normal_object_id: 4,
+                            selected_object_id: 5,
+                            commands: vec![CommandSpec::PlayPl(202)],
+                        }],
+                    },
+                    PageSpec {
+                        page_id: 3,
+                        buttons: vec![ButtonSpec {
+                            button_id: 3,
+                            x: 70,
+                            y: 80,
+                            normal_object_id: 6,
+                            selected_object_id: 7,
+                            commands: vec![CommandSpec::PlayPl(203)],
+                        }],
+                    },
+                ],
+                1, // first segment gets page 0
+                2, // middle segment gets page 1
+            )
+            .end_of_display()
+            .build();
+
+        let stream = parse(&data).expect("should reassemble three-segment composition");
+        let comp = &stream.display_sets[0].compositions[0];
+        assert_eq!(comp.pages.len(), 4, "all four pages reassembled");
+        for (i, page) in comp.pages.iter().enumerate() {
+            assert_eq!(page.page_id, i as u8, "page {i} id");
+            assert_eq!(page.buttons.len(), 1, "page {i} button count");
+        }
+        assert_eq!(
+            comp.pages[3].buttons[0].commands,
+            vec![NavigationCommand::PlayPl {
+                playlist: 203,
+                branch_opt: 0,
+                mark_or_pi: 0,
+            }],
+            "last page button command"
+        );
     }
 
     #[test]
