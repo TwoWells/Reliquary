@@ -380,12 +380,11 @@ pub fn resolve_via_execution(
     }
 
     let mut resolved = Vec::new();
-    // Per-clip dedup: the same playlist from different clips is NOT a
-    // duplicate — it's the same content accessible from different menus.
-    // Each menu provides different visual context (e.g. scene selection
-    // thumbnails vs. special features thumbnails). The CLI decides which
-    // clip's resolution to present.
-    let mut resolved_set = std::collections::HashSet::<(usize, PlayTarget)>::new();
+    // Per-page dedup: the same playlist from different pages is NOT a
+    // duplicate — each page provides different visual context (e.g.
+    // filmstrip thumbnails vs. text-label bitmaps). The downstream
+    // consumer decides which page's resolution to present.
+    let mut resolved_set = std::collections::HashSet::<(usize, u8, PlayTarget)>::new();
 
     // Page index: (clip_index, page_id) → (page ref, ig_pid)
     let mut page_lookup = std::collections::HashMap::<(usize, u8), (&Page, u16)>::new();
@@ -480,7 +479,7 @@ pub fn resolve_via_execution(
                                 branch_opt: 0,
                                 mark_or_pi: 0,
                             };
-                            if resolved_set.insert((clip_idx, target)) {
+                            if resolved_set.insert((clip_idx, page_id, target)) {
                                 let visible_bid = find_visible_button_for_nop(
                                     page, button, ig_pid, page_id, &gprs,
                                 )
@@ -525,7 +524,7 @@ pub fn resolve_via_execution(
                             && pl != 0xFFFF
                             && (valid_playlists.is_empty()
                                 || valid_playlists.contains(&u32::from(pl)));
-                        if is_valid && resolved_set.insert((clip_idx, target)) {
+                        if is_valid && resolved_set.insert((clip_idx, page_id, target)) {
                             let mut crumb = breadcrumb.clone();
                             crumb.push(BreadcrumbStep {
                                 clip_index: clip_idx,
@@ -544,7 +543,7 @@ pub fn resolve_via_execution(
                             let mut mobj_gprs = new_gprs;
                             if let Some(target) =
                                 run_mobj_vm(&mobj.instructions, 0, &mut mobj_gprs, valid_playlists)
-                                && resolved_set.insert((clip_idx, target))
+                                && resolved_set.insert((clip_idx, page_id, target))
                             {
                                 let mut crumb = breadcrumb.clone();
                                 crumb.push(BreadcrumbStep {
@@ -743,7 +742,7 @@ pub fn resolve_via_execution(
                                 branch_opt: 0,
                                 mark_or_pi: 0,
                             };
-                            if resolved_set.insert((clip_idx, target)) {
+                            if resolved_set.insert((clip_idx, page.page_id, target)) {
                                 let visible_bid = find_visible_button_for_nop(
                                     page,
                                     button,
@@ -800,7 +799,7 @@ pub fn resolve_via_execution(
                             && pl != 0xFFFF
                             && (valid_playlists.is_empty()
                                 || valid_playlists.contains(&u32::from(pl)));
-                        if is_valid && resolved_set.insert((clip_idx, target)) {
+                        if is_valid && resolved_set.insert((clip_idx, page.page_id, target)) {
                             resolved.push(ResolvedPlaylist {
                                 breadcrumb: vec![BreadcrumbStep {
                                     clip_index: clip_idx,
@@ -817,7 +816,7 @@ pub fn resolve_via_execution(
                             let mut mobj_gprs = new_gprs;
                             if let Some(target) =
                                 run_mobj_vm(&mobj.instructions, 0, &mut mobj_gprs, valid_playlists)
-                                && resolved_set.insert((clip_idx, target))
+                                && resolved_set.insert((clip_idx, page.page_id, target))
                             {
                                 resolved.push(ResolvedPlaylist {
                                     breadcrumb: vec![BreadcrumbStep {
@@ -865,7 +864,8 @@ pub fn resolve_via_execution(
                 }
 
                 let crumb_clip = crumb.last().map_or(0, |s| s.clip_index);
-                if resolved_set.insert((crumb_clip, target)) {
+                let crumb_page = crumb.last().map_or(0, |s| s.page_id);
+                if resolved_set.insert((crumb_clip, crumb_page, target)) {
                     // New resolution — no prior path existed.
                     resolved.push(ResolvedPlaylist {
                         breadcrumb: crumb.clone(),
@@ -2937,15 +2937,10 @@ mod tests {
             &std::collections::HashSet::new(),
         );
 
-        let matching: Vec<_> = resolved
-            .iter()
-            .filter(|r| r.target.playlist == 212)
-            .collect();
-        assert_eq!(matching.len(), 1, "same PlayTarget → deduplicated to one");
+        let count = resolved.iter().filter(|r| r.target.playlist == 212).count();
         assert_eq!(
-            breadcrumb_ids(&matching[0].breadcrumb),
-            vec![7],
-            "shortest breadcrumb (root page) wins, remapped to visible thumbnail"
+            count, 2,
+            "same playlist from different pages → one resolution per page"
         );
     }
 
@@ -3032,12 +3027,14 @@ mod tests {
         }];
         let resolved = resolve_via_execution(&clips, &mobj_file, None, &valid);
 
-        assert_eq!(resolved.len(), 1, "deduplicated to one resolution");
-        assert_eq!(resolved[0].target.playlist, 301, "playlist 301");
         assert_eq!(
-            breadcrumb_ids(&resolved[0].breadcrumb),
-            vec![5],
-            "shortest path (direct on page 0) wins"
+            resolved.len(),
+            2,
+            "same playlist from different pages → one resolution per page"
+        );
+        assert!(
+            resolved.iter().all(|r| r.target.playlist == 301),
+            "both resolve to playlist 301"
         );
     }
 
@@ -3261,8 +3258,8 @@ mod tests {
 
         let count = resolved.iter().filter(|r| r.target.playlist == 212).count();
         assert_eq!(
-            count, 1,
-            "same clip, same PlayTarget → still deduplicated to one"
+            count, 2,
+            "same playlist from different pages → one resolution per page"
         );
     }
 
