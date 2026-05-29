@@ -172,6 +172,9 @@ pub fn build_inventory(analysis: &BdmvAnalysis, buttons: &[MenuButton]) -> Conte
     // 4. Cross-clip dedup scoring: count content buttons per page
     let page_content_count = count_page_buttons(&candidates);
 
+    // Save all candidates before dedup for promote_main_feature
+    let all_candidates = candidates.clone();
+
     // Sort: prefer breadcrumb-having buttons, then pages with more siblings
     candidates.sort_by(|a, b| {
         let a_no_bc = u8::from(a.breadcrumb.is_empty());
@@ -197,10 +200,13 @@ pub fn build_inventory(analysis: &BdmvAnalysis, buttons: &[MenuButton]) -> Conte
         .collect();
 
     // Build navigable content with playlist metadata
-    let navigable = deduped
+    let mut navigable: Vec<NavigableContent> = deduped
         .into_iter()
         .filter_map(|b| build_navigable(b, analysis))
         .collect();
+
+    // 6. Post-dedup: promote the main feature to its lowest page
+    promote_main_feature(&mut navigable, &all_candidates);
 
     ContentInventory {
         navigable,
@@ -273,6 +279,81 @@ fn build_navigable(b: &MenuButton, analysis: &BdmvAnalysis) -> Option<NavigableC
             orphan: b.orphan,
         },
     })
+}
+
+/// Promotes the main feature to the lowest page with a valid candidate.
+///
+/// When one playlist is at least 4x longer than the next longest, it is
+/// treated as the main feature. Its snapshot is reassigned to the candidate
+/// on the lowest `page_id`, which typically places it on the main menu page
+/// rather than a sub-page with more sibling buttons.
+fn promote_main_feature(navigable: &mut [NavigableContent], candidates: &[&MenuButton]) {
+    /// Minimum duration ratio for a playlist to be considered the main feature.
+    const MAIN_FEATURE_RATIO: u64 = 4;
+
+    if navigable.len() < 2 {
+        return;
+    }
+
+    // Find the two longest playlists by duration
+    let mut by_duration: Vec<(u16, Duration)> =
+        navigable.iter().map(|n| (n.playlist, n.duration)).collect();
+    by_duration.sort_by_key(|b| std::cmp::Reverse(b.1));
+
+    let (main_pl, longest_dur) = by_duration[0];
+    let (_, second_dur) = by_duration[1];
+
+    if second_dur.as_secs() == 0
+        || longest_dur.as_secs() / second_dur.as_secs() < MAIN_FEATURE_RATIO
+    {
+        return;
+    }
+
+    // Find the candidate on the lowest page_id, preferring breadcrumb-having
+    // candidates (execution-resolved with known page context).
+    let Some(best) = candidates
+        .iter()
+        .filter(|b| b.playlist == main_pl)
+        .min_by_key(|b| {
+            let no_bc = u8::from(b.breadcrumb.is_empty());
+            let (ci, pid) = b
+                .breadcrumb
+                .last()
+                .map_or((b.clip_index, b.page_id), |s| (s.clip_index, s.page_id));
+            (no_bc, ci, pid)
+        })
+    else {
+        return;
+    };
+
+    let Some(nav) = navigable.iter_mut().find(|n| n.playlist == main_pl) else {
+        return;
+    };
+
+    let (snap_clip, snap_page, snap_btn) = best
+        .breadcrumb
+        .last()
+        .map_or((best.clip_index, best.page_id, best.button_id), |s| {
+            (s.clip_index, s.page_id, s.button_id)
+        });
+
+    // Only promote if the page actually changes
+    if snap_clip == nav.snapshot.clip_index && snap_page == nav.snapshot.page_id {
+        return;
+    }
+
+    nav.snapshot.clip_index = snap_clip;
+    nav.snapshot.page_id = snap_page;
+    nav.snapshot.button_id = snap_btn;
+    nav.snapshot.breadcrumb = if best.breadcrumb.is_empty() {
+        vec![BreadcrumbStep {
+            clip_index: best.clip_index,
+            page_id: best.page_id,
+            button_id: best.button_id,
+        }]
+    } else {
+        best.breadcrumb.clone()
+    };
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -474,8 +555,10 @@ mod tests {
 
     #[test]
     fn prefer_page_with_more_siblings() {
+        // Durations below the 4:1 promote_main_feature threshold so
+        // the dedup sibling-count preference is the final result.
         let analysis = test_analysis(vec![
-            test_playlist(100, 8476, 13),
+            test_playlist(100, 2000, 13),
             test_playlist(201, 600, 1),
             test_playlist(202, 300, 1),
         ]);
@@ -641,6 +724,69 @@ mod tests {
             inv.navigable.len(),
             2,
             "same playlist with different branch_opt should not be deduped"
+        );
+    }
+
+    #[test]
+    fn promote_main_feature_to_lowest_page() {
+        // pl100 is 4x longer than pl201 → main feature.
+        // Dedup picks page 4 (more siblings) for pl100.
+        // promote_main_feature should override to page 0 (lowest).
+        let analysis = test_analysis(vec![
+            test_playlist(100, 8476, 13),
+            test_playlist(201, 600, 1),
+            test_playlist(202, 300, 1),
+        ]);
+
+        // Page (0, 0): only pl 100
+        // Page (0, 4): pl 100, pl 201, pl 202 — more siblings
+        let buttons = vec![
+            test_button(100, 0, 0, 1),
+            test_button(100, 0, 4, 10),
+            test_button(201, 0, 4, 11),
+            test_button(202, 0, 4, 12),
+        ];
+
+        let inv = build_inventory(&analysis, &buttons);
+
+        assert_eq!(inv.navigable.len(), 3, "three unique playlists");
+        let pl100 = inv
+            .navigable
+            .iter()
+            .find(|n| n.playlist == 100)
+            .expect("pl 100 should be present");
+        assert_eq!(
+            pl100.snapshot.page_id, 0,
+            "main feature promoted to lowest page (page 0)"
+        );
+    }
+
+    #[test]
+    fn promote_main_feature_no_effect_below_ratio() {
+        // pl100 is only 3x longer than pl201 — does not meet the 4:1 threshold.
+        let analysis = test_analysis(vec![
+            test_playlist(100, 1800, 13),
+            test_playlist(201, 600, 1),
+        ]);
+
+        // Page (0, 0): only pl 100
+        // Page (0, 1): pl 100, pl 201 — more siblings
+        let buttons = vec![
+            test_button(100, 0, 0, 1),
+            test_button(100, 0, 1, 4),
+            test_button(201, 0, 1, 5),
+        ];
+
+        let inv = build_inventory(&analysis, &buttons);
+
+        let pl100 = inv
+            .navigable
+            .iter()
+            .find(|n| n.playlist == 100)
+            .expect("pl 100 should be present");
+        assert_eq!(
+            pl100.snapshot.page_id, 1,
+            "below 4:1 ratio — no promotion, sibling-count dedup wins"
         );
     }
 }

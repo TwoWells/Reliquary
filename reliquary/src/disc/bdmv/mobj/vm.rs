@@ -35,11 +35,15 @@ pub fn is_nop_anchor(button: &Button) -> bool {
 /// 1. **Forward trace:** execute each visible button's commands. If a button
 ///    produces `SET_BUTTON_PAGE` whose target button ID matches the NOP
 ///    anchor's `button_id`, it navigates to this anchor.
-/// 2. **Spatial fallback:** find the nearest visible button by squared
-///    Euclidean distance. WB authoring places NOP anchors ~30px from their
-///    corresponding visible thumbnails.
+/// 2. **Neighbor graph walk:** check cursor-navigation neighbor pointers in
+///    both directions (NOP → visible and visible → NOP) within 1–2 hops.
+///    Deterministic when the disc authoring encodes the relationship.
 ///
-/// Returns `None` if the page has no visible (non-NOP) buttons.
+/// Returns `None` if the page has no visible (non-NOP) buttons or no
+/// structural connection exists. On WB discs, NOP anchors on a page are
+/// dispatch targets from other pages — the visible button that activates
+/// them is on the originating page, resolved by the dispatch composite
+/// pass in [`resolve_via_execution`](super::resolve::resolve_via_execution).
 pub fn find_visible_button_for_nop(
     page: &Page,
     nop_button: &Button,
@@ -47,15 +51,6 @@ pub fn find_visible_button_for_nop(
     page_id: u8,
     gprs: &std::collections::HashMap<u32, u32>,
 ) -> Option<u16> {
-    /// Maximum squared distance for the spatial fallback (~60px).
-    ///
-    /// WB authoring places thumbnail NOP anchors ~30-42px from their
-    /// co-located visible thumbnails. Menu bar NOP anchors are ~285px+
-    /// from the nearest thumbnail — those must NOT match, because many
-    /// menu bar NOPs mapping to the same few thumbnails causes the CLI's
-    /// fallback matching to grab unrelated buttons (arrows, page numbers).
-    const MAX_SQUARED_DISTANCE: i32 = 60 * 60;
-
     let visible: Vec<&Button> = page.buttons.iter().filter(|b| !is_nop_anchor(b)).collect();
 
     if visible.is_empty() {
@@ -80,19 +75,67 @@ pub fn find_visible_button_for_nop(
         }
     }
 
-    // Spatial fallback: nearest visible button within the distance
-    // threshold. Rejects distant matches that cause many-to-one
-    // collisions in the CLI's button matching.
-    visible
-        .iter()
-        .filter_map(|v| {
-            let dx = i32::from(v.x) - i32::from(nop_button.x);
-            let dy = i32::from(v.y) - i32::from(nop_button.y);
-            let d2 = dx * dx + dy * dy;
-            (d2 <= MAX_SQUARED_DISTANCE).then_some((d2, v.button_id))
-        })
-        .min_by_key(|(d2, _)| *d2)
-        .map(|(_, bid)| bid)
+    // Neighbor graph walk: check structural connections between the NOP
+    // anchor and visible buttons via cursor-navigation neighbor pointers.
+    // Walks both directions: NOP → visible and visible → NOP.
+    let nop_neighbors = [
+        nop_button.upper_button_id,
+        nop_button.lower_button_id,
+        nop_button.left_button_id,
+        nop_button.right_button_id,
+    ];
+
+    let visible_ids: std::collections::HashSet<u16> = visible.iter().map(|v| v.button_id).collect();
+
+    // Forward 1-hop: NOP anchor's neighbor is a visible button.
+    for &nid in &nop_neighbors {
+        if nid != nop_button.button_id && visible_ids.contains(&nid) {
+            return Some(nid);
+        }
+    }
+
+    // Reverse 1-hop: a visible button's neighbor is the NOP anchor.
+    // On WB discs, visible thumbnails have neighbor fields pointing to
+    // co-located NOP anchors, but the NOP anchors may not point back.
+    for vis in &visible {
+        let vis_neighbors = [
+            vis.upper_button_id,
+            vis.lower_button_id,
+            vis.left_button_id,
+            vis.right_button_id,
+        ];
+        if vis_neighbors.contains(&nop_button.button_id) {
+            return Some(vis.button_id);
+        }
+    }
+
+    // 2-hop: neighbor's neighbor is a visible button (either direction).
+    let button_map: std::collections::HashMap<u16, &Button> =
+        page.buttons.iter().map(|b| (b.button_id, b)).collect();
+
+    for &nid in &nop_neighbors {
+        if nid == nop_button.button_id {
+            continue;
+        }
+        let Some(neighbor) = button_map.get(&nid) else {
+            continue;
+        };
+        for &next_id in &[
+            neighbor.upper_button_id,
+            neighbor.lower_button_id,
+            neighbor.left_button_id,
+            neighbor.right_button_id,
+        ] {
+            if next_id != neighbor.button_id
+                && next_id != nop_button.button_id
+                && visible_ids.contains(&next_id)
+            {
+                return Some(next_id);
+            }
+        }
+    }
+
+    None
 }
 
 // ── Button effect ──────────────────────────────────────────────────────
@@ -742,84 +785,98 @@ mod tests {
     }
 
     #[test]
-    fn visible_button_spatial_fallback() {
-        // No visible button's commands target the NOP anchor, but a
-        // co-located visible button is ~30px away. Spatial fallback
-        // selects the nearest one.
-        let thumb_near = make_button_at(
+    fn visible_button_neighbor_1hop() {
+        use super::super::test_helpers::make_button_with_neighbors;
+
+        // NOP anchor btn[21] has btn[5] as its upper neighbor.
+        // btn[5] is a visible button — should be found in 1 hop.
+        let nop = make_button_with_neighbors(
+            21,
+            199,
+            668,
+            [5, 0, 0, 0], // upper=5
+            vec![],
+        );
+        let thumb = make_button_at(
             5,
             229,
             668,
-            vec![
-                NavigationCommand::SetGpr {
-                    register: 50,
-                    value: 0,
-                },
-                NavigationCommand::SetGpr {
-                    register: 51,
-                    value: 26,
-                },
-                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
-            ],
-        );
-        let thumb_far = make_button_at(
-            6,
-            530,
-            668,
-            vec![
-                NavigationCommand::SetGpr {
-                    register: 50,
-                    value: 0,
-                },
-                NavigationCommand::SetGpr {
-                    register: 51,
-                    value: 26,
-                },
-                spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
-            ],
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
         );
 
-        let page = super::super::test_helpers::make_page(
-            0,
-            vec![make_button_at(21, 199, 668, vec![]), thumb_near, thumb_far],
-        );
-        let nop_ref = make_button_at(21, 199, 668, vec![]);
+        let page = super::super::test_helpers::make_page(0, vec![nop.clone(), thumb]);
         let gprs = std::collections::HashMap::new();
-        let result = find_visible_button_for_nop(&page, &nop_ref, 0x1200, 0, &gprs);
-        assert_eq!(
-            result,
-            Some(5),
-            "spatial fallback selects nearest visible btn[5] (30px) over btn[6] (331px)"
-        );
+        let result = find_visible_button_for_nop(&page, &nop, 0x1200, 0, &gprs);
+        assert_eq!(result, Some(5), "1-hop neighbor walk finds visible btn[5]");
     }
 
     #[test]
-    fn visible_button_spatial_rejects_distant_match() {
-        // Menu bar NOP anchor btn[19]@(1339,949) — nearest visible
-        // button is btn[9]@(1430,668) at ~295px, far beyond the 60px
-        // threshold. Should return None to prevent the many-to-one
-        // collision that causes fallback matching to grab random
-        // buttons (arrows, page numbers).
-        let page = super::super::test_helpers::make_page(
-            0,
-            vec![
-                make_button_at(19, 1339, 949, vec![]),
-                make_button_at(
-                    9,
-                    1430,
-                    668,
-                    vec![NavigationCommand::SetGpr {
-                        register: 50,
-                        value: 0,
-                    }],
-                ),
-            ],
-        );
-        let nop_ref = make_button_at(19, 1339, 949, vec![]);
+    fn visible_button_neighbor_2hop() {
+        use super::super::test_helpers::make_button_with_neighbors;
 
+        // NOP anchor btn[21] → neighbor btn[22] (another NOP) → neighbor btn[5] (visible).
+        // 2-hop walk required.
+        let nop = make_button_with_neighbors(
+            21,
+            0,
+            0,
+            [22, 0, 0, 0], // upper=22
+            vec![],
+        );
+        let intermediate = make_button_with_neighbors(
+            22,
+            0,
+            0,
+            [5, 0, 0, 0], // upper=5
+            vec![],
+        );
+        let thumb = make_button_at(
+            5,
+            229,
+            668,
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
+        );
+
+        let page = super::super::test_helpers::make_page(0, vec![nop.clone(), intermediate, thumb]);
         let gprs = std::collections::HashMap::new();
-        let result = find_visible_button_for_nop(&page, &nop_ref, 0x1200, 0, &gprs);
-        assert_eq!(result, None, "295px distance exceeds 60px threshold");
+        let result = find_visible_button_for_nop(&page, &nop, 0x1200, 0, &gprs);
+        assert_eq!(result, Some(5), "2-hop neighbor walk finds visible btn[5]");
+    }
+
+    #[test]
+    fn visible_button_no_neighbor_link_returns_none() {
+        use super::super::test_helpers::make_button_with_neighbors;
+
+        // NOP anchor btn[21] has no neighbor links to any visible button.
+        // On a copy-paste page, the neighbor pointers reference non-existent
+        // buttons — should return None to thin the candidate pool.
+        let nop = make_button_with_neighbors(
+            21,
+            0,
+            0,
+            [99, 98, 97, 96], // all neighbors reference buttons not on this page
+            vec![],
+        );
+        let thumb = make_button_at(
+            5,
+            229,
+            668,
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
+        );
+
+        let page = super::super::test_helpers::make_page(0, vec![nop.clone(), thumb]);
+        let gprs = std::collections::HashMap::new();
+        let result = find_visible_button_for_nop(&page, &nop, 0x1200, 0, &gprs);
+        assert_eq!(result, None, "no neighbor link to visible button → None");
     }
 
     #[test]
@@ -843,12 +900,12 @@ mod tests {
     fn visible_button_breadcrumb_in_resolver() {
         use super::super::resolve::extract_dispatch_table;
         use super::super::resolve::resolve_via_execution;
-        use super::super::test_helpers::build_dispatch_mobj;
+        use super::super::test_helpers::{build_dispatch_mobj, make_button_with_neighbors};
 
-        // End-to-end: NOP anchor on a page with a co-located visible
+        // End-to-end: NOP anchor on a page with a neighbor-linked visible
         // thumbnail. The resolver's breadcrumb should record the visible
         // button, not the NOP anchor.
-        let nop = make_button_at(21, 199, 668, vec![]);
+        let nop = make_button_with_neighbors(21, 199, 668, [5, 0, 0, 0], vec![]);
         let thumb = make_button_at(
             5,
             229,

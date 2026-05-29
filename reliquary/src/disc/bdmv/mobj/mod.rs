@@ -280,9 +280,14 @@ pub(crate) mod test_helpers {
             button_id,
             x: 0,
             y: 0,
+            upper_button_id: 0,
+            lower_button_id: 0,
+            left_button_id: 0,
+            right_button_id: 0,
             normal_object_id: 0,
             selected_object_id: 0,
             commands,
+            bog_id: 0,
         }
     }
 
@@ -296,9 +301,37 @@ pub(crate) mod test_helpers {
             button_id,
             x,
             y,
+            upper_button_id: 0,
+            lower_button_id: 0,
+            left_button_id: 0,
+            right_button_id: 0,
             normal_object_id: 0,
             selected_object_id: 0,
             commands,
+            bog_id: 0,
+        }
+    }
+
+    /// Creates a button with explicit neighbor navigation fields.
+    pub fn make_button_with_neighbors(
+        button_id: u16,
+        x: u16,
+        y: u16,
+        neighbors: [u16; 4],
+        commands: Vec<NavigationCommand>,
+    ) -> Button {
+        Button {
+            button_id,
+            x,
+            y,
+            upper_button_id: neighbors[0],
+            lower_button_id: neighbors[1],
+            left_button_id: neighbors[2],
+            right_button_id: neighbors[3],
+            normal_object_id: 0,
+            selected_object_id: 0,
+            commands,
+            bog_id: 0,
         }
     }
 

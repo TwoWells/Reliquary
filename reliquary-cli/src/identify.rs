@@ -364,6 +364,8 @@ fn extract_buttons(
     let mut frame_cache: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     // Collect raw IG buttons with player context for legacy MOBJ resolution
     let mut ig_buttons: Vec<(ig::Button, PlayerContext)> = Vec::new();
+    // Parallel origin tracking: (clip_index, page_id) for each ig_button entry
+    let mut ig_button_origins: Vec<(usize, u8)> = Vec::new();
     // Collect page structure per clip for execution-based resolution
     let mut clip_pages: Vec<(u16, Vec<ig::Page>)> = Vec::new();
     // Track clip_index for breadcrumb matching (indexes into clip_pages)
@@ -493,9 +495,14 @@ fn extract_buttons(
                                     button_id: button.button_id,
                                     x: button.x,
                                     y: button.y,
+                                    upper_button_id: button.upper_button_id,
+                                    lower_button_id: button.lower_button_id,
+                                    left_button_id: button.left_button_id,
+                                    right_button_id: button.right_button_id,
                                     normal_object_id: button.normal_object_id,
                                     selected_object_id: button.selected_object_id,
                                     commands: button.commands.clone(),
+                                    bog_id: button.bog_id,
                                 },
                                 PlayerContext {
                                     ig_stream: ig_pid,
@@ -503,6 +510,7 @@ fn extract_buttons(
                                     page_id: page.page_id,
                                 },
                             ));
+                            ig_button_origins.push((next_clip_index, page.page_id));
                         }
                     }
 
@@ -583,6 +591,7 @@ fn extract_buttons(
         resolve_mobj_buttons(
             reader,
             &ig_buttons,
+            &ig_button_origins,
             &clip_pages,
             &mut buttons,
             &valid_playlists,
@@ -604,12 +613,17 @@ fn extract_buttons(
     clippy::too_many_lines,
     reason = "pipeline orchestration with two resolver passes"
 )]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "origin tracking adds one parameter to the existing pipeline"
+)]
 fn resolve_mobj_buttons(
     reader: &reliquary::disc::reader::DiscReader,
     ig_buttons: &[(
         reliquary::disc::bdmv::ig::Button,
         reliquary::disc::bdmv::mobj::PlayerContext,
     )],
+    ig_button_origins: &[(usize, u8)],
     clip_pages: &[(u16, Vec<reliquary::disc::bdmv::ig::Page>)],
     buttons: &mut [ExtractedButton],
     valid_playlists: &HashSet<u32>,
@@ -702,21 +716,12 @@ fn resolve_mobj_buttons(
         let Some(content_step) = rp.breadcrumb.last() else {
             continue;
         };
-        let idx = buttons
-            .iter()
-            .position(|b| {
-                b.clip_index == content_step.clip_index
-                    && b.page_id == content_step.page_id
-                    && b.button_id == content_step.button_id
-                    && b.playlist.is_none()
-            })
-            .or_else(|| {
-                buttons.iter().position(|b| {
-                    b.clip_index == content_step.clip_index
-                        && b.page_id == content_step.page_id
-                        && b.playlist.is_none()
-                })
-            });
+        let idx = buttons.iter().position(|b| {
+            b.clip_index == content_step.clip_index
+                && b.page_id == content_step.page_id
+                && b.button_id == content_step.button_id
+                && b.playlist.is_none()
+        });
         if let Some(i) = idx {
             buttons[i].playlist = Some(rp.target.playlist);
             buttons[i].branch_opt = rp.target.branch_opt;
@@ -749,16 +754,33 @@ fn resolve_mobj_buttons(
             dispatch_table.as_ref(),
         );
 
+        // Build origin lookup: button_id → [(clip_index, page_id)]
+        let mut origin_lookup: HashMap<u16, Vec<(usize, u8)>> = HashMap::new();
+        for ((b, _), &(clip_idx, page_id)) in ig_buttons.iter().zip(ig_button_origins) {
+            origin_lookup
+                .entry(b.button_id)
+                .or_default()
+                .push((clip_idx, page_id));
+        }
+
         let mut legacy_count = 0u32;
         for rb in &legacy_resolved {
-            if let Some(eb) = buttons
-                .iter_mut()
-                .find(|b| b.button_id == rb.button_id && b.playlist.is_none())
-            {
-                eb.playlist = Some(rb.target.playlist);
-                eb.branch_opt = rb.target.branch_opt;
-                eb.mark_or_pi = rb.target.mark_or_pi;
-                legacy_count += 1;
+            let Some(origins) = origin_lookup.get(&rb.button_id) else {
+                continue;
+            };
+            for &(clip_index, page_id) in origins {
+                if let Some(eb) = buttons.iter_mut().find(|b| {
+                    b.button_id == rb.button_id
+                        && b.clip_index == clip_index
+                        && b.page_id == page_id
+                        && b.playlist.is_none()
+                }) {
+                    eb.playlist = Some(rb.target.playlist);
+                    eb.branch_opt = rb.target.branch_opt;
+                    eb.mark_or_pi = rb.target.mark_or_pi;
+                    legacy_count += 1;
+                    break;
+                }
             }
         }
 

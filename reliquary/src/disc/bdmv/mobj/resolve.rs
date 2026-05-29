@@ -479,11 +479,12 @@ pub fn resolve_via_execution(
                                 branch_opt: 0,
                                 mark_or_pi: 0,
                             };
+                            let Some(visible_bid) =
+                                find_visible_button_for_nop(page, button, ig_pid, page_id, &gprs)
+                            else {
+                                continue;
+                            };
                             if resolved_set.insert((clip_idx, page_id, target)) {
-                                let visible_bid = find_visible_button_for_nop(
-                                    page, button, ig_pid, page_id, &gprs,
-                                )
-                                .unwrap_or(button.button_id);
                                 let mut crumb = breadcrumb.clone();
                                 crumb.push(BreadcrumbStep {
                                     clip_index: clip_idx,
@@ -742,15 +743,16 @@ pub fn resolve_via_execution(
                                 branch_opt: 0,
                                 mark_or_pi: 0,
                             };
+                            let Some(visible_bid) = find_visible_button_for_nop(
+                                page,
+                                button,
+                                ig_pid,
+                                page.page_id,
+                                &init_gprs,
+                            ) else {
+                                continue;
+                            };
                             if resolved_set.insert((clip_idx, page.page_id, target)) {
-                                let visible_bid = find_visible_button_for_nop(
-                                    page,
-                                    button,
-                                    ig_pid,
-                                    page.page_id,
-                                    &init_gprs,
-                                )
-                                .unwrap_or(button.button_id);
                                 resolved.push(ResolvedPlaylist {
                                     breadcrumb: vec![BreadcrumbStep {
                                         clip_index: clip_idx,
@@ -1189,7 +1191,7 @@ fn resolve_via_lifecycle(
 mod tests {
     use super::super::test_helpers::{
         InsnSpec, MobjBuilder, breadcrumb_ids, build_dispatch_mobj, make_button, make_button_at,
-        make_page, spec_to_other,
+        make_button_with_neighbors, make_page, spec_to_other,
     };
     use super::super::{NavClipInput, PlayerContext};
     use super::*;
@@ -2702,9 +2704,37 @@ mod tests {
 
     #[test]
     fn exec_nop_anchor_resolves_via_button_id() {
-        let anchor_12 = make_button(12, vec![]);
-        let anchor_15 = make_button(15, vec![spec_to_other(&InsnSpec::Nop)]);
-        let anchor_20 = make_button(20, vec![]);
+        // NOP anchors with neighbor links to visible companion buttons.
+        let anchor_12 = make_button_with_neighbors(12, 0, 0, [112, 0, 0, 0], vec![]);
+        let thumb_12 = make_button(
+            112,
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
+        );
+        let anchor_15 = make_button_with_neighbors(
+            15,
+            0,
+            0,
+            [115, 0, 0, 0],
+            vec![spec_to_other(&InsnSpec::Nop)],
+        );
+        let thumb_15 = make_button(
+            115,
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
+        );
+        let anchor_20 = make_button_with_neighbors(20, 0, 0, [120, 0, 0, 0], vec![]);
+        let thumb_20 = make_button(
+            120,
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
+        );
 
         let dispatch_mobj =
             build_dispatch_mobj(&[(5, 205), (12, 212), (15, 215), (20, 220), (32, 232)]);
@@ -2712,7 +2742,12 @@ mod tests {
         let mobj_file = parse(&mobj_data).expect("should parse");
         let table = extract_dispatch_table(&mobj_file).expect("should extract table");
 
-        let page = make_page(0, vec![anchor_12, anchor_15, anchor_20]);
+        let page = make_page(
+            0,
+            vec![
+                anchor_12, thumb_12, anchor_15, thumb_15, anchor_20, thumb_20,
+            ],
+        );
         let clips = vec![NavClipInput {
             ig_pid: 0x1200,
             pages: vec![&page],
@@ -2824,7 +2859,7 @@ mod tests {
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
         );
-        let anchor = make_button_at(15, 199, 668, vec![]);
+        let anchor = make_button_with_neighbors(15, 199, 668, [5, 0, 0, 0], vec![]);
 
         let dispatch_mobj = build_dispatch_mobj(&[(8, 208), (15, 215), (20, 220)]);
         let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
@@ -2867,7 +2902,7 @@ mod tests {
 
     #[test]
     fn exec_nop_anchor_deduplicates() {
-        let anchor_p0 = make_button_at(12, 199, 668, vec![]);
+        let anchor_p0 = make_button_with_neighbors(12, 199, 668, [7, 0, 0, 0], vec![]);
         let thumbnail = make_button_at(
             7,
             229,
@@ -2916,7 +2951,14 @@ mod tests {
                 spec_to_other(&InsnSpec::SetButtonPage(50, 52)),
             ],
         );
-        let anchor_p1 = make_button(12, vec![]);
+        let anchor_p1 = make_button_with_neighbors(12, 0, 0, [70, 0, 0, 0], vec![]);
+        let thumb_p1 = make_button(
+            70,
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
+        );
 
         let dispatch_mobj = build_dispatch_mobj(&[(12, 212), (15, 215), (20, 220)]);
         let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
@@ -2924,7 +2966,7 @@ mod tests {
         let table = extract_dispatch_table(&mobj_file).expect("should extract table");
 
         let page0 = make_page(0, vec![anchor_p0, thumbnail, nav_a, nav_b]);
-        let page1 = make_page(1, vec![anchor_p1]);
+        let page1 = make_page(1, vec![anchor_p1, thumb_p1]);
         let clips = vec![NavClipInput {
             ig_pid: 0x1200,
             pages: vec![&page0, &page1],
@@ -2962,8 +3004,15 @@ mod tests {
         );
         let page0 = make_page(0, vec![nav]);
 
-        let anchor = make_button(15, vec![]);
-        let page1 = make_page(1, vec![anchor]);
+        let anchor = make_button_with_neighbors(15, 0, 0, [50, 0, 0, 0], vec![]);
+        let thumb_p1 = make_button(
+            50,
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
+        );
+        let page1 = make_page(1, vec![anchor, thumb_p1]);
 
         let dispatch_mobj = build_dispatch_mobj(&[(10, 210), (15, 215), (20, 220)]);
         let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
@@ -2985,8 +3034,8 @@ mod tests {
         assert_eq!(resolved[0].target.playlist, 215, "anchor 15 → 215");
         assert_eq!(
             breadcrumb_ids(&resolved[0].breadcrumb),
-            vec![1, 15],
-            "sub-page anchor has navigation prefix"
+            vec![1, 50],
+            "sub-page anchor remapped to visible companion btn[50]"
         );
     }
 
@@ -3043,8 +3092,15 @@ mod tests {
         let root_content = make_button(5, vec![NavigationCommand::GotoMobj { object_id: 1 }]);
         let page0 = make_page(0, vec![root_content]);
 
-        let orphan_anchor = make_button(15, vec![]);
-        let page2 = make_page(2, vec![orphan_anchor]);
+        let orphan_anchor = make_button_with_neighbors(15, 0, 0, [50, 0, 0, 0], vec![]);
+        let orphan_thumb = make_button(
+            50,
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
+        );
+        let page2 = make_page(2, vec![orphan_anchor, orphan_thumb]);
 
         let dispatch_mobj = build_dispatch_mobj(&[(10, 210), (15, 215), (20, 220)]);
         let mobj_data = MobjBuilder::new()
@@ -3132,7 +3188,7 @@ mod tests {
 
     #[test]
     fn exec_cross_clip_nop_anchors_both_preserved() {
-        let anchor_a = make_button_at(15, 199, 668, vec![]);
+        let anchor_a = make_button_with_neighbors(15, 199, 668, [5, 0, 0, 0], vec![]);
         let thumb_a = make_button_at(
             5,
             229,
@@ -3150,7 +3206,7 @@ mod tests {
             ],
         );
 
-        let anchor_b = make_button_at(15, 199, 668, vec![]);
+        let anchor_b = make_button_with_neighbors(15, 199, 668, [7, 0, 0, 0], vec![]);
         let thumb_b = make_button_at(
             7,
             229,
@@ -3218,7 +3274,7 @@ mod tests {
 
     #[test]
     fn exec_same_clip_still_deduplicates() {
-        let anchor_p0 = make_button_at(12, 199, 668, vec![]);
+        let anchor_p0 = make_button_with_neighbors(12, 199, 668, [7, 0, 0, 0], vec![]);
         let thumb_p0 = make_button_at(
             7,
             229,
@@ -3235,7 +3291,14 @@ mod tests {
                 spec_to_other(&InsnSpec::SetButtonPage(50, 51)),
             ],
         );
-        let anchor_p1 = make_button(12, vec![]);
+        let anchor_p1 = make_button_with_neighbors(12, 0, 0, [71, 0, 0, 0], vec![]);
+        let thumb_p1 = make_button(
+            71,
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
+        );
 
         let dispatch_mobj = build_dispatch_mobj(&[(12, 212), (15, 215), (20, 220)]);
         let mobj_data = MobjBuilder::new().object(&dispatch_mobj).build();
@@ -3243,7 +3306,7 @@ mod tests {
         let table = extract_dispatch_table(&mobj_file).expect("should extract table");
 
         let page0 = make_page(0, vec![anchor_p0, thumb_p0]);
-        let page1 = make_page(1, vec![anchor_p1]);
+        let page1 = make_page(1, vec![anchor_p1, thumb_p1]);
         let clips = vec![NavClipInput {
             ig_pid: 0x1200,
             pages: vec![&page0, &page1],
@@ -3334,11 +3397,35 @@ mod tests {
         );
         let page1 = make_page(1, vec![special_features_btn]);
 
-        // Page 6: special features (NOP anchors with text labels)
-        let extras_a = make_button(31, vec![]);
-        let extras_b = make_button(32, vec![]);
-        let extras_c = make_button(30, vec![]);
-        let page6 = make_page(6, vec![extras_a, extras_b, extras_c]);
+        // Page 6: special features (NOP anchors with text label neighbors)
+        let extras_a = make_button_with_neighbors(31, 0, 0, [131, 0, 0, 0], vec![]);
+        let thumb_a = make_button(
+            131,
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
+        );
+        let extras_b = make_button_with_neighbors(32, 0, 0, [132, 0, 0, 0], vec![]);
+        let thumb_b = make_button(
+            132,
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
+        );
+        let extras_c = make_button_with_neighbors(30, 0, 0, [130, 0, 0, 0], vec![]);
+        let thumb_c = make_button(
+            130,
+            vec![NavigationCommand::SetGpr {
+                register: 50,
+                value: 0,
+            }],
+        );
+        let page6 = make_page(
+            6,
+            vec![extras_a, thumb_a, extras_b, thumb_b, extras_c, thumb_c],
+        );
 
         let clips = vec![NavClipInput {
             ig_pid: 0x1200,

@@ -64,8 +64,15 @@ pub fn trace_ig_clip(clip_id: &str, ig_stream: &reliquary::disc::bdmv::ig::IgStr
                         "nav"
                     };
                     eprintln!(
-                        "    btn[{:3}]@({:4},{:4}) {cmd_label}",
-                        b.button_id, b.x, b.y,
+                        "    btn[{:3}]@({:4},{:4}) bog={:2} {cmd_label} ↑{up}↓{dn}←{lt}→{rt}",
+                        b.button_id,
+                        b.x,
+                        b.y,
+                        b.bog_id,
+                        up = b.upper_button_id,
+                        dn = b.lower_button_id,
+                        lt = b.left_button_id,
+                        rt = b.right_button_id,
                     );
                 }
 

@@ -101,7 +101,7 @@ pub struct Page {
 }
 
 /// A menu button with bitmap references and navigation commands.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Button {
     /// Button identifier.
     pub button_id: u16,
@@ -109,6 +109,14 @@ pub struct Button {
     pub x: u16,
     /// Vertical position in pixels.
     pub y: u16,
+    /// Neighbor button ID for cursor-up navigation.
+    pub upper_button_id: u16,
+    /// Neighbor button ID for cursor-down navigation.
+    pub lower_button_id: u16,
+    /// Neighbor button ID for cursor-left navigation.
+    pub left_button_id: u16,
+    /// Neighbor button ID for cursor-right navigation.
+    pub right_button_id: u16,
     /// Object ID for the normal (unselected) state bitmap.
     pub normal_object_id: u16,
     /// Object ID for the selected state bitmap.
@@ -116,6 +124,8 @@ pub struct Button {
     /// Navigation commands — filtered to `PlayPl` commands where
     /// identifiable, others wrapped as `Other`.
     pub commands: Vec<NavigationCommand>,
+    /// Button Overlap Group index within the page (0-based).
+    pub bog_id: u8,
 }
 
 /// An HDMV navigation command on a button.
@@ -576,8 +586,8 @@ fn parse_page(r: &mut Cursor<'_>) -> Result<Page, IgError> {
     let num_bogs = r.read_u8()?;
 
     let mut buttons = Vec::new();
-    for _ in 0..num_bogs {
-        parse_bog(r, &mut buttons)?;
+    for bog_idx in 0..num_bogs {
+        parse_bog(r, &mut buttons, bog_idx)?;
     }
 
     Ok(Page { page_id, buttons })
@@ -635,13 +645,15 @@ fn skip_composition_object(r: &mut Cursor<'_>) -> Result<(), IgError> {
 }
 
 /// Parses a Button Overlap Group (BOG) and appends its buttons.
-fn parse_bog(r: &mut Cursor<'_>, buttons: &mut Vec<Button>) -> Result<(), IgError> {
+fn parse_bog(r: &mut Cursor<'_>, buttons: &mut Vec<Button>, bog_id: u8) -> Result<(), IgError> {
     // default_valid_button_id (u16)
     let _default_button = r.read_u16()?;
     let num_buttons = r.read_u8()?;
 
     for _ in 0..num_buttons {
-        buttons.push(parse_button(r)?);
+        let mut btn = parse_button(r)?;
+        btn.bog_id = bog_id;
+        buttons.push(btn);
     }
 
     Ok(())
@@ -660,7 +672,10 @@ fn parse_button(r: &mut Cursor<'_>) -> Result<Button, IgError> {
     let y = r.read_u16()?;
 
     // neighbor navigation: up, down, left, right (u16 each)
-    r.skip(8)?;
+    let upper_button_id = r.read_u16()?;
+    let lower_button_id = r.read_u16()?;
+    let left_button_id = r.read_u16()?;
+    let right_button_id = r.read_u16()?;
 
     // Normal state
     let normal_start_object_id = r.read_u16()?;
@@ -695,9 +710,14 @@ fn parse_button(r: &mut Cursor<'_>) -> Result<Button, IgError> {
         button_id,
         x,
         y,
+        upper_button_id,
+        lower_button_id,
+        left_button_id,
+        right_button_id,
         normal_object_id: normal_start_object_id,
         selected_object_id: selected_start_object_id,
         commands,
+        bog_id: 0, // set by parse_bog caller
     })
 }
 
@@ -1029,6 +1049,8 @@ pub(crate) mod tests {
         pub selected_object_id: u16,
         /// Commands to attach.
         pub commands: Vec<CommandSpec>,
+        /// Neighbor navigation: `[up, down, left, right]`.
+        pub neighbors: [u16; 4],
     }
 
     /// Specification for a navigation command in the test builder.
@@ -1090,7 +1112,9 @@ pub(crate) mod tests {
         buf.extend_from_slice(&button.x.to_be_bytes());
         buf.extend_from_slice(&button.y.to_be_bytes());
         // neighbor navigation: up, down, left, right
-        buf.extend_from_slice(&[0u8; 8]);
+        for &n in &button.neighbors {
+            buf.extend_from_slice(&n.to_be_bytes());
+        }
         // Normal state
         buf.extend_from_slice(&button.normal_object_id.to_be_bytes()); // start
         buf.extend_from_slice(&button.normal_object_id.to_be_bytes()); // end
@@ -1208,6 +1232,7 @@ pub(crate) mod tests {
                         normal_object_id: 0,
                         selected_object_id: 0,
                         commands: vec![CommandSpec::PlayPl(203)],
+                        neighbors: [0; 4],
                     }],
                 }],
             )
@@ -1294,6 +1319,7 @@ pub(crate) mod tests {
                             normal_object_id: 0,
                             selected_object_id: 1,
                             commands: vec![CommandSpec::PlayPl(203)],
+                            neighbors: [0; 4],
                         },
                         ButtonSpec {
                             button_id: 1,
@@ -1302,6 +1328,7 @@ pub(crate) mod tests {
                             normal_object_id: 2,
                             selected_object_id: 3,
                             commands: vec![CommandSpec::PlayPl(204)],
+                            neighbors: [0; 4],
                         },
                     ],
                 }],
@@ -1363,6 +1390,7 @@ pub(crate) mod tests {
                             normal_object_id: 0,
                             selected_object_id: 1,
                             commands: vec![CommandSpec::PlayPl(100)],
+                            neighbors: [0; 4],
                         }],
                     },
                     PageSpec {
@@ -1374,6 +1402,7 @@ pub(crate) mod tests {
                             normal_object_id: 2,
                             selected_object_id: 3,
                             commands: vec![CommandSpec::PlayPl(101)],
+                            neighbors: [0; 4],
                         }],
                     },
                 ],
@@ -1407,6 +1436,7 @@ pub(crate) mod tests {
                             normal_object_id: 0,
                             selected_object_id: 1,
                             commands: vec![CommandSpec::PlayPl(100)],
+                            neighbors: [0; 4],
                         }],
                     },
                     PageSpec {
@@ -1418,6 +1448,7 @@ pub(crate) mod tests {
                             normal_object_id: 2,
                             selected_object_id: 3,
                             commands: vec![CommandSpec::PlayPl(101)],
+                            neighbors: [0; 4],
                         }],
                     },
                     PageSpec {
@@ -1430,6 +1461,7 @@ pub(crate) mod tests {
                                 normal_object_id: 4,
                                 selected_object_id: 5,
                                 commands: vec![CommandSpec::PlayPl(102)],
+                                neighbors: [0; 4],
                             },
                             ButtonSpec {
                                 button_id: 3,
@@ -1438,6 +1470,7 @@ pub(crate) mod tests {
                                 normal_object_id: 6,
                                 selected_object_id: 7,
                                 commands: vec![CommandSpec::PlayPl(103)],
+                                neighbors: [0; 4],
                             },
                         ],
                     },
@@ -1491,6 +1524,7 @@ pub(crate) mod tests {
                             normal_object_id: 0,
                             selected_object_id: 1,
                             commands: vec![CommandSpec::PlayPl(200)],
+                            neighbors: [0; 4],
                         }],
                     },
                     PageSpec {
@@ -1502,6 +1536,7 @@ pub(crate) mod tests {
                             normal_object_id: 2,
                             selected_object_id: 3,
                             commands: vec![CommandSpec::PlayPl(201)],
+                            neighbors: [0; 4],
                         }],
                     },
                     PageSpec {
@@ -1513,6 +1548,7 @@ pub(crate) mod tests {
                             normal_object_id: 4,
                             selected_object_id: 5,
                             commands: vec![CommandSpec::PlayPl(202)],
+                            neighbors: [0; 4],
                         }],
                     },
                     PageSpec {
@@ -1524,6 +1560,7 @@ pub(crate) mod tests {
                             normal_object_id: 6,
                             selected_object_id: 7,
                             commands: vec![CommandSpec::PlayPl(203)],
+                            neighbors: [0; 4],
                         }],
                     },
                 ],
@@ -1566,6 +1603,7 @@ pub(crate) mod tests {
                         normal_object_id: 0,
                         selected_object_id: 1,
                         commands: vec![],
+                        neighbors: [0; 4],
                     }],
                 }],
             )
@@ -1594,6 +1632,7 @@ pub(crate) mod tests {
                         normal_object_id: 0,
                         selected_object_id: 1,
                         commands: vec![CommandSpec::Other(other_opcode)],
+                        neighbors: [0; 4],
                     }],
                 }],
             )
@@ -1628,6 +1667,7 @@ pub(crate) mod tests {
                         normal_object_id: 0,
                         selected_object_id: 1,
                         commands: vec![CommandSpec::SetGpr(0, 5), CommandSpec::GotoMobj(2)],
+                        neighbors: [0; 4],
                     }],
                 }],
             )
@@ -1751,6 +1791,7 @@ pub(crate) mod tests {
                             normal_object_id: 0,
                             selected_object_id: 1,
                             commands: vec![CommandSpec::PlayPl(203)],
+                            neighbors: [0; 4],
                         },
                         ButtonSpec {
                             button_id: 1,
@@ -1759,6 +1800,7 @@ pub(crate) mod tests {
                             normal_object_id: 2,
                             selected_object_id: 3,
                             commands: vec![CommandSpec::PlayPl(204)],
+                            neighbors: [0; 4],
                         },
                     ],
                 }],
