@@ -137,7 +137,7 @@ pub struct ResolvedButton {
 /// Identifies a specific button on a specific page within a specific clip,
 /// so the CLI can look up the correct bitmap (not a same-ID button from a
 /// different clip or page).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct BreadcrumbStep {
     /// Index into the `clips` slice passed to [`resolve_via_execution`].
     pub clip_index: usize,

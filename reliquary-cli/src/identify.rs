@@ -170,82 +170,41 @@ pub fn run_identify(
             }
         };
 
-    // 5. Filter: content buttons (have PlayPl targeting a valid playlist)
-    let valid_playlists: HashSet<u32> = analysis.playlists.iter().map(|p| p.number).collect();
-
-    // Composite parents: playlists that contain other playlists as members.
-    // Suppress buttons targeting these — the member playlists are the actual content.
-    let composite_parents: HashSet<u32> = analysis
-        .playlists
+    // 5. Build content inventory (filtering + dedup in the library)
+    let menu_buttons: Vec<reliquary::disc::bdmv::inventory::MenuButton> = buttons
         .iter()
-        .filter(|p| !p.members.is_empty())
-        .map(|p| p.number)
+        .filter_map(|b| {
+            let playlist = b.playlist?;
+            Some(reliquary::disc::bdmv::inventory::MenuButton {
+                playlist,
+                branch_opt: b.branch_opt,
+                mark_or_pi: b.mark_or_pi,
+                clip_index: b.clip_index,
+                page_id: b.page_id,
+                button_id: b.button_id,
+                breadcrumb: b.breadcrumb.clone(),
+                orphan: b.orphan,
+            })
+        })
         .collect();
 
-    // Title table filter: only show playlists registered as titles in index.bdmv
-    let title_playlists = &analysis.title_playlists;
-    let use_title_filter = !title_playlists.is_empty();
+    let inventory = reliquary::disc::bdmv::inventory::build_inventory(&analysis, &menu_buttons);
 
-    let content_buttons: Vec<&ExtractedButton> = {
-        let mut candidates: Vec<&ExtractedButton> = buttons
-            .iter()
-            .filter(|b| {
-                b.playlist.is_some_and(|pl| {
-                    let pl32 = u32::from(pl);
-                    valid_playlists.contains(&pl32)
-                        && !composite_parents.contains(&pl32)
-                        && (!use_title_filter || title_playlists.contains(&pl32))
-                })
+    // Map navigable content back to ExtractedButtons for rendering.
+    // The snapshot metadata identifies the winning button by
+    // (clip_index, page_id, button_id).
+    let content_buttons: Vec<&ExtractedButton> = inventory
+        .navigable
+        .iter()
+        .filter_map(|nav| {
+            buttons.iter().find(|b| {
+                b.playlist == Some(nav.playlist)
+                    && b.clip_index == nav.snapshot.clip_index
+                    && b.page_id == nav.snapshot.page_id
+                    && b.button_id == nav.snapshot.button_id
             })
-            .collect();
-
-        // Cross-clip dedup: when the same playlist is resolved from
-        // multiple clips, prefer the resolution from the page with the
-        // most sibling content buttons. That page is the dedicated
-        // content page (e.g. special features thumbnails) rather than
-        // a page that happens to share the same dispatch table (e.g.
-        // scene selection NOP anchors claiming the same playlists).
-        let page_content_count: HashMap<(usize, u8), usize> = {
-            let mut counts: HashMap<(usize, u8), usize> = HashMap::new();
-            for b in &candidates {
-                let key = b
-                    .breadcrumb
-                    .last()
-                    .map_or((b.clip_index, b.page_id), |s| (s.clip_index, s.page_id));
-                *counts.entry(key).or_default() += 1;
-            }
-            counts
-        };
-
-        // Sort: prefer breadcrumb-having buttons, then pages with more
-        // sibling content buttons.
-        candidates.sort_by(|a, b| {
-            let a_has_bc = u8::from(a.breadcrumb.is_empty());
-            let b_has_bc = u8::from(b.breadcrumb.is_empty());
-            a_has_bc.cmp(&b_has_bc).then_with(|| {
-                let a_key = a
-                    .breadcrumb
-                    .last()
-                    .map_or((a.clip_index, a.page_id), |s| (s.clip_index, s.page_id));
-                let b_key = b
-                    .breadcrumb
-                    .last()
-                    .map_or((b.clip_index, b.page_id), |s| (s.clip_index, s.page_id));
-                let a_count = page_content_count.get(&a_key).copied().unwrap_or(0);
-                let b_count = page_content_count.get(&b_key).copied().unwrap_or(0);
-                b_count.cmp(&a_count)
-            })
-        });
-
-        let mut seen = HashSet::new();
-        candidates
-            .into_iter()
-            .filter(|b| {
-                b.playlist
-                    .is_some_and(|pl| seen.insert((pl, b.branch_opt, b.mark_or_pi)))
-            })
-            .collect()
-    };
+        })
+        .collect();
 
     eprintln!(
         "found {} buttons with playlist targets",
