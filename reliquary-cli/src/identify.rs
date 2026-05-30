@@ -625,7 +625,7 @@ fn resolve_mobj_buttons(
     )],
     ig_button_origins: &[(usize, u8)],
     clip_pages: &[(u16, Vec<reliquary::disc::bdmv::ig::Page>)],
-    buttons: &mut [ExtractedButton],
+    buttons: &mut Vec<ExtractedButton>,
     valid_playlists: &HashSet<u32>,
     menu_playlists: &[u32],
     do_trace: bool,
@@ -728,6 +728,36 @@ fn resolve_mobj_buttons(
             buttons[i].mark_or_pi = rp.target.mark_or_pi;
             buttons[i].breadcrumb.clone_from(&rp.breadcrumb);
             buttons[i].orphan = rp.orphan;
+        } else {
+            // Button already occupied by a different playlist — clone
+            // with the new resolution so all dispatch composites get
+            // breadcrumbs (ticket 06b: multi-composite matchback).
+            let source = buttons.iter().position(|b| {
+                b.clip_index == content_step.clip_index
+                    && b.page_id == content_step.page_id
+                    && b.button_id == content_step.button_id
+            });
+            if let Some(i) = source {
+                let width = buttons[i].width;
+                let height = buttons[i].height;
+                let clip_index = buttons[i].clip_index;
+                let page_id = buttons[i].page_id;
+                let button_id = buttons[i].button_id;
+                let rgba = buttons[i].rgba.clone();
+                buttons.push(ExtractedButton {
+                    playlist: Some(rp.target.playlist),
+                    branch_opt: rp.target.branch_opt,
+                    mark_or_pi: rp.target.mark_or_pi,
+                    clip_index,
+                    page_id,
+                    button_id,
+                    breadcrumb: rp.breadcrumb.clone(),
+                    orphan: rp.orphan,
+                    width,
+                    height,
+                    rgba,
+                });
+            }
         }
     }
 
