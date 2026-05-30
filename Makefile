@@ -90,6 +90,9 @@ deny:
 run:
 	@cargo run -p reliquary-cli --release -- $(ARGS)
 
+nav:
+	@cargo run -p reliquary-nav --release -- $(ARGS)
+
 # --- Test ---
 
 # Run mutation tests (scoped to parser-heavy library crate)

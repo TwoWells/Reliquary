@@ -8,7 +8,9 @@
 
 use std::collections::HashMap;
 
-use crate::identify::{ExtractedButton, PageComposition};
+pub use reliquary::disc::bdmv::compose::{PageComposition, composite_page};
+
+use crate::identify::ExtractedButton;
 
 /// Draws a colored border rectangle on an RGBA canvas.
 ///
@@ -61,65 +63,6 @@ pub fn draw_highlight_border(
             }
         }
     }
-}
-
-/// Composites a full menu page into an RGBA canvas.
-///
-/// When a video `background` is provided, button bitmaps are alpha-composited
-/// on top of the decoded video frame — producing the same view a person sees
-/// on their TV. Without a background, transparent regions are left as black.
-///
-/// All buttons are rendered at their `(x, y)` positions in the normal state.
-/// If `highlight` is provided, that button is rendered in its selected state
-/// instead.
-pub fn composite_page(
-    page: &PageComposition,
-    highlight: Option<u16>,
-    background: Option<&[u8]>,
-) -> Vec<u8> {
-    let w = usize::from(page.canvas_width);
-    let h = usize::from(page.canvas_height);
-    let expected = w * h * 4;
-    let mut canvas = match background {
-        Some(bg) if bg.len() == expected => bg.to_vec(),
-        _ => vec![0u8; expected],
-    };
-
-    for btn in &page.buttons {
-        let use_selected = highlight == Some(btn.button_id);
-        let bitmap = if use_selected {
-            btn.selected.as_ref().or(btn.normal.as_ref())
-        } else {
-            btn.normal.as_ref().or(btn.selected.as_ref())
-        };
-        let Some(bmp) = bitmap else { continue };
-
-        let bx = usize::from(btn.x);
-        let by = usize::from(btn.y);
-        let bw = usize::from(bmp.width);
-        let bh = usize::from(bmp.height);
-
-        for row in 0..bh {
-            let dst_y = by + row;
-            if dst_y >= h {
-                break;
-            }
-            for col in 0..bw {
-                let dst_x = bx + col;
-                if dst_x >= w {
-                    break;
-                }
-                let src_off = (row * bw + col) * 4;
-                let dst_off = (dst_y * w + dst_x) * 4;
-                let alpha = bmp.data[src_off + 3];
-                if alpha > 0 {
-                    canvas[dst_off..dst_off + 4].copy_from_slice(&bmp.data[src_off..src_off + 4]);
-                }
-            }
-        }
-    }
-
-    canvas
 }
 
 /// Writes an RGBA canvas as a PPM file (RGB, no alpha).

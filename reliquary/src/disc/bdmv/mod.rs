@@ -8,6 +8,7 @@
 
 pub mod aacs;
 pub mod clpi;
+pub mod compose;
 pub mod cursor;
 pub mod ig;
 pub mod index;

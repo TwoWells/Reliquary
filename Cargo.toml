@@ -2,6 +2,7 @@
 members = [
     "reliquary",
     "reliquary-cli",
+    "reliquary-nav",
     "reliquary-tui",
     "reliquary-web",
 ]

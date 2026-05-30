@@ -6,6 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::process::ExitCode;
 
+pub use reliquary::disc::bdmv::compose::{ButtonComposition, PageComposition};
+
 use crate::output::{output_dump, output_json, output_text};
 use crate::prompt::{prompt_content_buttons, prompt_fallback_buttons};
 use crate::snapshot::{dump_page_images, extract_video_frame};
@@ -51,39 +53,6 @@ pub struct NamedItem {
     pub mark_or_pi: u32,
     /// User-provided name (empty string means skipped).
     pub name: String,
-}
-
-/// All decoded button bitmaps for one IG page, with positions and canvas size.
-///
-/// Used for full-page rendering: composite all buttons at their `(x, y)`
-/// coordinates onto a canvas at the composition window dimensions, then
-/// highlight the active button by overwriting its region with the selected-
-/// state bitmap.
-pub struct PageComposition {
-    /// Index into the clips list (matches [`ExtractedButton::clip_index`]).
-    pub clip_index: usize,
-    /// Page identifier.
-    pub page_id: u8,
-    /// Canvas width in pixels (from the IG composition descriptor).
-    pub canvas_width: u16,
-    /// Canvas height in pixels.
-    pub canvas_height: u16,
-    /// Decoded button bitmaps with positions.
-    pub buttons: Vec<ButtonComposition>,
-}
-
-/// A single button's position and decoded bitmaps (both states).
-pub struct ButtonComposition {
-    /// Button identifier.
-    pub button_id: u16,
-    /// Horizontal position on the canvas.
-    pub x: u16,
-    /// Vertical position on the canvas.
-    pub y: u16,
-    /// Normal (unselected) state bitmap, if decodable.
-    pub normal: Option<reliquary::disc::bdmv::rle::Bitmap>,
-    /// Selected (highlighted) state bitmap, if decodable.
-    pub selected: Option<reliquary::disc::bdmv::rle::Bitmap>,
 }
 
 // ── Pipeline ────────────────────────────────────────────────────────
