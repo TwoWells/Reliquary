@@ -226,6 +226,10 @@ pub fn seed_gpr_state(mobj_file: &MovieObjectFile) -> std::collections::HashMap<
 /// Converts all [`NavigationCommand`]s to [`Instruction`]s and runs them
 /// through the mini-VM. Recognizes three terminal actions: `PlayPl`,
 /// `GotoMobj` (BRANCH\_JUMP), and `SET_BUTTON_PAGE` (SETSYSTEM set\_opt=3).
+#[allow(
+    clippy::implicit_hasher,
+    reason = "called from both library internals and navigator with std HashMap"
+)]
 pub fn execute_button_commands(
     commands: &[NavigationCommand],
     ctx: &PlayerContext,
@@ -249,8 +253,10 @@ pub fn execute_button_commands(
             GRP_SET => {
                 // Intercept SET_BUTTON_PAGE before the generic SET handler
                 if insn.sub_group == 1 && insn.set_opt == SET_BUTTON_PAGE_OPT {
-                    let composite = fetch_operand(insn.imm_op1, insn.dst, &gprs);
-                    let page = fetch_operand(insn.imm_op2, insn.src, &gprs);
+                    let composite =
+                        resolve_sbp_operand(fetch_operand(insn.imm_op1, insn.dst, &gprs), &gprs);
+                    let page =
+                        resolve_sbp_operand(fetch_operand(insn.imm_op2, insn.src, &gprs), &gprs);
                     return (ButtonEffect::SetButtonPage { composite, page }, gprs);
                 }
                 execute_set(insn, &mut gprs);
@@ -423,6 +429,25 @@ pub fn fetch_operand(
             .unwrap_or(0)
     } else {
         gprs.get(&raw).copied().unwrap_or(0)
+    }
+}
+
+/// Resolves a `SET_BUTTON_PAGE` operand after standard operand fetch.
+///
+/// `SET_BUTTON_PAGE` uses a non-standard operand convention: even when
+/// `imm_op1`/`imm_op2` are set (marking the values as "immediate"), the
+/// values may embed register references using bit 31. libbluray's
+/// `_read_setbuttonpage_reg` handles this by extracting bits 0–11 as a
+/// register number whenever bit 31 is set.
+///
+/// This function applies that convention: if `value` has bit 31 set,
+/// it reads `GPR[value & 0xFFF]`. Otherwise it returns `value` unchanged.
+fn resolve_sbp_operand(value: u32, gprs: &std::collections::HashMap<u32, u32>) -> u32 {
+    if value & PSR_FLAG != 0 {
+        let reg = value & 0xFFF;
+        gprs.get(&reg).copied().unwrap_or(0)
+    } else {
+        value
     }
 }
 
@@ -1048,6 +1073,56 @@ mod tests {
                     page, 0,
                     "page = 0 when GPR[3051] uninitialized (wrong destination)"
                 );
+            }
+            ref other => panic!("expected SetButtonPage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn immediate_set_button_page_with_embedded_register_refs() {
+        // AT-style SET_BUTTON_PAGE: imm_op1=1, imm_op2=1, but the
+        // immediate values embed register references (bit 31 = flag).
+        // libbluray's `_read_setbuttonpage_reg` checks bit 31 and reads
+        // GPR[value & 0xFFF] when set.
+        //
+        //   1. GPR[16] = 1  (page selector, immediate)
+        //   2. SET_BUTTON_PAGE(0x80000000, 0x80000010)
+        //       imm_op1=1, imm_op2=1 (both "immediate")
+        //       dst = 0x80000000 → bit 31 set → GPR[0] = 0
+        //       src = 0x80000010 → bit 31 set → GPR[16] = 1
+
+        // Construct the raw SET_BUTTON_PAGE with imm_op1=1, imm_op2=1:
+        // grp=2 (SET), sub_grp=1 (SETSYSTEM), op_cnt=2,
+        // imm_op1=1, imm_op2=1, set_opt=3 (SET_BUTTON_PAGE)
+        // Opcode: 0101 0001 1100 0000 0000 0000 0000 0011
+        //         ^^^  ^^   ^^                        ^^^
+        //         op=2 grp  imm1+imm2                 set_opt=3
+        let opcode: u32 = 0x51C0_0003;
+        let commands = vec![
+            NavigationCommand::SetGpr {
+                register: 16,
+                value: 1,
+            },
+            NavigationCommand::Other {
+                opcode,
+                dst: 0x8000_0000, // packed: bit 31 → GPR[0]
+                src: 0x8000_0010, // packed: bit 31 → GPR[16]
+            },
+        ];
+
+        let ctx = PlayerContext {
+            selected_button_id: 2,
+            page_id: 1,
+            ..PlayerContext::default()
+        };
+
+        let (effect, _) =
+            execute_button_commands(&commands, &ctx, &std::collections::HashMap::new());
+
+        match effect {
+            ButtonEffect::SetButtonPage { composite, page } => {
+                assert_eq!(composite, 0, "composite = GPR[0] = 0 (not set)");
+                assert_eq!(page, 1, "page = GPR[16] = 1 (set by preceding SetGpr)");
             }
             ref other => panic!("expected SetButtonPage, got {other:?}"),
         }

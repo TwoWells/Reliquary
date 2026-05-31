@@ -5,7 +5,8 @@
 //!
 //! Opens a window rendering a Blu-ray IG menu page at full resolution.
 //! Mouse hover highlights buttons by swapping their bitmap state (normal ↔
-//! selected). Validates the compositing pipeline and button bounding boxes.
+//! selected). Clicking a button with a `SetButtonPage` command navigates
+//! to the target page within the same clip.
 
 mod pipeline;
 
@@ -17,13 +18,15 @@ use std::sync::Arc;
 use clap::Parser;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
 use reliquary::disc::bdmv::compose::composite_page;
 
-use crate::pipeline::LoadedPage;
+use crate::pipeline::{
+    ButtonEffect, LoadedClip, LoadedPage, PlayerContext, execute_button_commands,
+};
 
 /// Interactive disc menu navigator — visual validation of IG compositing.
 #[derive(Parser)]
@@ -61,12 +64,21 @@ fn main() -> ExitCode {
         None => None,
     };
 
-    let loaded = match pipeline::load_page(&cli.path, cli.clip, cli.page, vuk.as_ref()) {
-        Ok(p) => p,
+    let clip = match pipeline::load_clip(&cli.path, cli.clip, vuk.as_ref()) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
+    };
+
+    let Some(loaded) = clip.build_page(cli.page) else {
+        eprintln!(
+            "error: page index {} out of range (have {} pages)",
+            cli.page,
+            clip.page_count()
+        );
+        return ExitCode::FAILURE;
     };
 
     let event_loop = match EventLoop::new() {
@@ -77,7 +89,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut app = App::new(loaded);
+    let mut app = App::new(clip, loaded);
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("error: event loop failed: {e}");
         return ExitCode::FAILURE;
@@ -103,6 +115,7 @@ fn parse_vuk(s: &str) -> Result<[u8; 16], String> {
 // ── Application state ──────────────────────────────────────────────────
 
 struct App {
+    clip: LoadedClip,
     loaded: LoadedPage,
     state: Option<WindowState>,
 }
@@ -116,8 +129,9 @@ struct WindowState {
 }
 
 impl App {
-    const fn new(loaded: LoadedPage) -> Self {
+    const fn new(clip: LoadedClip, loaded: LoadedPage) -> Self {
         Self {
+            clip,
             loaded,
             state: None,
         }
@@ -132,7 +146,7 @@ impl App {
             return;
         };
 
-        let canvas = composite_page(&self.loaded.page, state.highlight, self.loaded.background());
+        let canvas = composite_page(&self.loaded.page, state.highlight, self.clip.background());
 
         let width = u32::from(self.loaded.page.canvas_width);
         let height = u32::from(self.loaded.page.canvas_height);
@@ -193,6 +207,45 @@ impl App {
             }
         }
         None
+    }
+
+    /// Executes a button's commands through the HDMV mini-VM and navigates
+    /// to the target page if the result is `SetButtonPage`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "page IDs are u8 values stored in u32 SetButtonPage fields"
+    )]
+    fn navigate_to_page(&mut self, button_id: u16) {
+        let Some(commands) = self.loaded.commands_for_button(button_id) else {
+            return;
+        };
+
+        let ctx = PlayerContext {
+            selected_button_id: button_id,
+            page_id: self.loaded.page.page_id,
+            ..PlayerContext::default()
+        };
+        let (effect, _gprs) = execute_button_commands(commands, &ctx, self.clip.init_gprs());
+
+        let ButtonEffect::SetButtonPage { page, .. } = effect else {
+            return;
+        };
+
+        let page_id = page as u8;
+        let Some(page_index) = self.clip.page_index_for_id(page_id) else {
+            return;
+        };
+
+        let Some(new_loaded) = self.clip.build_page(page_index) else {
+            return;
+        };
+
+        self.loaded = new_loaded;
+
+        if let Some(state) = &mut self.state {
+            state.highlight = None;
+            state.window.request_redraw();
+        }
     }
 }
 
@@ -265,6 +318,17 @@ impl ApplicationHandler for App {
                 {
                     state.highlight = new_highlight;
                     state.window.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if let Some(ws) = &self.state
+                    && let Some(button_id) = ws.highlight
+                {
+                    self.navigate_to_page(button_id);
                 }
             }
             WindowEvent::RedrawRequested => {

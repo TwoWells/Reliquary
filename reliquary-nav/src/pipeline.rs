@@ -1,45 +1,163 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Two Wells <contact@twowells.dev>
 
-//! Disc loading pipeline — reads IG data and builds a compositable page.
+//! Disc loading pipeline — reads IG data and builds compositable pages.
 //!
-//! Extracts the IG stream from a disc, decodes button bitmaps, and
-//! optionally extracts a video background frame via ffmpeg.
+//! Loads an entire IG clip once (all pages, bitmaps, palette), then builds
+//! [`LoadedPage`] views on demand for any page within the clip. This
+//! supports page navigation without re-reading the disc.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use reliquary::disc::bdmv::compose::{ButtonComposition, PageComposition};
-use reliquary::disc::bdmv::{ig, read_clip, rle, ts};
+use reliquary::disc::bdmv::ig::{self, NavigationCommand};
+use reliquary::disc::bdmv::mobj;
+use reliquary::disc::bdmv::{read_clip, rle, ts};
 use reliquary::disc::reader::DiscReader;
 use reliquary::disc::{self, InspectResult};
 
-/// A fully loaded page ready for rendering.
-pub struct LoadedPage {
-    /// The compositable page data.
-    pub page: PageComposition,
+pub use mobj::{ButtonEffect, PlayerContext, execute_button_commands};
+
+/// All decoded data for one IG clip — supports building any page on demand.
+pub struct LoadedClip {
+    /// Clip index within the disc's IG clip list.
+    clip_index: usize,
+    /// Canvas width from the IC descriptor.
+    canvas_width: u16,
+    /// Canvas height from the IC descriptor.
+    canvas_height: u16,
+    /// Decoded button bitmaps keyed by object ID, shared across pages.
+    bitmaps: Vec<DecodedObject>,
+    /// All pages in presentation order from the IC.
+    pages: Vec<ig::Page>,
     /// Video background RGBA buffer (if extracted), matching canvas dimensions.
     background: Option<Vec<u8>>,
+    /// Initial GPR state from MOBJ\[0\] (First Play) execution.
+    ///
+    /// WB and similar authoring stores per-content-item configuration in a
+    /// GPR database initialized by MOBJ\[0\]. Button commands read from
+    /// these registers to compute dispatch values and page targets.
+    init_gprs: HashMap<u32, u32>,
+}
+
+/// A decoded bitmap object, identified by its object ID.
+struct DecodedObject {
+    object_id: u16,
+    bitmap: rle::Bitmap,
+}
+
+/// A fully loaded page ready for rendering, with navigation command access.
+pub struct LoadedPage {
+    /// The compositable page data (positions + bitmaps).
+    pub page: PageComposition,
+    /// Navigation commands for each button, indexed by position in
+    /// `page.buttons` (same order, same length).
+    pub button_commands: Vec<Vec<NavigationCommand>>,
 }
 
 impl LoadedPage {
+    /// Returns the navigation commands for the given button ID.
+    pub fn commands_for_button(&self, button_id: u16) -> Option<&[NavigationCommand]> {
+        let idx = self
+            .page
+            .buttons
+            .iter()
+            .position(|b| b.button_id == button_id)?;
+        self.button_commands.get(idx).map(Vec::as_slice)
+    }
+}
+
+impl LoadedClip {
     /// Returns the background as a slice reference, if available.
     pub fn background(&self) -> Option<&[u8]> {
         self.background.as_deref()
     }
+
+    /// Returns the initial GPR state from MOBJ\[0\] execution.
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "HashMap::new is not const-stable"
+    )]
+    pub fn init_gprs(&self) -> &HashMap<u32, u32> {
+        &self.init_gprs
+    }
+
+    /// Number of pages in this clip.
+    pub const fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Builds a [`LoadedPage`] for the given page index.
+    ///
+    /// Returns `None` if the page index is out of range.
+    pub fn build_page(&self, page_index: usize) -> Option<LoadedPage> {
+        let page = self.pages.get(page_index)?;
+
+        let mut btn_comps = Vec::with_capacity(page.buttons.len());
+        let mut button_commands = Vec::with_capacity(page.buttons.len());
+
+        for button in &page.buttons {
+            let normal = self.find_bitmap(button.normal_object_id);
+            let selected = self.find_bitmap(button.selected_object_id);
+
+            btn_comps.push(ButtonComposition {
+                button_id: button.button_id,
+                x: button.x,
+                y: button.y,
+                normal,
+                selected,
+            });
+            button_commands.push(button.commands.clone());
+        }
+
+        let page_comp = PageComposition {
+            clip_index: self.clip_index,
+            page_id: page.page_id,
+            canvas_width: self.canvas_width,
+            canvas_height: self.canvas_height,
+            buttons: btn_comps,
+        };
+
+        Some(LoadedPage {
+            page: page_comp,
+            button_commands,
+        })
+    }
+
+    /// Finds the page index for a given page ID.
+    ///
+    /// Page IDs are assigned by the disc author and may not be sequential
+    /// starting from 0. This maps from the ID in `SetButtonPage` commands
+    /// to the index used by [`build_page`](Self::build_page).
+    pub fn page_index_for_id(&self, page_id: u8) -> Option<usize> {
+        self.pages.iter().position(|p| p.page_id == page_id)
+    }
+
+    /// Clones a bitmap for the given object ID, if it was successfully decoded.
+    fn find_bitmap(&self, object_id: u16) -> Option<rle::Bitmap> {
+        self.bitmaps
+            .iter()
+            .find(|o| o.object_id == object_id)
+            .map(|o| o.bitmap.clone())
+    }
 }
 
-/// Loads a single page from a disc for rendering.
+/// Loads an entire IG clip from a disc.
+///
+/// Parses all pages, decodes all button bitmaps, and optionally extracts
+/// a video background frame. The returned [`LoadedClip`] can produce
+/// a [`LoadedPage`] for any page via [`build_page`](LoadedClip::build_page).
 ///
 /// # Errors
 ///
 /// Returns an error string if the disc cannot be read, the clip index
-/// or page index is out of range, or IG parsing fails.
-pub fn load_page(
+/// is out of range, or IG parsing fails.
+pub fn load_clip(
     path: &Path,
     clip_index: usize,
-    page_index: usize,
     vuk: Option<&[u8; 16]>,
-) -> Result<LoadedPage, String> {
+) -> Result<LoadedClip, String> {
     let reader = DiscReader::open(path).map_err(|e| format!("failed to open disc: {e}"))?;
 
     let analysis = match disc::inspect(path).map_err(|e| format!("inspect failed: {e}"))? {
@@ -96,57 +214,61 @@ pub fn load_page(
 
     let palette = ds.palettes.first().ok_or("no palettes in display set")?;
 
-    // Find the requested page
     let comp = ds
         .compositions
-        .first()
+        .into_iter()
+        .next()
         .ok_or("no compositions in display set")?;
 
-    let page = comp.pages.get(page_index).ok_or_else(|| {
-        format!(
-            "page index {page_index} out of range (have {} pages)",
-            comp.pages.len()
-        )
-    })?;
-
-    // Decode button bitmaps
-    let mut btn_comps = Vec::new();
-    for button in &page.buttons {
-        let normal = ds
-            .objects
-            .iter()
-            .find(|o| o.object_id == button.normal_object_id)
-            .and_then(|o| rle::decode(o, palette).ok());
-        let selected = ds
-            .objects
-            .iter()
-            .find(|o| o.object_id == button.selected_object_id)
-            .and_then(|o| rle::decode(o, palette).ok());
-
-        btn_comps.push(ButtonComposition {
-            button_id: button.button_id,
-            x: button.x,
-            y: button.y,
-            normal,
-            selected,
-        });
+    // Decode all bitmap objects up front (shared across pages)
+    let mut bitmaps = Vec::with_capacity(ds.objects.len());
+    for obj in &ds.objects {
+        if let Ok(bitmap) = rle::decode(obj, palette) {
+            bitmaps.push(DecodedObject {
+                object_id: obj.object_id,
+                bitmap,
+            });
+        }
     }
-
-    let page_comp = PageComposition {
-        clip_index,
-        page_id: page.page_id,
-        canvas_width: comp.width,
-        canvas_height: comp.height,
-        buttons: btn_comps,
-    };
 
     // Extract video background
     let background = extract_background(&reader, &analysis, ig_clip, vuk, comp.width, comp.height);
 
-    Ok(LoadedPage {
-        page: page_comp,
+    // Seed GPR state from MOBJ[0] (First Play). Button commands on
+    // complex discs read from a GPR database initialized here.
+    let init_gprs = load_mobj_gprs(&reader);
+
+    Ok(LoadedClip {
+        clip_index,
+        canvas_width: comp.width,
+        canvas_height: comp.height,
+        bitmaps,
+        pages: comp.pages,
         background,
+        init_gprs,
     })
+}
+
+/// Loads `MovieObject.bdmv` and runs MOBJ\[0\] to seed the GPR database.
+///
+/// Returns an empty map if the file is missing or cannot be parsed.
+fn load_mobj_gprs(reader: &DiscReader) -> HashMap<u32, u32> {
+    let mobj_path = std::path::Path::new("BDMV/MovieObject.bdmv");
+    let mobj_alt = std::path::Path::new("MovieObject.bdmv");
+
+    let mobj_data = reader
+        .read_file(mobj_path)
+        .or_else(|_| reader.read_file(mobj_alt));
+
+    let Ok(data) = mobj_data else {
+        return HashMap::new();
+    };
+
+    let Ok(mobj_file) = mobj::parse(&data) else {
+        return HashMap::new();
+    };
+
+    mobj::seed_gpr_state(&mobj_file)
 }
 
 /// Attempts to extract a video background frame for the IG clip.

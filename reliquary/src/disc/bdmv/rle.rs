@@ -50,7 +50,7 @@ pub enum RleError {
 // ── Public types ────────────────────────────────────────────────────────
 
 /// A decoded RGBA bitmap.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Bitmap {
     /// Width in pixels.
     pub width: u16,

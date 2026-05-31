@@ -18,7 +18,7 @@ pub use resolve::{
     extract_dispatch_table, find_dispatch_entries, find_handler_pc, resolve_buttons,
     resolve_via_execution,
 };
-pub use vm::{is_nop_anchor, run_mobj_vm, seed_gpr_state};
+pub use vm::{ButtonEffect, execute_button_commands, is_nop_anchor, run_mobj_vm, seed_gpr_state};
 
 use thiserror::Error;
 
