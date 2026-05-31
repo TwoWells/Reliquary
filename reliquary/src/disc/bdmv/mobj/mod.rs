@@ -18,7 +18,10 @@ pub use resolve::{
     extract_dispatch_table, find_dispatch_entries, find_handler_pc, resolve_buttons,
     resolve_via_execution,
 };
-pub use vm::{ButtonEffect, execute_button_commands, is_nop_anchor, run_mobj_vm, seed_gpr_state};
+pub use vm::{
+    ButtonEffect, execute_button_commands, is_nop_anchor, run_mobj_vm, seed_gpr_state,
+    seed_title_gprs,
+};
 
 use thiserror::Error;
 
@@ -368,9 +371,15 @@ pub(crate) mod test_helpers {
         Goto(u32),
         /// GOTO: conditional branch (taken if last CMP was true).
         GotoIf(u32),
-        /// `GotoMobj`: jump to movie object (`BRANCH_JUMP`, `imm_op1=1`).
+        /// `GotoMobj`: jump to movie object (`BRANCH_JUMP`, `imm_op1=1`,
+        /// `branch_opt=1`). Used for button command tests where `branch_opt`
+        /// is not inspected.
         #[allow(dead_code, reason = "used via spec_to_other for button commands")]
         GotoMobj(u32),
+        /// `JumpObject`: jump to movie object by index (`BRANCH_JUMP`,
+        /// `imm_op1=1`, `branch_opt=0`). Unlike `GotoMobj`, this uses the
+        /// correct `JUMP_OBJECT` encoding for MOBJ chain tests.
+        JumpObject(u32),
         /// AND: `GPR[dst] &= GPR[src]` (register-to-register).
         AndReg(u32, u32),
         /// ADD: `GPR[dst] += GPR[src]` (register-to-register).
@@ -501,10 +510,19 @@ pub(crate) mod test_helpers {
             }
             InsnSpec::GotoMobj(object_id) => {
                 // grp=0 (BRANCH), sub_grp=1 (JUMP), op_cnt=1, imm_op1=1,
-                // branch_opt=1 (GOTO)
+                // branch_opt=1 (JUMP_TITLE encoding — works for button
+                // command tests where branch_opt is not inspected)
                 let insn: u32 = 0x2181_0000;
                 buf.extend_from_slice(&insn.to_be_bytes());
                 buf.extend_from_slice(&object_id.to_be_bytes());
+                buf.extend_from_slice(&0u32.to_be_bytes());
+            }
+            InsnSpec::JumpObject(mobj_idx) => {
+                // grp=0 (BRANCH), sub_grp=1 (JUMP), op_cnt=1, imm_op1=1,
+                // branch_opt=0 (JUMP_OBJECT)
+                let insn: u32 = 0x2180_0000;
+                buf.extend_from_slice(&insn.to_be_bytes());
+                buf.extend_from_slice(&mobj_idx.to_be_bytes());
                 buf.extend_from_slice(&0u32.to_be_bytes());
             }
             InsnSpec::AndReg(dst_reg, src_reg) => {

@@ -220,6 +220,142 @@ pub fn seed_gpr_state(mobj_file: &MovieObjectFile) -> std::collections::HashMap<
         .collect()
 }
 
+/// Executes the MOBJ chain from First Play (MOBJ\[0\]) following
+/// `JumpObject` and `JumpTitle` instructions across movie objects,
+/// capturing GPR state when `PlayPl` for a menu playlist is reached.
+///
+/// This captures per-page context registers (e.g. GPR\[3\] on Adventure
+/// Time) that are set by the title MOBJ before it plays the menu
+/// playlist. Without these registers, sequential page navigation
+/// fails because button commands compute page targets from uninitialized
+/// values.
+///
+/// `title_to_mobj` maps title numbers to MOBJ indices for resolving
+/// `JumpTitle` instructions. Build this from the disc's `index.bdmv`
+/// title table (title 0 = First Playback, title 0xFFFF = Top Menu,
+/// titles 1..N = regular titles).
+///
+/// Returns only GPR entries (PSRs are stripped). Returns an empty map
+/// if no `PlayPl` for a menu playlist is reached — callers should
+/// merge the result with [`seed_gpr_state`] (which provides the global
+/// GPR database from MOBJ\[0\]).
+#[must_use]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "called from navigator pipeline with std HashMap/HashSet"
+)]
+pub fn seed_title_gprs(
+    mobj_file: &MovieObjectFile,
+    menu_playlists: &std::collections::HashSet<u32>,
+    title_to_mobj: &std::collections::HashMap<u32, usize>,
+) -> std::collections::HashMap<u32, u32> {
+    /// Maximum cross-MOBJ jumps before giving up (prevents cycles).
+    const MAX_JUMPS: u32 = 10;
+
+    if menu_playlists.is_empty() || mobj_file.objects.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let mut gprs = std::collections::HashMap::new();
+    // Seed PSRs with first-boot defaults (identical to seed_gpr_state).
+    gprs.insert(PSR_FLAG | 0x01, 0xFF); // primary audio
+    gprs.insert(PSR_FLAG | 0x02, 0xFFFE); // PG/TextST
+    gprs.insert(PSR_FLAG | 0x03, 0xFF); // angle
+    gprs.insert(PSR_FLAG | 0x04, 0xFFFF); // title (init guard)
+    gprs.insert(PSR_FLAG | 0x0A, 0xFFFF); // selected button
+    gprs.insert(PSR_FLAG | 0x0C, 0xFF); // user style
+    gprs.insert(PSR_FLAG | 0x0D, 0xFF); // parental level
+    gprs.insert(PSR_FLAG | 0x0E, 0xFFFF); // secondary A/V
+    gprs.insert(PSR_FLAG | 0x0F, 0x0002_0000); // audio cap
+    gprs.insert(PSR_FLAG | 0x1D, 0x0200); // profile 2.0
+    gprs.insert(PSR_FLAG | 0x1F, 0x0200); // player version
+
+    let mut current_mobj_idx: usize = 0;
+    let mut pc: usize = 0;
+    let mut steps: u32 = 0;
+    let mut jump_count: u32 = 0;
+
+    while let Some(current_mobj) = mobj_file.objects.get(current_mobj_idx) {
+        let instrs = &current_mobj.instructions;
+        let mut jumped = false;
+
+        while pc < instrs.len() && steps < VM_STEP_LIMIT {
+            steps += 1;
+            let insn = &instrs[pc];
+
+            match insn.group {
+                GRP_SET => {
+                    execute_set(insn, &mut gprs);
+                    pc += 1;
+                }
+                GRP_CMP => {
+                    if execute_cmp(insn, &gprs) {
+                        pc += 1;
+                    } else {
+                        pc += 2;
+                    }
+                }
+                GRP_BRANCH => match insn.sub_group {
+                    BRANCH_PLAY => {
+                        let playlist = fetch_operand(insn.imm_op1, insn.dst, &gprs);
+                        if menu_playlists.contains(&playlist) {
+                            // Found PlayPl for menu playlist — capture GPR state
+                            return gprs
+                                .into_iter()
+                                .filter(|(k, _)| k & PSR_FLAG == 0)
+                                .collect();
+                        }
+                        // Skip non-menu PlayPl and continue
+                        pc += 1;
+                    }
+                    BRANCH_JUMP => {
+                        if jump_count >= MAX_JUMPS {
+                            pc += 1;
+                            continue;
+                        }
+                        let target = fetch_operand(insn.imm_op1, insn.dst, &gprs);
+                        // branch_opt 0/2 = JUMP/CALL_OBJECT (direct MOBJ index)
+                        // branch_opt 1/3 = JUMP/CALL_TITLE (title number → MOBJ via index)
+                        let target_mobj = match insn.branch_opt {
+                            0 | 2 => {
+                                Some(target as usize).filter(|&idx| idx < mobj_file.objects.len())
+                            }
+                            1 | 3 => title_to_mobj.get(&target).copied(),
+                            _ => None,
+                        };
+                        if let Some(mobj_idx) = target_mobj {
+                            jump_count += 1;
+                            current_mobj_idx = mobj_idx;
+                            pc = 0;
+                            jumped = true;
+                            break;
+                        }
+                        pc += 1;
+                    }
+                    BRANCH_GOTO => {
+                        if !execute_goto(insn, &gprs, &mut pc) {
+                            pc += 1;
+                        }
+                    }
+                    _ => {
+                        pc += 1;
+                    }
+                },
+                _ => {
+                    pc += 1;
+                }
+            }
+        }
+
+        if !jumped {
+            break;
+        }
+    }
+
+    // No PlayPl for menu playlist reached — return empty
+    std::collections::HashMap::new()
+}
+
 /// Executes a button's navigation commands and returns the terminal effect
 /// along with the register state at the point of termination.
 ///
@@ -1133,6 +1269,7 @@ mod tests {
     #[test]
     fn seed_gpr_captures_registers_after_play_pl() {
         // MOBJ[0] writes GPR[3051] = 6 AFTER a PlayPl instruction.
+        // See detailed assertion comments below.
         // Before the fix, PlayPl terminated execution and GPR[3051]
         // was never captured. After the fix, PlayPl is skipped
         // during seeding, so the entire init block executes.
@@ -1169,5 +1306,159 @@ mod tests {
             Some(7),
             "GPR[3052] captured after PlayPl"
         );
+    }
+
+    // ── seed_title_gprs tests ───────────────────────────────────────
+
+    #[test]
+    fn title_gprs_jump_object_captures_context_registers() {
+        // MOBJ[0] sets GPR[3000] (config database), then JumpObject
+        // to MOBJ[1]. MOBJ[1] sets GPR[3] (page context) and plays
+        // the menu playlist. seed_title_gprs should capture both.
+        let mobj_data = MobjBuilder::new()
+            .object(&[InsnSpec::SetGpr(3000, 42), InsnSpec::JumpObject(1)])
+            .object(&[InsnSpec::SetGpr(3, 5), InsnSpec::PlayPl(800)])
+            .build();
+
+        let mobj_file = super::super::parse::parse(&mobj_data).expect("should parse");
+        let menu_playlists = std::collections::HashSet::from([800]);
+        let title_to_mobj = std::collections::HashMap::new();
+
+        let gprs = seed_title_gprs(&mobj_file, &menu_playlists, &title_to_mobj);
+
+        assert_eq!(
+            gprs.get(&3000).copied(),
+            Some(42),
+            "GPR[3000] captured from MOBJ[0] before jump"
+        );
+        assert_eq!(
+            gprs.get(&3).copied(),
+            Some(5),
+            "GPR[3] captured from title MOBJ[1]"
+        );
+    }
+
+    #[test]
+    fn title_gprs_jump_title_resolves_via_map() {
+        // MOBJ[0] sets GPR[3000], then JumpTitle(0xFFFF) (top menu).
+        // title_to_mobj maps 0xFFFF → MOBJ[1]. MOBJ[1] sets GPR[3]
+        // and plays menu playlist.
+        let mobj_data = MobjBuilder::new()
+            .object(&[
+                InsnSpec::SetGpr(3000, 42),
+                // GotoMobj uses branch_opt=1 = JUMP_TITLE encoding
+                InsnSpec::GotoMobj(0xFFFF),
+            ])
+            .object(&[InsnSpec::SetGpr(3, 5), InsnSpec::PlayPl(800)])
+            .build();
+
+        let mobj_file = super::super::parse::parse(&mobj_data).expect("should parse");
+        let menu_playlists = std::collections::HashSet::from([800]);
+        let mut title_to_mobj = std::collections::HashMap::new();
+        title_to_mobj.insert(0xFFFF_u32, 1_usize);
+
+        let gprs = seed_title_gprs(&mobj_file, &menu_playlists, &title_to_mobj);
+
+        assert_eq!(
+            gprs.get(&3000).copied(),
+            Some(42),
+            "GPR[3000] captured from MOBJ[0]"
+        );
+        assert_eq!(
+            gprs.get(&3).copied(),
+            Some(5),
+            "GPR[3] captured from title MOBJ resolved via title_to_mobj"
+        );
+    }
+
+    #[test]
+    fn title_gprs_skips_non_menu_play_pl() {
+        // MOBJ[0] plays a non-menu playlist (100), then jumps to
+        // MOBJ[1] which plays the menu playlist (800). The non-menu
+        // PlayPl should be skipped; GPR state captured at menu PlayPl.
+        let mobj_data = MobjBuilder::new()
+            .object(&[
+                InsnSpec::SetGpr(3000, 42),
+                InsnSpec::PlayPl(100), // non-menu — skipped
+                InsnSpec::SetGpr(3001, 99),
+                InsnSpec::JumpObject(1),
+            ])
+            .object(&[
+                InsnSpec::SetGpr(3, 5),
+                InsnSpec::PlayPl(800), // menu — captures state
+            ])
+            .build();
+
+        let mobj_file = super::super::parse::parse(&mobj_data).expect("should parse");
+        let menu_playlists = std::collections::HashSet::from([800]);
+        let title_to_mobj = std::collections::HashMap::new();
+
+        let gprs = seed_title_gprs(&mobj_file, &menu_playlists, &title_to_mobj);
+
+        assert_eq!(gprs.get(&3000).copied(), Some(42), "GPR[3000] captured");
+        assert_eq!(
+            gprs.get(&3001).copied(),
+            Some(99),
+            "GPR[3001] captured after skipped non-menu PlayPl"
+        );
+        assert_eq!(
+            gprs.get(&3).copied(),
+            Some(5),
+            "GPR[3] captured from MOBJ[1]"
+        );
+    }
+
+    #[test]
+    fn title_gprs_empty_when_no_menu_playlist_reached() {
+        // MOBJ[0] plays a non-menu playlist and has no jump to
+        // a title MOBJ. No menu PlayPl is reached → empty result.
+        let mobj_data = MobjBuilder::new()
+            .object(&[
+                InsnSpec::SetGpr(3000, 42),
+                InsnSpec::PlayPl(100), // non-menu — skipped
+            ])
+            .build();
+
+        let mobj_file = super::super::parse::parse(&mobj_data).expect("should parse");
+        let menu_playlists = std::collections::HashSet::from([800]);
+        let title_to_mobj = std::collections::HashMap::new();
+
+        let gprs = seed_title_gprs(&mobj_file, &menu_playlists, &title_to_mobj);
+
+        assert!(gprs.is_empty(), "no menu PlayPl reached → empty map");
+    }
+
+    #[test]
+    fn title_gprs_empty_when_no_menu_playlists_provided() {
+        let mobj_data = MobjBuilder::new().object(&[InsnSpec::PlayPl(800)]).build();
+
+        let mobj_file = super::super::parse::parse(&mobj_data).expect("should parse");
+        let menu_playlists = std::collections::HashSet::new();
+        let title_to_mobj = std::collections::HashMap::new();
+
+        let gprs = seed_title_gprs(&mobj_file, &menu_playlists, &title_to_mobj);
+
+        assert!(gprs.is_empty(), "empty menu_playlists → empty map");
+    }
+
+    #[test]
+    fn title_gprs_multi_hop_chain() {
+        // MOBJ[0] → JumpObject(1) → JumpObject(2) → PlayPl(menu).
+        // Three-MOBJ chain, each setting a different GPR.
+        let mobj_data = MobjBuilder::new()
+            .object(&[InsnSpec::SetGpr(10, 1), InsnSpec::JumpObject(1)])
+            .object(&[InsnSpec::SetGpr(11, 2), InsnSpec::JumpObject(2)])
+            .object(&[InsnSpec::SetGpr(12, 3), InsnSpec::PlayPl(800)])
+            .build();
+
+        let mobj_file = super::super::parse::parse(&mobj_data).expect("should parse");
+        let menu_playlists = std::collections::HashSet::from([800]);
+        let title_to_mobj = std::collections::HashMap::new();
+
+        let gprs = seed_title_gprs(&mobj_file, &menu_playlists, &title_to_mobj);
+
+        assert_eq!(gprs.get(&10).copied(), Some(1), "GPR[10] from MOBJ[0]");
+        assert_eq!(gprs.get(&11).copied(), Some(2), "GPR[11] from MOBJ[1]");
+        assert_eq!(gprs.get(&12).copied(), Some(3), "GPR[12] from MOBJ[2]");
     }
 }

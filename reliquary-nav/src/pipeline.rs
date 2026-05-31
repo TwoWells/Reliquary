@@ -236,7 +236,7 @@ pub fn load_clip(
 
     // Seed GPR state from MOBJ[0] (First Play). Button commands on
     // complex discs read from a GPR database initialized here.
-    let init_gprs = load_mobj_gprs(&reader);
+    let init_gprs = load_mobj_gprs(&reader, &analysis.menu_playlists);
 
     Ok(LoadedClip {
         clip_index,
@@ -249,10 +249,20 @@ pub fn load_clip(
     })
 }
 
-/// Loads `MovieObject.bdmv` and runs MOBJ\[0\] to seed the GPR database.
+/// Loads `MovieObject.bdmv`, seeds the GPR database from MOBJ\[0\], and
+/// executes the title MOBJ chain to capture per-page context registers.
+///
+/// Phase 1: [`mobj::seed_gpr_state`] runs MOBJ\[0\] to capture the global
+/// GPR database (e.g. GPR\[3000+\] on WB).
+///
+/// Phase 2: [`mobj::seed_title_gprs`] follows the MOBJ chain from MOBJ\[0\]
+/// through `JumpObject`/`JumpTitle` instructions to the title MOBJ that
+/// plays the menu playlist, capturing per-page context registers (e.g.
+/// GPR\[3\] on a Blu-ray series). Title MOBJ registers override MOBJ\[0\]
+/// where both set the same register.
 ///
 /// Returns an empty map if the file is missing or cannot be parsed.
-fn load_mobj_gprs(reader: &DiscReader) -> HashMap<u32, u32> {
+fn load_mobj_gprs(reader: &DiscReader, menu_playlists: &[u32]) -> HashMap<u32, u32> {
     let mobj_path = std::path::Path::new("BDMV/MovieObject.bdmv");
     let mobj_alt = std::path::Path::new("MovieObject.bdmv");
 
@@ -268,7 +278,73 @@ fn load_mobj_gprs(reader: &DiscReader) -> HashMap<u32, u32> {
         return HashMap::new();
     };
 
-    mobj::seed_gpr_state(&mobj_file)
+    // Phase 1: MOBJ[0] GPR database (global config registers)
+    let mut init_gprs = mobj::seed_gpr_state(&mobj_file);
+
+    // Phase 2: Title MOBJ context registers (per-page state)
+    if !menu_playlists.is_empty() {
+        let menu_set: std::collections::HashSet<u32> = menu_playlists.iter().copied().collect();
+        let title_to_mobj = load_title_to_mobj_map(reader);
+        let title_gprs = mobj::seed_title_gprs(&mobj_file, &menu_set, &title_to_mobj);
+        // Title MOBJ overrides MOBJ[0] where both set the same register
+        for (k, v) in title_gprs {
+            init_gprs.insert(k, v);
+        }
+    }
+
+    init_gprs
+}
+
+/// Reads `index.bdmv` and builds a title-number → MOBJ-index mapping.
+///
+/// Used by [`mobj::seed_title_gprs`] to resolve `JumpTitle` instructions.
+/// Title 0 = First Playback, title 0xFFFF = Top Menu, titles 1..N =
+/// regular titles (1-based, matching libbluray's `_jump_title` semantics).
+///
+/// Returns an empty map if the index file is missing or cannot be parsed.
+fn load_title_to_mobj_map(reader: &DiscReader) -> HashMap<u32, usize> {
+    use reliquary::disc::bdmv::index;
+
+    let index_path = std::path::Path::new("BDMV/index.bdmv");
+    let index_alt = std::path::Path::new("index.bdmv");
+
+    let index_data = reader
+        .read_file(index_path)
+        .or_else(|_| reader.read_file(index_alt));
+
+    let Ok(data) = index_data else {
+        return HashMap::new();
+    };
+
+    let Ok(disc_index) = index::parse(&data) else {
+        return HashMap::new();
+    };
+
+    let mut map = HashMap::new();
+
+    // Title 0 = First Playback
+    if let index::ObjectType::Hdmv { id_ref, .. } = &disc_index.first_play.object {
+        map.insert(0, usize::from(*id_ref));
+    }
+
+    // Title 0xFFFF = Top Menu
+    if let index::ObjectType::Hdmv { id_ref, .. } = &disc_index.top_menu.object {
+        map.insert(0xFFFF, usize::from(*id_ref));
+    }
+
+    // Regular titles (1-based)
+    for (i, title) in disc_index.titles.iter().enumerate() {
+        if let index::ObjectType::Hdmv { id_ref, .. } = &title.object {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "disc title count is small (u16 in index.bdmv)"
+            )]
+            let title_num = (i as u32) + 1;
+            map.insert(title_num, usize::from(*id_ref));
+        }
+    }
+
+    map
 }
 
 /// Attempts to extract a video background frame for the IG clip.
