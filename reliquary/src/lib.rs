@@ -18,4 +18,5 @@
 //!   tried and rejected
 
 pub mod disc;
+pub mod extract;
 pub mod matroska;
