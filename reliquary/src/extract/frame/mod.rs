@@ -9,6 +9,7 @@
 //! block writing.
 
 pub mod ac3;
+pub mod mpeg2;
 
 /// A framed access unit ready for the Matroska muxer.
 #[derive(Debug, Clone)]
