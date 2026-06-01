@@ -96,10 +96,10 @@ run:
 mutants:
 	@cargo mutants -p reliquary --timeout 60
 
-# Run tests. Pass T= to filter, N= to repeat.
+# Run tests. Pass T= to filter, N= to repeat, I=1 to include ignored.
 CLEAN_T = $(subst \,,$(subst !,,$(T)))
 test:
-	@cargo nextest run --workspace --status-level fail --final-status-level slow --cargo-quiet $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
+	@cargo nextest run --workspace --status-level fail --final-status-level slow --cargo-quiet $(if $(I),--run-ignored all,) $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
 
 # --- Release ---
 
