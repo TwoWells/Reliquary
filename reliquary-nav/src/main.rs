@@ -118,6 +118,11 @@ struct App {
     clip: LoadedClip,
     loaded: LoadedPage,
     state: Option<WindowState>,
+    /// Persistent GPR state across button clicks. Initialized from the
+    /// MOBJ seed and updated after each button command execution, so
+    /// registers set by one button (e.g. GPR[16] for page context) are
+    /// available to subsequent button commands on the target page.
+    gprs: std::collections::HashMap<u32, u32>,
 }
 
 struct WindowState {
@@ -129,11 +134,13 @@ struct WindowState {
 }
 
 impl App {
-    const fn new(clip: LoadedClip, loaded: LoadedPage) -> Self {
+    fn new(clip: LoadedClip, loaded: LoadedPage) -> Self {
+        let gprs = clip.init_gprs().clone();
         Self {
             clip,
             loaded,
             state: None,
+            gprs,
         }
     }
 
@@ -225,13 +232,20 @@ impl App {
             page_id: self.loaded.page.page_id,
             ..PlayerContext::default()
         };
-        let (effect, _gprs) = execute_button_commands(commands, &ctx, self.clip.init_gprs());
+        let (effect, new_gprs) = execute_button_commands(commands, &ctx, &self.gprs);
+        self.gprs = new_gprs;
 
         let ButtonEffect::SetButtonPage { page, .. } = effect else {
             return;
         };
 
+        // BD spec: page=0 means "stay on current page" (no navigation).
+        // Only navigate when page > 0.
         let page_id = page as u8;
+        if page_id == 0 {
+            return;
+        }
+
         let Some(page_index) = self.clip.page_index_for_id(page_id) else {
             return;
         };
