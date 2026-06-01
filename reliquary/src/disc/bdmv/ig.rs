@@ -96,6 +96,14 @@ pub struct InteractiveComposition {
 pub struct Page {
     /// Page identifier.
     pub page_id: u8,
+    /// Button selected by default when the page loads (0xFFFF = none).
+    pub default_selected_button_id: u16,
+    /// Button activated automatically when the page loads (0xFFFF = none).
+    ///
+    /// When set, the player activates this button immediately on page
+    /// entry without waiting for user input. Used for bootstrap pages
+    /// (e.g. WB page 0) that read GPR state and navigate elsewhere.
+    pub default_activated_button_id: u16,
     /// Buttons on this page.
     pub buttons: Vec<Button>,
 }
@@ -105,6 +113,12 @@ pub struct Page {
 pub struct Button {
     /// Button identifier.
     pub button_id: u16,
+    /// Whether this button auto-activates when selected.
+    ///
+    /// Auto-action buttons execute their commands immediately when the
+    /// button becomes selected (via page load or cursor navigation),
+    /// without waiting for the user to press Enter/OK.
+    pub auto_action: bool,
     /// Horizontal position in pixels.
     pub x: u16,
     /// Vertical position in pixels.
@@ -577,8 +591,8 @@ fn parse_page(r: &mut Cursor<'_>) -> Result<Page, IgError> {
     // animation_frame_rate_code (u8)
     r.skip(1)?;
 
-    // default_selected_button_id (u16) + default_activated_button_id (u16)
-    r.skip(4)?;
+    let default_selected_button_id = r.read_u16()?;
+    let default_activated_button_id = r.read_u16()?;
 
     // palette_id (u8)
     r.skip(1)?;
@@ -590,7 +604,12 @@ fn parse_page(r: &mut Cursor<'_>) -> Result<Page, IgError> {
         parse_bog(r, &mut buttons, bog_idx)?;
     }
 
-    Ok(Page { page_id, buttons })
+    Ok(Page {
+        page_id,
+        default_selected_button_id,
+        default_activated_button_id,
+        buttons,
+    })
 }
 
 /// Skips an effect sequence (windows + effects).
@@ -666,7 +685,8 @@ fn parse_button(r: &mut Cursor<'_>) -> Result<Button, IgError> {
     let button_id = r.read_u16()?;
     let _numeric_value = r.read_u16()?;
     // auto_action_flag (1 bit) + reserved (7 bits)
-    let _auto_action = r.read_u8()?;
+    let auto_action_byte = r.read_u8()?;
+    let auto_action = (auto_action_byte >> 7) & 1 == 1;
 
     let x = r.read_u16()?;
     let y = r.read_u16()?;
@@ -708,6 +728,7 @@ fn parse_button(r: &mut Cursor<'_>) -> Result<Button, IgError> {
 
     Ok(Button {
         button_id,
+        auto_action,
         x,
         y,
         upper_button_id,

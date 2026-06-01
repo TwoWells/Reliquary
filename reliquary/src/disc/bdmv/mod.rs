@@ -680,9 +680,13 @@ fn identify_ig_clips(clips: &[ClipInfo]) -> Vec<IgClip> {
 
 /// Finds playlist numbers that reference IG clips (menu playlists).
 ///
-/// A menu playlist is one whose play items reference a clip that contains
-/// IG streams. These playlists are played by MOBJs before suspending for
-/// button input (`PlayPl` suspend/resume lifecycle).
+/// A menu playlist is one whose play items or sub-path entries reference a
+/// clip that contains IG streams. These playlists are played by MOBJs before
+/// suspending for button input (`PlayPl` suspend/resume lifecycle).
+///
+/// Both play-item clip IDs (WB pattern) and sub-path clip IDs (AT pattern)
+/// are checked. On some discs, IG clips are referenced exclusively via
+/// sub-paths rather than play items.
 fn find_menu_playlists(playlists: &[Playlist], ig_clips: &[IgClip]) -> Vec<u32> {
     let ig_clip_ids: HashSet<&str> = ig_clips.iter().map(|c| c.clip_id.as_str()).collect();
 
@@ -692,6 +696,10 @@ fn find_menu_playlists(playlists: &[Playlist], ig_clips: &[IgClip]) -> Vec<u32> 
             pl.play_items
                 .iter()
                 .any(|item| ig_clip_ids.contains(item.clip_id.as_str()))
+                || pl
+                    .sub_path_clip_ids
+                    .iter()
+                    .any(|id| ig_clip_ids.contains(id.as_str()))
         })
         .map(|pl| pl.number)
         .collect();

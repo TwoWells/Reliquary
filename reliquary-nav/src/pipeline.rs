@@ -3,21 +3,87 @@
 
 //! Disc loading pipeline — reads IG data and builds compositable pages.
 //!
-//! Loads an entire IG clip once (all pages, bitmaps, palette), then builds
-//! [`LoadedPage`] views on demand for any page within the clip. This
-//! supports page navigation without re-reading the disc.
+//! Split into two layers:
+//! - [`DiscState`]: disc-level state (reader, analysis, MOBJ file) loaded
+//!   once and shared across clip switches.
+//! - [`LoadedClip`]: one IG clip's decoded data, rebuilt on cross-clip
+//!   navigation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use reliquary::disc::bdmv::compose::{ButtonComposition, PageComposition};
 use reliquary::disc::bdmv::ig::{self, NavigationCommand};
-use reliquary::disc::bdmv::mobj;
-use reliquary::disc::bdmv::{read_clip, rle, ts};
+use reliquary::disc::bdmv::mobj::{self, MovieObjectFile};
+use reliquary::disc::bdmv::{BdmvAnalysis, read_clip, rle, ts};
 use reliquary::disc::reader::DiscReader;
 use reliquary::disc::{self, InspectResult};
 
-pub use mobj::{ButtonEffect, PlayerContext, execute_button_commands};
+pub use mobj::{ButtonEffect, PlayTarget, PlayerContext, execute_button_commands, run_mobj_chain};
+
+// ── Disc-level state ─────────────────────────────────────────────────
+
+/// Disc-level state shared across clip switches.
+///
+/// Loaded once by [`load_disc`] and kept alive for the navigator's
+/// lifetime. Provides the reader, analysis, MOBJ infrastructure, and
+/// initial GPR state needed for dispatch and cross-clip navigation.
+pub struct DiscState {
+    /// Disc reader for loading clips on demand.
+    pub reader: DiscReader,
+    /// Full disc analysis (IG clips, menu playlists, video clip mapping).
+    pub analysis: BdmvAnalysis,
+    /// Parsed movie objects for VM execution.
+    pub mobj_file: MovieObjectFile,
+    /// Title number → MOBJ index mapping (from `index.bdmv`).
+    pub title_to_mobj: HashMap<u32, usize>,
+    /// Menu playlist numbers as a set (for fast lookup).
+    pub menu_playlists: HashSet<u32>,
+    /// Title MOBJ resume point for `SET_BUTTON_PAGE` dispatch.
+    ///
+    /// `(mobj_index, resume_pc)` — the instruction after the title
+    /// MOBJ's menu `PlayPl`, where execution resumes when IG terminates.
+    pub resume_point: Option<(usize, usize)>,
+    /// VUK for AACS-encrypted discs.
+    pub vuk: Option<[u8; 16]>,
+    /// Initial GPR state from MOBJ\[0\] + title MOBJ chain.
+    pub init_gprs: HashMap<u32, u32>,
+}
+
+/// Loads disc-level state: reader, analysis, MOBJ file, and GPR seed.
+///
+/// # Errors
+///
+/// Returns an error string if the disc cannot be read or is not a BDMV disc.
+pub fn load_disc(path: &Path, vuk: Option<[u8; 16]>) -> Result<DiscState, String> {
+    let reader = DiscReader::open(path).map_err(|e| format!("failed to open disc: {e}"))?;
+
+    let analysis = match disc::inspect(path).map_err(|e| format!("inspect failed: {e}"))? {
+        InspectResult::Bdmv(a) => a,
+        InspectResult::Dvd(_) => return Err("DVD discs do not have IG menus".into()),
+    };
+
+    let mobj_file = load_mobj_file(&reader);
+    let title_to_mobj = load_title_to_mobj_map(&reader);
+    let menu_playlists: HashSet<u32> = analysis.menu_playlists.iter().copied().collect();
+
+    let resume_point = mobj::find_title_resume_point(&mobj_file, &menu_playlists, &title_to_mobj);
+
+    let init_gprs = seed_gprs(&mobj_file, &menu_playlists, &title_to_mobj);
+
+    Ok(DiscState {
+        reader,
+        analysis,
+        mobj_file,
+        title_to_mobj,
+        menu_playlists,
+        resume_point,
+        vuk,
+        init_gprs,
+    })
+}
+
+// ── Clip-level state ─────────────────────────────────────────────────
 
 /// All decoded data for one IG clip — supports building any page on demand.
 pub struct LoadedClip {
@@ -33,12 +99,6 @@ pub struct LoadedClip {
     pages: Vec<ig::Page>,
     /// Video background RGBA buffer (if extracted), matching canvas dimensions.
     background: Option<Vec<u8>>,
-    /// Initial GPR state from MOBJ\[0\] (First Play) execution.
-    ///
-    /// WB and similar authoring stores per-content-item configuration in a
-    /// GPR database initialized by MOBJ\[0\]. Button commands read from
-    /// these registers to compute dispatch values and page targets.
-    init_gprs: HashMap<u32, u32>,
 }
 
 /// A decoded bitmap object, identified by its object ID.
@@ -54,6 +114,15 @@ pub struct LoadedPage {
     /// Navigation commands for each button, indexed by position in
     /// `page.buttons` (same order, same length).
     pub button_commands: Vec<Vec<NavigationCommand>>,
+    /// Whether each button has the auto-action flag set (parallel to
+    /// `button_commands`). Auto-action buttons activate immediately
+    /// when selected — used with `default_selected_button_id` to
+    /// implement bootstrap page routing.
+    pub auto_action: Vec<bool>,
+    /// Button selected by default when this page loads (0xFFFF = none).
+    pub default_selected_button_id: u16,
+    /// Button activated directly when this page loads (0xFFFF = none).
+    pub default_activated_button_id: u16,
 }
 
 impl LoadedPage {
@@ -74,13 +143,9 @@ impl LoadedClip {
         self.background.as_deref()
     }
 
-    /// Returns the initial GPR state from MOBJ\[0\] execution.
-    #[allow(
-        clippy::missing_const_for_fn,
-        reason = "HashMap::new is not const-stable"
-    )]
-    pub fn init_gprs(&self) -> &HashMap<u32, u32> {
-        &self.init_gprs
+    /// Returns the clip index within the disc's IG clip list.
+    pub const fn clip_index(&self) -> usize {
+        self.clip_index
     }
 
     /// Number of pages in this clip.
@@ -96,6 +161,7 @@ impl LoadedClip {
 
         let mut btn_comps = Vec::with_capacity(page.buttons.len());
         let mut button_commands = Vec::with_capacity(page.buttons.len());
+        let mut auto_action = Vec::with_capacity(page.buttons.len());
 
         for button in &page.buttons {
             let normal = self.find_bitmap(button.normal_object_id);
@@ -109,6 +175,7 @@ impl LoadedClip {
                 selected,
             });
             button_commands.push(button.commands.clone());
+            auto_action.push(button.auto_action);
         }
 
         let page_comp = PageComposition {
@@ -122,6 +189,9 @@ impl LoadedClip {
         Some(LoadedPage {
             page: page_comp,
             button_commands,
+            auto_action,
+            default_selected_button_id: page.default_selected_button_id,
+            default_activated_button_id: page.default_activated_button_id,
         })
     }
 
@@ -143,7 +213,7 @@ impl LoadedClip {
     }
 }
 
-/// Loads an entire IG clip from a disc.
+/// Loads an entire IG clip from the disc state.
 ///
 /// Parses all pages, decodes all button bitmaps, and optionally extracts
 /// a video background frame. The returned [`LoadedClip`] can produce
@@ -151,29 +221,18 @@ impl LoadedClip {
 ///
 /// # Errors
 ///
-/// Returns an error string if the disc cannot be read, the clip index
-/// is out of range, or IG parsing fails.
-pub fn load_clip(
-    path: &Path,
-    clip_index: usize,
-    vuk: Option<&[u8; 16]>,
-) -> Result<LoadedClip, String> {
-    let reader = DiscReader::open(path).map_err(|e| format!("failed to open disc: {e}"))?;
-
-    let analysis = match disc::inspect(path).map_err(|e| format!("inspect failed: {e}"))? {
-        InspectResult::Bdmv(a) => a,
-        InspectResult::Dvd(_) => return Err("DVD discs do not have IG menus".into()),
-    };
-
-    let ig_clip = analysis.ig_clips.get(clip_index).ok_or_else(|| {
+/// Returns an error string if the clip index is out of range or IG
+/// parsing fails.
+pub fn load_clip(disc: &DiscState, clip_index: usize) -> Result<LoadedClip, String> {
+    let ig_clip = disc.analysis.ig_clips.get(clip_index).ok_or_else(|| {
         format!(
             "clip index {clip_index} out of range (have {} clips)",
-            analysis.ig_clips.len()
+            disc.analysis.ig_clips.len()
         )
     })?;
 
     // Read and decrypt the IG clip
-    let data = read_clip(&reader, vuk, &ig_clip.clip_id)
+    let data = read_clip(&disc.reader, disc.vuk.as_ref(), &ig_clip.clip_id)
         .map_err(|e| format!("failed to read clip {}: {e}", ig_clip.clip_id))?;
 
     // Demux MPEG-TS to get PES packets
@@ -232,11 +291,14 @@ pub fn load_clip(
     }
 
     // Extract video background
-    let background = extract_background(&reader, &analysis, ig_clip, vuk, comp.width, comp.height);
-
-    // Seed GPR state from MOBJ[0] (First Play). Button commands on
-    // complex discs read from a GPR database initialized here.
-    let init_gprs = load_mobj_gprs(&reader, &analysis.menu_playlists);
+    let background = extract_background(
+        &disc.reader,
+        &disc.analysis,
+        ig_clip,
+        disc.vuk.as_ref(),
+        comp.width,
+        comp.height,
+    );
 
     Ok(LoadedClip {
         clip_index,
@@ -245,48 +307,21 @@ pub fn load_clip(
         bitmaps,
         pages: comp.pages,
         background,
-        init_gprs,
     })
 }
 
-/// Loads `MovieObject.bdmv`, seeds the GPR database from MOBJ\[0\], and
-/// executes the title MOBJ chain to capture per-page context registers.
-///
-/// Phase 1: [`mobj::seed_gpr_state`] runs MOBJ\[0\] to capture the global
-/// GPR database (e.g. GPR\[3000+\] on WB).
-///
-/// Phase 2: [`mobj::seed_title_gprs`] follows the MOBJ chain from MOBJ\[0\]
-/// through `JumpObject`/`JumpTitle` instructions to the title MOBJ that
-/// plays the menu playlist, capturing per-page context registers (e.g.
-/// GPR\[3\] on a Blu-ray series). Title MOBJ registers override MOBJ\[0\]
-/// where both set the same register.
-///
-/// Returns an empty map if the file is missing or cannot be parsed.
-fn load_mobj_gprs(reader: &DiscReader, menu_playlists: &[u32]) -> HashMap<u32, u32> {
-    let mobj_path = std::path::Path::new("BDMV/MovieObject.bdmv");
-    let mobj_alt = std::path::Path::new("MovieObject.bdmv");
+// ── Internal helpers ─────────────────────────────────────────────────
 
-    let mobj_data = reader
-        .read_file(mobj_path)
-        .or_else(|_| reader.read_file(mobj_alt));
+/// Seeds GPR state from MOBJ\[0\] + title MOBJ chain.
+fn seed_gprs(
+    mobj_file: &MovieObjectFile,
+    menu_playlists: &HashSet<u32>,
+    title_to_mobj: &HashMap<u32, usize>,
+) -> HashMap<u32, u32> {
+    let mut init_gprs = mobj::seed_gpr_state(mobj_file);
 
-    let Ok(data) = mobj_data else {
-        return HashMap::new();
-    };
-
-    let Ok(mobj_file) = mobj::parse(&data) else {
-        return HashMap::new();
-    };
-
-    // Phase 1: MOBJ[0] GPR database (global config registers)
-    let mut init_gprs = mobj::seed_gpr_state(&mobj_file);
-
-    // Phase 2: Title MOBJ context registers (per-page state)
     if !menu_playlists.is_empty() {
-        let menu_set: std::collections::HashSet<u32> = menu_playlists.iter().copied().collect();
-        let title_to_mobj = load_title_to_mobj_map(reader);
-        let title_gprs = mobj::seed_title_gprs(&mobj_file, &menu_set, &title_to_mobj);
-        // Title MOBJ overrides MOBJ[0] where both set the same register
+        let title_gprs = mobj::seed_title_gprs(mobj_file, menu_playlists, title_to_mobj);
         for (k, v) in title_gprs {
             init_gprs.insert(k, v);
         }
@@ -295,13 +330,26 @@ fn load_mobj_gprs(reader: &DiscReader, menu_playlists: &[u32]) -> HashMap<u32, u
     init_gprs
 }
 
+/// Parses `MovieObject.bdmv`. Returns an empty file if missing or invalid.
+fn load_mobj_file(reader: &DiscReader) -> MovieObjectFile {
+    let mobj_path = std::path::Path::new("BDMV/MovieObject.bdmv");
+    let mobj_alt = std::path::Path::new("MovieObject.bdmv");
+
+    let data = reader
+        .read_file(mobj_path)
+        .or_else(|_| reader.read_file(mobj_alt));
+
+    data.ok()
+        .and_then(|d| mobj::parse(&d).ok())
+        .unwrap_or(MovieObjectFile {
+            objects: Vec::new(),
+        })
+}
+
 /// Reads `index.bdmv` and builds a title-number → MOBJ-index mapping.
 ///
-/// Used by [`mobj::seed_title_gprs`] to resolve `JumpTitle` instructions.
 /// Title 0 = First Playback, title 0xFFFF = Top Menu, titles 1..N =
-/// regular titles (1-based, matching libbluray's `_jump_title` semantics).
-///
-/// Returns an empty map if the index file is missing or cannot be parsed.
+/// regular titles (1-based).
 fn load_title_to_mobj_map(reader: &DiscReader) -> HashMap<u32, usize> {
     use reliquary::disc::bdmv::index;
 
@@ -348,13 +396,9 @@ fn load_title_to_mobj_map(reader: &DiscReader) -> HashMap<u32, usize> {
 }
 
 /// Attempts to extract a video background frame for the IG clip.
-///
-/// Uses ffmpeg to decode the first frame from the video clip mapped
-/// to this IG clip. Returns `None` if ffmpeg is unavailable or
-/// extraction fails.
 fn extract_background(
     reader: &DiscReader,
-    analysis: &reliquary::disc::bdmv::BdmvAnalysis,
+    analysis: &BdmvAnalysis,
     ig_clip: &reliquary::disc::bdmv::IgClip,
     vuk: Option<&[u8; 16]>,
     width: u16,
@@ -377,14 +421,9 @@ fn extract_background(
 }
 
 /// Extracts the first video frame from an m2ts clip as RGBA pixel data.
-///
-/// Uses `ffmpeg` to decode one video frame, scaled to the given dimensions.
-/// Returns `None` if `ffmpeg` is not available or frame extraction fails.
 fn extract_video_frame(clip_data: &[u8], width: u16, height: u16) -> Option<Vec<u8>> {
     use std::io::Write;
 
-    // Use ~/tmp if it exists (avoids tmpfs/ramdisk pressure for large clips),
-    // otherwise fall back to the system temp directory.
     let temp_dir = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .map(|h| h.join("tmp"))

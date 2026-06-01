@@ -19,8 +19,8 @@ pub use resolve::{
     resolve_via_execution,
 };
 pub use vm::{
-    ButtonEffect, execute_button_commands, is_nop_anchor, run_mobj_vm, seed_gpr_state,
-    seed_title_gprs,
+    ButtonEffect, execute_button_commands, find_title_resume_point, is_nop_anchor, run_mobj_chain,
+    run_mobj_vm, seed_gpr_state, seed_title_gprs,
 };
 
 use thiserror::Error;
@@ -270,7 +270,7 @@ pub(crate) const VM_STEP_LIMIT: u32 = 10_000;
 
 /// PSR (Player Status Register) bit flag. Register references with
 /// bit 31 set address PSRs rather than GPRs.
-pub(crate) const PSR_FLAG: u32 = 0x8000_0000;
+pub const PSR_FLAG: u32 = 0x8000_0000;
 
 // ── Test helpers ────────────────────────────────────────────────────────
 
@@ -281,6 +281,7 @@ pub(crate) mod test_helpers {
     pub fn make_button(button_id: u16, commands: Vec<NavigationCommand>) -> Button {
         Button {
             button_id,
+            auto_action: false,
             x: 0,
             y: 0,
             upper_button_id: 0,
@@ -302,6 +303,7 @@ pub(crate) mod test_helpers {
     ) -> Button {
         Button {
             button_id,
+            auto_action: false,
             x,
             y,
             upper_button_id: 0,
@@ -325,6 +327,7 @@ pub(crate) mod test_helpers {
     ) -> Button {
         Button {
             button_id,
+            auto_action: false,
             x,
             y,
             upper_button_id: neighbors[0],
@@ -339,7 +342,12 @@ pub(crate) mod test_helpers {
     }
 
     pub fn make_page(page_id: u8, buttons: Vec<Button>) -> Page {
-        Page { page_id, buttons }
+        Page {
+            page_id,
+            default_selected_button_id: 0xFFFF,
+            default_activated_button_id: 0xFFFF,
+            buttons,
+        }
     }
 
     /// Extracts button IDs from a breadcrumb for concise assertions.

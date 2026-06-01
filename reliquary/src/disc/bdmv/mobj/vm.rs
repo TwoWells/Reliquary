@@ -616,8 +616,25 @@ fn resolve_sbp_operand(value: u32, gprs: &std::collections::HashMap<u32, u32>) -
 /// Handles both general SET (`sub_group=0`) and SETSYSTEM (`sub_group=1`).
 /// SETSYSTEM reads/writes PSRs, which are stored in the same register
 /// map with the [`PSR_FLAG`] bit set.
+///
+/// For SETSYSTEM `SET_BUTTON_PAGE` (`set_opt=3`), the semantics differ
+/// from the general SET ADD operation: the destination operand provides
+/// the button composite (written to PSR\[10\]) and the source operand
+/// provides the page (written to PSR\[11\]). This is how MOBJ dispatch
+/// handlers set the target page before re-entering the menu via `PlayPl`.
 pub fn execute_set(insn: &Instruction, gprs: &mut std::collections::HashMap<u32, u32>) {
     if insn.sub_group > 1 {
+        return;
+    }
+
+    // SETSYSTEM SET_BUTTON_PAGE: set PSR[10] (button) and PSR[11] (page).
+    // This must be handled before the general SET path because set_opt=3
+    // means ADD in general SET context but SET_BUTTON_PAGE in SETSYSTEM.
+    if insn.sub_group == 1 && insn.set_opt == SET_BUTTON_PAGE_OPT {
+        let button = resolve_sbp_operand(fetch_operand(insn.imm_op1, insn.dst, gprs), gprs);
+        let page = resolve_sbp_operand(fetch_operand(insn.imm_op2, insn.src, gprs), gprs);
+        gprs.insert(PSR_FLAG | 0x0A, button); // PSR[10]
+        gprs.insert(PSR_FLAG | 0x0B, page); // PSR[11]
         return;
     }
 
@@ -698,6 +715,260 @@ pub fn execute_goto(
         }
         _ => false, // NOP (0x00) and unknown — no branch
     }
+}
+
+// ── MOBJ chain execution ─────────────────────────────────────────────
+
+/// Finds the title MOBJ resume point for MOBJ-mediated dispatch.
+///
+/// Walks the MOBJ chain from MOBJ\[0\] (with top-menu fallback, matching
+/// [`seed_title_gprs`]) to find the title MOBJ that issues `PlayPl` for
+/// a menu playlist. Returns `(mobj_index, resume_pc)` where `resume_pc`
+/// is the instruction after the menu `PlayPl` — the point where the
+/// title MOBJ resumes when IG terminates with `SET_BUTTON_PAGE`.
+///
+/// Returns `None` if no MOBJ in the chain plays a menu playlist.
+#[must_use]
+#[allow(
+    clippy::implicit_hasher,
+    reason = "called from navigator pipeline with std HashMap/HashSet"
+)]
+pub fn find_title_resume_point(
+    mobj_file: &MovieObjectFile,
+    menu_playlists: &std::collections::HashSet<u32>,
+    title_to_mobj: &std::collections::HashMap<u32, usize>,
+) -> Option<(usize, usize)> {
+    /// Maximum cross-MOBJ jumps before giving up (prevents cycles).
+    const MAX_JUMPS: u32 = 10;
+
+    if menu_playlists.is_empty() || mobj_file.objects.is_empty() {
+        return None;
+    }
+
+    // Same PSR seed as seed_title_gprs — needed for conditional branches.
+    let mut gprs = std::collections::HashMap::new();
+    gprs.insert(PSR_FLAG | 0x01, 0xFF);
+    gprs.insert(PSR_FLAG | 0x02, 0xFFFE);
+    gprs.insert(PSR_FLAG | 0x03, 0xFF);
+    gprs.insert(PSR_FLAG | 0x04, 0xFFFF);
+    gprs.insert(PSR_FLAG | 0x0A, 0xFFFF);
+    gprs.insert(PSR_FLAG | 0x0C, 0xFF);
+    gprs.insert(PSR_FLAG | 0x0D, 0xFF);
+    gprs.insert(PSR_FLAG | 0x0E, 0xFFFF);
+    gprs.insert(PSR_FLAG | 0x0F, 0x0002_0000);
+    gprs.insert(PSR_FLAG | 0x1D, 0x0200);
+    gprs.insert(PSR_FLAG | 0x1F, 0x0200);
+
+    let mut start_indices = vec![0_usize];
+    if let Some(&top_menu_idx) = title_to_mobj.get(&0xFFFF)
+        && top_menu_idx != 0
+        && top_menu_idx < mobj_file.objects.len()
+    {
+        start_indices.push(top_menu_idx);
+    }
+
+    for &start_idx in &start_indices {
+        let mut current_mobj_idx = start_idx;
+        let mut pc: usize = 0;
+        let mut steps: u32 = 0;
+        let mut jump_count: u32 = 0;
+
+        while let Some(current_mobj) = mobj_file.objects.get(current_mobj_idx) {
+            let instrs = &current_mobj.instructions;
+            let mut jumped = false;
+
+            while pc < instrs.len() && steps < VM_STEP_LIMIT {
+                steps += 1;
+                let insn = &instrs[pc];
+
+                match insn.group {
+                    GRP_SET => {
+                        execute_set(insn, &mut gprs);
+                        pc += 1;
+                    }
+                    GRP_CMP => {
+                        if execute_cmp(insn, &gprs) {
+                            pc += 1;
+                        } else {
+                            pc += 2;
+                        }
+                    }
+                    GRP_BRANCH => match insn.sub_group {
+                        BRANCH_PLAY => {
+                            let playlist = fetch_operand(insn.imm_op1, insn.dst, &gprs);
+                            if menu_playlists.contains(&playlist) {
+                                return Some((current_mobj_idx, pc + 1));
+                            }
+                            pc += 1;
+                        }
+                        BRANCH_JUMP => {
+                            if jump_count >= MAX_JUMPS {
+                                pc += 1;
+                                continue;
+                            }
+                            let target = fetch_operand(insn.imm_op1, insn.dst, &gprs);
+                            let target_mobj = match insn.branch_opt {
+                                0 | 2 => Some(target as usize)
+                                    .filter(|&idx| idx < mobj_file.objects.len()),
+                                1 | 3 => title_to_mobj.get(&target).copied(),
+                                _ => None,
+                            };
+                            if let Some(mobj_idx) = target_mobj {
+                                jump_count += 1;
+                                current_mobj_idx = mobj_idx;
+                                pc = 0;
+                                jumped = true;
+                                break;
+                            }
+                            pc += 1;
+                        }
+                        BRANCH_GOTO => {
+                            if !execute_goto(insn, &gprs, &mut pc) {
+                                pc += 1;
+                            }
+                        }
+                        _ => {
+                            pc += 1;
+                        }
+                    },
+                    _ => {
+                        pc += 1;
+                    }
+                }
+            }
+
+            if !jumped {
+                break;
+            }
+        }
+    }
+
+    None
+}
+
+/// Executes an MOBJ chain starting at `(start_mobj, start_pc)`, following
+/// `JumpObject`/`JumpTitle` across MOBJs until a valid `PlayPl` is reached.
+///
+/// Used by the navigator to:
+/// 1. Resume the title MOBJ after `SET_BUTTON_PAGE` dispatch
+/// 2. Follow `GotoMobj` button commands through MOBJ chains
+///
+/// When `valid_playlists` is non-empty, only `PlayPl` instructions whose
+/// playlist number is in the set are treated as terminal. Other `PlayPl`
+/// instructions are skipped (simulating the player finishing that playlist
+/// and resuming the MOBJ). This handles WB dispatch where intermediate
+/// playlists (transitions, stubs) precede the actual menu `PlayPl`.
+///
+/// When `valid_playlists` is empty, any non-zero `PlayPl` is terminal.
+///
+/// The GPR state is mutated in place so the caller has the final register
+/// values after execution (needed for auto-action button evaluation on
+/// the target page).
+///
+/// Returns `None` if no valid `PlayPl` is reached within the step/jump limits.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "called from navigator pipeline with std HashMap"
+)]
+pub fn run_mobj_chain(
+    mobj_file: &MovieObjectFile,
+    start_mobj: usize,
+    start_pc: usize,
+    gprs: &mut std::collections::HashMap<u32, u32>,
+    title_to_mobj: &std::collections::HashMap<u32, usize>,
+    valid_playlists: &std::collections::HashSet<u32>,
+) -> Option<PlayTarget> {
+    /// Maximum cross-MOBJ jumps before giving up (prevents cycles).
+    const MAX_JUMPS: u32 = 10;
+
+    let mut current_mobj_idx = start_mobj;
+    let mut pc = start_pc;
+    let mut steps: u32 = 0;
+    let mut jump_count: u32 = 0;
+
+    while let Some(current_mobj) = mobj_file.objects.get(current_mobj_idx) {
+        let instrs = &current_mobj.instructions;
+        let mut jumped = false;
+
+        while pc < instrs.len() && steps < VM_STEP_LIMIT {
+            steps += 1;
+            let insn = &instrs[pc];
+
+            match insn.group {
+                GRP_SET => {
+                    execute_set(insn, gprs);
+                    pc += 1;
+                }
+                GRP_CMP => {
+                    if execute_cmp(insn, gprs) {
+                        pc += 1;
+                    } else {
+                        pc += 2;
+                    }
+                }
+                GRP_BRANCH => match insn.sub_group {
+                    BRANCH_PLAY => {
+                        let playlist = fetch_operand(insn.imm_op1, insn.dst, gprs);
+                        let is_valid = playlist != 0
+                            && playlist != 0xFFFF
+                            && (valid_playlists.is_empty() || valid_playlists.contains(&playlist));
+                        if is_valid {
+                            let mark_or_pi = fetch_operand(insn.imm_op2, insn.src, gprs);
+                            #[allow(
+                                clippy::cast_possible_truncation,
+                                reason = "playlist numbers are u16 values"
+                            )]
+                            return Some(PlayTarget {
+                                playlist: (playlist & 0xFFFF) as u16,
+                                branch_opt: insn.branch_opt,
+                                mark_or_pi,
+                            });
+                        }
+                        pc += 1;
+                    }
+                    BRANCH_JUMP => {
+                        if jump_count >= MAX_JUMPS {
+                            pc += 1;
+                            continue;
+                        }
+                        let target = fetch_operand(insn.imm_op1, insn.dst, gprs);
+                        let target_mobj = match insn.branch_opt {
+                            0 | 2 => {
+                                Some(target as usize).filter(|&idx| idx < mobj_file.objects.len())
+                            }
+                            1 | 3 => title_to_mobj.get(&target).copied(),
+                            _ => None,
+                        };
+                        if let Some(mobj_idx) = target_mobj {
+                            jump_count += 1;
+                            current_mobj_idx = mobj_idx;
+                            pc = 0;
+                            jumped = true;
+                            break;
+                        }
+                        pc += 1;
+                    }
+                    BRANCH_GOTO => {
+                        if !execute_goto(insn, gprs, &mut pc) {
+                            pc += 1;
+                        }
+                    }
+                    _ => {
+                        pc += 1;
+                    }
+                },
+                _ => {
+                    pc += 1;
+                }
+            }
+        }
+
+        if !jumped {
+            break;
+        }
+    }
+
+    None
 }
 
 // ── Lifecycle simulation ──────────────────────────────────────────────

@@ -5,11 +5,12 @@
 //!
 //! Opens a window rendering a Blu-ray IG menu page at full resolution.
 //! Mouse hover highlights buttons by swapping their bitmap state (normal ↔
-//! selected). Clicking a button with a `SetButtonPage` command navigates
-//! to the target page within the same clip.
+//! selected). Clicking a button executes its HDMV commands and navigates
+//! via direct page change, MOBJ dispatch, or `GotoMobj` chain following.
 
 mod pipeline;
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,9 +24,11 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
 use reliquary::disc::bdmv::compose::composite_page;
+use reliquary::disc::bdmv::mobj::PSR_FLAG;
 
 use crate::pipeline::{
-    ButtonEffect, LoadedClip, LoadedPage, PlayerContext, execute_button_commands,
+    ButtonEffect, DiscState, LoadedClip, LoadedPage, PlayTarget, PlayerContext,
+    execute_button_commands, load_clip, load_disc, run_mobj_chain,
 };
 
 /// Interactive disc menu navigator — visual validation of IG compositing.
@@ -64,7 +67,15 @@ fn main() -> ExitCode {
         None => None,
     };
 
-    let clip = match pipeline::load_clip(&cli.path, cli.clip, vuk.as_ref()) {
+    let disc = match load_disc(&cli.path, vuk) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let clip = match load_clip(&disc, cli.clip) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
@@ -89,7 +100,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut app = App::new(clip, loaded);
+    let mut app = App::new(disc, clip, loaded);
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("error: event loop failed: {e}");
         return ExitCode::FAILURE;
@@ -115,14 +126,21 @@ fn parse_vuk(s: &str) -> Result<[u8; 16], String> {
 // ── Application state ──────────────────────────────────────────────────
 
 struct App {
+    disc: DiscState,
     clip: LoadedClip,
     loaded: LoadedPage,
     state: Option<WindowState>,
-    /// Persistent GPR state across button clicks. Initialized from the
-    /// MOBJ seed and updated after each button command execution, so
-    /// registers set by one button (e.g. GPR[16] for page context) are
-    /// available to subsequent button commands on the target page.
-    gprs: std::collections::HashMap<u32, u32>,
+    /// Persistent GPR state across button clicks and MOBJ dispatch.
+    gprs: HashMap<u32, u32>,
+    /// Navigation history for back button (right-click / Escape).
+    history: Vec<HistoryEntry>,
+}
+
+/// Saved state for back navigation.
+struct HistoryEntry {
+    clip_index: usize,
+    page_id: u8,
+    gprs: HashMap<u32, u32>,
 }
 
 struct WindowState {
@@ -134,13 +152,15 @@ struct WindowState {
 }
 
 impl App {
-    fn new(clip: LoadedClip, loaded: LoadedPage) -> Self {
-        let gprs = clip.init_gprs().clone();
+    fn new(disc: DiscState, clip: LoadedClip, loaded: LoadedPage) -> Self {
+        let gprs = disc.init_gprs.clone();
         Self {
+            disc,
             clip,
             loaded,
             state: None,
             gprs,
+            history: Vec::new(),
         }
     }
 
@@ -216,13 +236,15 @@ impl App {
         None
     }
 
-    /// Executes a button's commands through the HDMV mini-VM and navigates
-    /// to the target page if the result is `SetButtonPage`.
+    // ── Click handling ───────────────────────────────────────────────
+
+    /// Handles a button click — executes commands, dispatches to the
+    /// appropriate navigation path based on the terminal effect.
     #[allow(
         clippy::cast_possible_truncation,
         reason = "page IDs are u8 values stored in u32 SetButtonPage fields"
     )]
-    fn navigate_to_page(&mut self, button_id: u16) {
+    fn handle_click(&mut self, button_id: u16) {
         let Some(commands) = self.loaded.commands_for_button(button_id) else {
             return;
         };
@@ -235,21 +257,180 @@ impl App {
         let (effect, new_gprs) = execute_button_commands(commands, &ctx, &self.gprs);
         self.gprs = new_gprs;
 
-        let ButtonEffect::SetButtonPage { page, .. } = effect else {
-            return;
+        match effect {
+            ButtonEffect::SetButtonPage { composite, page } => {
+                self.handle_set_button_page(composite, page);
+            }
+            ButtonEffect::GotoMobj(object_id) => {
+                self.handle_goto_mobj(object_id);
+            }
+            ButtonEffect::Playlist {
+                playlist,
+                branch_opt,
+                mark_or_pi,
+            } => {
+                self.handle_playlist(PlayTarget {
+                    playlist,
+                    branch_opt,
+                    mark_or_pi,
+                });
+            }
+            ButtonEffect::None => {}
+        }
+    }
+
+    /// Handles `SET_BUTTON_PAGE` — composite button selection, direct
+    /// page navigation, or MOBJ dispatch fallback.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "page IDs and button IDs are u8/u16 values in u32 fields"
+    )]
+    fn handle_set_button_page(&mut self, composite: u32, page: u32) {
+        let composite_button_id = if composite > 0 {
+            Some((composite & 0xFFFF) as u16)
+        } else {
+            None
         };
 
-        // BD spec: page=0 means "stay on current page" (no navigation).
-        // Only navigate when page > 0.
-        let page_id = page as u8;
-        if page_id == 0 {
+        // Direct page navigation: if the target page exists, navigate
+        // there with optional button selection from composite.
+        // Page doesn't exist → fall through to button selection.
+        // WB uses invalid page IDs (e.g. 120) as a signal that the
+        // composite selects a button on the CURRENT page.
+        let page_id = (page & 0xFF) as u8;
+        if page_id > 0
+            && let Some(page_index) = self.clip.page_index_for_id(page_id)
+        {
+            self.push_history();
+            self.navigate_to_page_index(page_index, composite_button_id);
             return;
         }
 
-        let Some(page_index) = self.clip.page_index_for_id(page_id) else {
+        // Button selection: composite > 0 selects a button on the
+        // current page. If that button has auto_action, activate it
+        // immediately (this is how WB navigates to submenu pages).
+        if let Some(btn_id) = composite_button_id
+            && let Some(idx) = self
+                .loaded
+                .page
+                .buttons
+                .iter()
+                .position(|b| b.button_id == btn_id)
+        {
+            if let Some(state) = &mut self.state {
+                state.highlight = Some(btn_id);
+                state.window.request_redraw();
+            }
+            // If this button has auto_action, activate it.
+            if self.loaded.auto_action.get(idx).copied().unwrap_or(false) {
+                self.handle_click(btn_id);
+            }
             return;
-        };
+        }
 
+        // MOBJ dispatch fallback: resume the title MOBJ with updated
+        // PSR[10]/PSR[11]. If the handler calls SET_BUTTON_PAGE before
+        // a menu PlayPl, PSR[11] will contain the target page.
+        if let Some((mobj_idx, resume_pc)) = self.disc.resume_point {
+            self.gprs.insert(PSR_FLAG | 0x0A, composite); // PSR[10]
+            self.gprs.insert(PSR_FLAG | 0x0B, page); // PSR[11]
+
+            let target = run_mobj_chain(
+                &self.disc.mobj_file,
+                mobj_idx,
+                resume_pc,
+                &mut self.gprs,
+                &self.disc.title_to_mobj,
+                &self.disc.menu_playlists,
+            );
+
+            if target.is_some() {
+                let psr11 = self.gprs.get(&(PSR_FLAG | 0x0B)).copied().unwrap_or(0);
+                let target_page = (psr11 & 0xFF) as u8;
+                self.push_history();
+                if target_page > 0
+                    && let Some(page_index) = self.clip.page_index_for_id(target_page)
+                {
+                    self.navigate_to_page_index(page_index, None);
+                } else {
+                    self.navigate_to_page_index(0, None);
+                }
+            }
+        }
+    }
+
+    /// Handles `GotoMobj` — executes the target MOBJ chain to reach a
+    /// `PlayPl` and acts on the result.
+    fn handle_goto_mobj(&mut self, object_id: u32) {
+        // Empty valid set = any non-zero PlayPl is terminal.
+        let any_playlist = std::collections::HashSet::new();
+        let target = run_mobj_chain(
+            &self.disc.mobj_file,
+            object_id as usize,
+            0,
+            &mut self.gprs,
+            &self.disc.title_to_mobj,
+            &any_playlist,
+        );
+
+        if let Some(play_target) = target {
+            self.handle_play_target(play_target);
+        }
+    }
+
+    /// Handles a `PlayTarget` from MOBJ dispatch or `GotoMobj`.
+    ///
+    /// If the playlist is a menu playlist, navigates to that menu's page 0
+    /// and runs auto-action. Otherwise, logs the content playlist.
+    #[allow(
+        clippy::print_stderr,
+        reason = "binary crate uses stderr for status messages"
+    )]
+    fn handle_play_target(&mut self, target: PlayTarget) {
+        if self
+            .disc
+            .menu_playlists
+            .contains(&u32::from(target.playlist))
+        {
+            // Menu playlist — navigate within menus.
+            // Go to page 0 and let auto-action route to the correct page.
+            self.push_history();
+            self.navigate_to_page_index(0, None);
+        } else {
+            // Content playlist — log it.
+            eprintln!(
+                "content: playlist {} (branch_opt={}, mark_or_pi={})",
+                target.playlist, target.branch_opt, target.mark_or_pi
+            );
+        }
+    }
+
+    /// Handles a direct `Playlist` button effect.
+    #[allow(
+        clippy::unused_self,
+        reason = "method signature kept consistent with other handle_* methods"
+    )]
+    #[allow(
+        clippy::print_stderr,
+        reason = "binary crate uses stderr for status messages"
+    )]
+    fn handle_playlist(&self, target: PlayTarget) {
+        // Content playback — log the playlist info. Future: capture
+        // for content labeling (M3 milestone).
+        eprintln!(
+            "content: playlist {} (branch_opt={}, mark_or_pi={})",
+            target.playlist, target.branch_opt, target.mark_or_pi
+        );
+    }
+
+    // ── Navigation helpers ───────────────────────────────────────────
+
+    /// Navigates to a page by index, optionally selecting a specific button.
+    ///
+    /// After loading the page, checks for auto-action buttons and executes
+    /// them — this handles the WB page-0 bootstrap pattern where an
+    /// auto-action button reads GPR state and navigates to the real page.
+    fn navigate_to_page_index(&mut self, page_index: usize, initial_highlight: Option<u16>) {
         let Some(new_loaded) = self.clip.build_page(page_index) else {
             return;
         };
@@ -257,8 +438,140 @@ impl App {
         self.loaded = new_loaded;
 
         if let Some(state) = &mut self.state {
-            state.highlight = None;
+            state.highlight = initial_highlight;
             state.window.request_redraw();
+        }
+
+        // Auto-action: if this page has a default_activated_button_id,
+        // execute that button's commands immediately.
+        self.run_auto_action(0);
+    }
+
+    /// Executes auto-action buttons on the current page.
+    ///
+    /// Two BD spec paths for auto-activation:
+    /// 1. `default_activated_button_id` — page directly activates a button.
+    /// 2. `default_selected_button_id` + per-button `auto_action` flag —
+    ///    page selects a button, and that button's `auto_action` flag
+    ///    causes it to activate immediately when selected.
+    ///
+    /// Both paths are used for bootstrap pages (e.g. WB page 0) that
+    /// read GPR state and navigate to the correct submenu page.
+    ///
+    /// `depth` limits recursion — auto-action on the target page may
+    /// chain to another auto-action, but we cap at 4 hops.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "page IDs are u8 values stored in u32 SetButtonPage fields"
+    )]
+    fn run_auto_action(&mut self, depth: u8) {
+        if depth >= 4 {
+            return;
+        }
+        // Path 1: page-level direct activation
+        let mut activated_id = self.loaded.default_activated_button_id;
+
+        // Path 2: default-selected button with auto_action flag
+        if activated_id == 0xFFFF {
+            let selected_id = self.loaded.default_selected_button_id;
+            if selected_id != 0xFFFF
+                && let Some(idx) = self
+                    .loaded
+                    .page
+                    .buttons
+                    .iter()
+                    .position(|b| b.button_id == selected_id)
+                && self.loaded.auto_action.get(idx).copied().unwrap_or(false)
+            {
+                activated_id = selected_id;
+            }
+        }
+
+        if activated_id == 0xFFFF {
+            return;
+        }
+
+        let Some(commands) = self.loaded.commands_for_button(activated_id) else {
+            return;
+        };
+
+        let ctx = PlayerContext {
+            selected_button_id: activated_id,
+            page_id: self.loaded.page.page_id,
+            ..PlayerContext::default()
+        };
+        // Clone commands before executing to avoid borrow conflict.
+        let commands_owned: Vec<_> = commands.to_vec();
+        let (effect, new_gprs) = execute_button_commands(&commands_owned, &ctx, &self.gprs);
+        self.gprs = new_gprs;
+
+        // Auto-action typically produces SetButtonPage to the real page.
+        if let ButtonEffect::SetButtonPage { page, composite } = effect {
+            let page_id = (page & 0xFF) as u8;
+            if page_id > 0
+                && let Some(page_index) = self.clip.page_index_for_id(page_id)
+            {
+                let highlight = if composite > 0 {
+                    Some((composite & 0xFFFF) as u16)
+                } else {
+                    None
+                };
+                let Some(new_loaded) = self.clip.build_page(page_index) else {
+                    return;
+                };
+                self.loaded = new_loaded;
+                if let Some(state) = &mut self.state {
+                    state.highlight = highlight;
+                    state.window.request_redraw();
+                }
+                // Recursive auto-action on the target page
+                self.run_auto_action(depth + 1);
+            }
+        }
+    }
+
+    /// Pushes the current state onto the history stack.
+    fn push_history(&mut self) {
+        self.history.push(HistoryEntry {
+            clip_index: self.clip.clip_index(),
+            page_id: self.loaded.page.page_id,
+            gprs: self.gprs.clone(),
+        });
+    }
+
+    /// Pops the history stack and navigates back.
+    fn navigate_back(&mut self) {
+        let Some(entry) = self.history.pop() else {
+            return;
+        };
+
+        self.gprs = entry.gprs;
+
+        // Same clip — just switch pages.
+        if entry.clip_index == self.clip.clip_index() {
+            if let Some(page_index) = self.clip.page_index_for_id(entry.page_id)
+                && let Some(new_loaded) = self.clip.build_page(page_index)
+            {
+                self.loaded = new_loaded;
+                if let Some(state) = &mut self.state {
+                    state.highlight = None;
+                    state.window.request_redraw();
+                }
+            }
+            return;
+        }
+
+        // Different clip — reload.
+        if let Ok(new_clip) = load_clip(&self.disc, entry.clip_index)
+            && let Some(page_index) = new_clip.page_index_for_id(entry.page_id)
+            && let Some(new_loaded) = new_clip.build_page(page_index)
+        {
+            self.clip = new_clip;
+            self.loaded = new_loaded;
+            if let Some(state) = &mut self.state {
+                state.highlight = None;
+                state.window.request_redraw();
+            }
         }
     }
 }
@@ -314,6 +627,40 @@ impl ApplicationHandler for App {
             highlight: None,
         });
 
+        // Run auto-action on the initial page. On WB, page 0 is a
+        // bootstrap stub whose auto-action button reads GPR state and
+        // navigates to the main menu page.
+        let page_before = self.loaded.page.page_id;
+        self.run_auto_action(0);
+
+        // Bootstrap fallback: if auto-action didn't navigate away from
+        // page 0 (GPR lifecycle state not yet populated), skip to the
+        // first page with visible buttons. This handles the WB pattern
+        // where page 0 needs GPR[3807] from MOBJ dispatch feedback.
+        if self.loaded.page.page_id == page_before && self.clip.page_count() > 1 {
+            let has_visible_buttons = self
+                .loaded
+                .page
+                .buttons
+                .iter()
+                .any(|b| b.normal.is_some() || b.selected.is_some());
+            if !has_visible_buttons {
+                for idx in 1..self.clip.page_count() {
+                    if let Some(candidate) = self.clip.build_page(idx) {
+                        let visible = candidate
+                            .page
+                            .buttons
+                            .iter()
+                            .any(|b| b.normal.is_some() || b.selected.is_some());
+                        if visible {
+                            self.loaded = candidate;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         self.render();
     }
 
@@ -342,8 +689,25 @@ impl ApplicationHandler for App {
                 if let Some(ws) = &self.state
                     && let Some(button_id) = ws.highlight
                 {
-                    self.navigate_to_page(button_id);
+                    self.handle_click(button_id);
                 }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            }
+            | WindowEvent::KeyboardInput {
+                event:
+                    winit::event::KeyEvent {
+                        physical_key:
+                            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                self.navigate_back();
             }
             WindowEvent::RedrawRequested => {
                 self.render();

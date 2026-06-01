@@ -462,6 +462,7 @@ fn extract_buttons(
                             ig_buttons.push((
                                 ig::Button {
                                     button_id: button.button_id,
+                                    auto_action: button.auto_action,
                                     x: button.x,
                                     y: button.y,
                                     upper_button_id: button.upper_button_id,
