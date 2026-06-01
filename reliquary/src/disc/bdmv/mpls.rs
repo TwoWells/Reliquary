@@ -117,6 +117,8 @@ pub struct StnTable {
 /// A video stream entry from the STN table.
 #[derive(Debug, Clone)]
 pub struct VideoStream {
+    /// MPEG-TS PID for this stream.
+    pub pid: u16,
     /// Codec type (e.g. 0x1b = H.264, 0x24 = HEVC).
     pub coding_type: u8,
     /// Video format (resolution indicator).
@@ -128,6 +130,8 @@ pub struct VideoStream {
 /// An audio stream entry from the STN table.
 #[derive(Debug, Clone)]
 pub struct AudioStream {
+    /// MPEG-TS PID for this stream.
+    pub pid: u16,
     /// Codec type (e.g. 0x81 = AC-3, 0x86 = DTS-HD MA).
     pub coding_type: u8,
     /// Audio format (channel layout indicator).
@@ -141,6 +145,8 @@ pub struct AudioStream {
 /// A PGS subtitle stream entry from the STN table.
 #[derive(Debug, Clone)]
 pub struct SubtitleStream {
+    /// MPEG-TS PID for this stream.
+    pub pid: u16,
     /// Codec type (0x90 = PGS, 0x92 = text subtitle).
     pub coding_type: u8,
     /// Three-letter ISO 639-2 language code.
@@ -529,7 +535,7 @@ fn parse_video_stream(r: &mut Cursor<'_>) -> Result<VideoStream, MplsError> {
     // stream_type
     let _stream_type = r.read_u8()?;
     // PID (for stream_type=1, which is the common case)
-    let _pid = r.read_u16()?;
+    let pid = r.read_u16()?;
     // Skip remaining entry bytes
     let entry_consumed = r.pos - entry_start;
     if entry_consumed < entry_length {
@@ -550,6 +556,7 @@ fn parse_video_stream(r: &mut Cursor<'_>) -> Result<VideoStream, MplsError> {
     }
 
     Ok(VideoStream {
+        pid,
         coding_type,
         video_format,
         frame_rate,
@@ -562,7 +569,7 @@ fn parse_audio_stream(r: &mut Cursor<'_>) -> Result<AudioStream, MplsError> {
     let entry_length = r.read_u8()? as usize;
     let entry_start = r.pos;
     let _stream_type = r.read_u8()?;
-    let _pid = r.read_u16()?;
+    let pid = r.read_u16()?;
     let entry_consumed = r.pos - entry_start;
     if entry_consumed < entry_length {
         r.skip(entry_length - entry_consumed)?;
@@ -583,6 +590,7 @@ fn parse_audio_stream(r: &mut Cursor<'_>) -> Result<AudioStream, MplsError> {
     }
 
     Ok(AudioStream {
+        pid,
         coding_type,
         audio_format,
         sample_rate,
@@ -596,7 +604,7 @@ fn parse_subtitle_stream(r: &mut Cursor<'_>) -> Result<SubtitleStream, MplsError
     let entry_length = r.read_u8()? as usize;
     let entry_start = r.pos;
     let _stream_type = r.read_u8()?;
-    let _pid = r.read_u16()?;
+    let pid = r.read_u16()?;
     let entry_consumed = r.pos - entry_start;
     if entry_consumed < entry_length {
         r.skip(entry_length - entry_consumed)?;
@@ -620,6 +628,7 @@ fn parse_subtitle_stream(r: &mut Cursor<'_>) -> Result<SubtitleStream, MplsError
     }
 
     Ok(SubtitleStream {
+        pid,
         coding_type,
         language,
     })
@@ -685,12 +694,14 @@ pub(crate) mod tests {
     }
 
     struct VideoStreamSpec {
+        pid: u16,
         coding_type: u8,
         video_format: u8,
         frame_rate: u8,
     }
 
     struct AudioStreamSpec {
+        pid: u16,
         coding_type: u8,
         audio_format: u8,
         sample_rate: u8,
@@ -698,6 +709,7 @@ pub(crate) mod tests {
     }
 
     struct SubtitleStreamSpec {
+        pid: u16,
         coding_type: u8,
         language: [u8; 3],
     }
@@ -729,11 +741,13 @@ pub(crate) mod tests {
                 is_multi_angle: false,
                 angle_clip_ids: Vec::new(),
                 video: vec![VideoStreamSpec {
+                    pid: 0x1011,
                     coding_type: 0x1b,
                     video_format: 6,
                     frame_rate: 1,
                 }],
                 audio: vec![AudioStreamSpec {
+                    pid: 0x1100,
                     coding_type: 0x81,
                     audio_format: 3,
                     sample_rate: 1,
@@ -897,7 +911,7 @@ pub(crate) mod tests {
                 // entry: stream_type(1) + PID(2) = 3 bytes
                 entries.push(3u8); // entry_length
                 entries.push(1); // stream_type = PlayItem stream
-                entries.extend_from_slice(&0x1011_u16.to_be_bytes()); // PID
+                entries.extend_from_slice(&v.pid.to_be_bytes());
                 // attrs: coding_type(1) + format_rate(1) = 2 bytes
                 entries.push(2); // attrs_length
                 entries.push(v.coding_type);
@@ -907,7 +921,7 @@ pub(crate) mod tests {
             for a in &item.audio {
                 entries.push(3u8); // entry_length
                 entries.push(1);
-                entries.extend_from_slice(&0x1100_u16.to_be_bytes());
+                entries.extend_from_slice(&a.pid.to_be_bytes());
                 // attrs: coding_type(1) + format_rate(1) + language(3) = 5 bytes
                 entries.push(5); // attrs_length
                 entries.push(a.coding_type);
@@ -918,7 +932,7 @@ pub(crate) mod tests {
             for s in &item.subtitles {
                 entries.push(3u8);
                 entries.push(1);
-                entries.extend_from_slice(&0x1200_u16.to_be_bytes());
+                entries.extend_from_slice(&s.pid.to_be_bytes());
                 // attrs: coding_type(1) + language(3) = 4 bytes
                 entries.push(4); // attrs_length
                 entries.push(s.coding_type);
@@ -965,11 +979,13 @@ pub(crate) mod tests {
         assert!(!item.is_multi_angle, "not multi-angle");
 
         assert_eq!(item.streams.video.len(), 1, "video stream count");
+        assert_eq!(item.streams.video[0].pid, 0x1011, "video PID");
         assert_eq!(item.streams.video[0].coding_type, 0x1b, "video codec");
         assert_eq!(item.streams.video[0].video_format, 6, "video format");
         assert_eq!(item.streams.video[0].frame_rate, 1, "frame rate");
 
         assert_eq!(item.streams.audio.len(), 1, "audio stream count");
+        assert_eq!(item.streams.audio[0].pid, 0x1100, "audio PID");
         assert_eq!(item.streams.audio[0].coding_type, 0x81, "audio codec");
         assert_eq!(item.streams.audio[0].language, "eng", "audio language");
 

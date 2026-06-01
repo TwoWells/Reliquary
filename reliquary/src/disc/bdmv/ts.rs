@@ -72,6 +72,12 @@ pub struct PesPacket {
 pub struct ParsedPes {
     /// Presentation timestamp (90 kHz clock), if present.
     pub pts: Option<u64>,
+    /// Decode timestamp (90 kHz clock), if present.
+    ///
+    /// Present when `pts_dts_flags == 0b11` in the PES header, which occurs
+    /// on video frames with decode reordering (B-frames). Audio streams
+    /// always have PTS == DTS and typically signal PTS-only.
+    pub dts: Option<u64>,
     /// Elementary stream payload (PES header stripped).
     pub payload: Vec<u8>,
 }
@@ -189,6 +195,16 @@ pub fn parse_pes(data: &[u8]) -> Result<ParsedPes, PesError> {
         None
     };
 
+    let dts = if pts_dts_flags == 0x03 {
+        // DTS present (flags 0b11 — PTS + DTS)
+        if data.len() < 19 {
+            return Err(PesError::Truncated);
+        }
+        Some(extract_pts(&data[14..19]))
+    } else {
+        None
+    };
+
     let payload_start = 9 + header_data_len;
     if payload_start > data.len() {
         return Err(PesError::Truncated);
@@ -196,6 +212,7 @@ pub fn parse_pes(data: &[u8]) -> Result<ParsedPes, PesError> {
 
     Ok(ParsedPes {
         pts,
+        dts,
         payload: data[payload_start..].to_vec(),
     })
 }
@@ -649,6 +666,7 @@ mod tests {
 
         let parsed = parse_pes(&pes).expect("PES parse should succeed");
         assert!(parsed.pts.is_none(), "PTS should be absent");
+        assert!(parsed.dts.is_none(), "DTS should be absent");
         assert_eq!(parsed.payload, payload, "payload should match");
     }
 
@@ -660,6 +678,7 @@ mod tests {
 
         let parsed = parse_pes(&pes).expect("PES parse should succeed");
         assert_eq!(parsed.pts, Some(pts), "PTS should be 90000");
+        assert!(parsed.dts.is_none(), "DTS should be absent for PTS-only");
         assert_eq!(parsed.payload, payload, "payload should match");
     }
 
@@ -696,6 +715,7 @@ mod tests {
 
         let parsed = parse_pes(&pes).expect("PES parse should succeed");
         assert_eq!(parsed.pts, Some(pts), "PTS should be extracted");
+        assert_eq!(parsed.dts, Some(dts), "DTS should be extracted");
         assert_eq!(parsed.payload, payload, "payload should match");
     }
 
