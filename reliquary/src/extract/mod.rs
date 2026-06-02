@@ -3,4 +3,5 @@
 
 //! Extraction pipeline — demuxing, codec framing, and muxing.
 
+pub mod demux;
 pub mod frame;
