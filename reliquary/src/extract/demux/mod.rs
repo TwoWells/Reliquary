@@ -8,18 +8,19 @@
 //! with stream identity and timestamps. The framing layer then processes
 //! these into codec access units.
 
+pub mod ps;
 pub mod ts;
 
 /// Identifies an elementary stream within a container.
 ///
-/// Wraps the container-level stream identifier (TS PID for Blu-ray, stream ID
-/// for DVD) along with the MPEG coding type from the playlist metadata.
+/// Wraps the container-level stream identifier (TS PID for Blu-ray, packed
+/// stream/sub-stream ID for DVD) along with the MPEG coding type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId {
     /// Container-level stream identifier.
     ///
     /// For MPEG-TS (Blu-ray): the 13-bit PID from the TS header.
-    /// For MPEG-PS (DVD): a packed `stream_id + sub_stream_id`.
+    /// For MPEG-PS (DVD): packed as `(stream_id << 8) | sub_stream_id`.
     pub pid: u16,
     /// MPEG coding type from the playlist metadata.
     ///
