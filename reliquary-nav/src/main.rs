@@ -244,6 +244,10 @@ impl App {
         clippy::cast_possible_truncation,
         reason = "page IDs are u8 values stored in u32 SetButtonPage fields"
     )]
+    #[allow(
+        clippy::print_stderr,
+        reason = "binary crate uses stderr for debug trace"
+    )]
     fn handle_click(&mut self, button_id: u16) {
         let Some(commands) = self.loaded.commands_for_button(button_id) else {
             return;
@@ -257,6 +261,11 @@ impl App {
         let (effect, new_gprs) = execute_button_commands(commands, &ctx, &self.gprs);
         self.gprs = new_gprs;
 
+        eprintln!(
+            "click: button_id={button_id} page_id={} effect={effect:?}",
+            self.loaded.page.page_id
+        );
+
         match effect {
             ButtonEffect::SetButtonPage { composite, page } => {
                 self.handle_set_button_page(composite, page);
@@ -269,7 +278,7 @@ impl App {
                 branch_opt,
                 mark_or_pi,
             } => {
-                self.handle_playlist(PlayTarget {
+                self.handle_play_target(PlayTarget {
                     playlist,
                     branch_opt,
                     mark_or_pi,
@@ -284,6 +293,10 @@ impl App {
     #[allow(
         clippy::cast_possible_truncation,
         reason = "page IDs and button IDs are u8/u16 values in u32 fields"
+    )]
+    #[allow(
+        clippy::print_stderr,
+        reason = "binary crate uses stderr for debug trace"
     )]
     fn handle_set_button_page(&mut self, composite: u32, page: u32) {
         let composite_button_id = if composite > 0 {
@@ -329,38 +342,42 @@ impl App {
         }
 
         // MOBJ dispatch fallback: resume the title MOBJ with updated
-        // PSR[10]/PSR[11]. If the handler calls SET_BUTTON_PAGE before
-        // a menu PlayPl, PSR[11] will contain the target page.
+        // PSR[10]/PSR[11]. Any non-zero playlist terminates the chain
+        // so we can distinguish content playback from menu navigation.
+        // Previously this used menu_playlists as the valid set, which
+        // caused content PlayPl instructions to be skipped — the chain
+        // would continue to the menu-return PlayPl and navigate to
+        // page 0 instead of logging the content playlist.
         if let Some((mobj_idx, resume_pc)) = self.disc.resume_point {
             self.gprs.insert(PSR_FLAG | 0x0A, composite); // PSR[10]
             self.gprs.insert(PSR_FLAG | 0x0B, page); // PSR[11]
 
+            let any_playlist = std::collections::HashSet::new();
             let target = run_mobj_chain(
                 &self.disc.mobj_file,
                 mobj_idx,
                 resume_pc,
                 &mut self.gprs,
                 &self.disc.title_to_mobj,
-                &self.disc.menu_playlists,
+                &any_playlist,
             );
 
-            if target.is_some() {
-                let psr11 = self.gprs.get(&(PSR_FLAG | 0x0B)).copied().unwrap_or(0);
-                let target_page = (psr11 & 0xFF) as u8;
-                self.push_history();
-                if target_page > 0
-                    && let Some(page_index) = self.clip.page_index_for_id(target_page)
-                {
-                    self.navigate_to_page_index(page_index, None);
-                } else {
-                    self.navigate_to_page_index(0, None);
-                }
+            if let Some(play_target) = target {
+                eprintln!(
+                    "mobj_dispatch: psr10={composite:#x} psr11={page:#x} → playlist {}",
+                    play_target.playlist
+                );
+                self.handle_play_target(play_target);
             }
         }
     }
 
     /// Handles `GotoMobj` — executes the target MOBJ chain to reach a
     /// `PlayPl` and acts on the result.
+    #[allow(
+        clippy::print_stderr,
+        reason = "binary crate uses stderr for debug trace"
+    )]
     fn handle_goto_mobj(&mut self, object_id: u32) {
         // Empty valid set = any non-zero PlayPl is terminal.
         let any_playlist = std::collections::HashSet::new();
@@ -374,14 +391,25 @@ impl App {
         );
 
         if let Some(play_target) = target {
+            eprintln!(
+                "goto_mobj: object={object_id} → playlist {}",
+                play_target.playlist
+            );
             self.handle_play_target(play_target);
         }
     }
 
-    /// Handles a `PlayTarget` from MOBJ dispatch or `GotoMobj`.
+    /// Handles a `PlayTarget` from MOBJ dispatch, `GotoMobj`, or direct
+    /// `PlayPl` button effects.
     ///
-    /// If the playlist is a menu playlist, navigates to that menu's page 0
-    /// and runs auto-action. Otherwise, logs the content playlist.
+    /// If the playlist is a menu playlist, navigates using PSR\[11\] page
+    /// (set by the MOBJ chain's `SET_BUTTON_PAGE` before `PlayPl`) with
+    /// page 0 + auto-action as fallback. Otherwise, logs the content
+    /// playlist.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "page IDs are u8 values stored in u32 PSR fields"
+    )]
     #[allow(
         clippy::print_stderr,
         reason = "binary crate uses stderr for status messages"
@@ -392,10 +420,18 @@ impl App {
             .menu_playlists
             .contains(&u32::from(target.playlist))
         {
-            // Menu playlist — navigate within menus.
-            // Go to page 0 and let auto-action route to the correct page.
+            // Menu playlist — navigate using PSR[11] page if the MOBJ
+            // chain set it, otherwise fall back to page 0 + auto-action.
+            let psr11 = self.gprs.get(&(PSR_FLAG | 0x0B)).copied().unwrap_or(0);
+            let target_page = (psr11 & 0xFF) as u8;
             self.push_history();
-            self.navigate_to_page_index(0, None);
+            if target_page > 0
+                && let Some(page_index) = self.clip.page_index_for_id(target_page)
+            {
+                self.navigate_to_page_index(page_index, None);
+            } else {
+                self.navigate_to_page_index(0, None);
+            }
         } else {
             // Content playlist — log it.
             eprintln!(
@@ -403,24 +439,6 @@ impl App {
                 target.playlist, target.branch_opt, target.mark_or_pi
             );
         }
-    }
-
-    /// Handles a direct `Playlist` button effect.
-    #[allow(
-        clippy::unused_self,
-        reason = "method signature kept consistent with other handle_* methods"
-    )]
-    #[allow(
-        clippy::print_stderr,
-        reason = "binary crate uses stderr for status messages"
-    )]
-    fn handle_playlist(&self, target: PlayTarget) {
-        // Content playback — log the playlist info. Future: capture
-        // for content labeling (M3 milestone).
-        eprintln!(
-            "content: playlist {} (branch_opt={}, mark_or_pi={})",
-            target.playlist, target.branch_opt, target.mark_or_pi
-        );
     }
 
     // ── Navigation helpers ───────────────────────────────────────────
