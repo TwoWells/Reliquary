@@ -867,7 +867,7 @@ mod tests {
 
     #[test]
     fn simple_movie_single_title() {
-        // a DVD title pattern: 1 VTS, 1 PGC, 7 chapters
+        // Simple movie pattern: 1 VTS, 1 PGC, 7 chapters
         let vts_data = VtsBuilder::new()
             .video(1, 0, 3, 0)
             .audio(0, 1, 0, *b"en")
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn multi_vts_with_extras() {
-        // a DVD title pattern: main feature + short extras in separate VTSs
+        // Multi-VTS pattern: main feature + short extras in separate VTSs
         let main_chapters: Vec<(u16, u16)> = (1..=32).map(|p| (1u16, p)).collect();
         let main_vts = VtsBuilder::new()
             .video(1, 0, 3, 0)
@@ -947,7 +947,7 @@ mod tests {
 
     #[test]
     fn tv_series_with_play_all() {
-        // a TV-series DVD pattern: play-all PGC with N programs + individual PGCs
+        // TV series pattern: play-all PGC with N programs + individual PGCs
         let mut pgcs = vec![
             // PGC 1: play-all (3 episodes × 2 cells each = 6 cells, 3 programs)
             PgcBuilder::new()
@@ -1018,7 +1018,7 @@ mod tests {
 
     #[test]
     fn unreferenced_pgcs() {
-        // a DVD title pattern: VTS with PGCs not referenced by any title
+        // Unreferenced-PGC pattern: VTS with PGCs not referenced by any title
         let vts_data = VtsBuilder::new()
             .video(1, 0, 3, 0)
             .audio(0, 1, 0, *b"en")
@@ -1160,7 +1160,7 @@ mod tests {
 
     #[test]
     fn pal_disc() {
-        // a PAL DVD title pattern: PAL, 720×576
+        // PAL pattern: PAL, 720×576
         let vts_data = VtsBuilder::new()
             .video(1, 1, 3, 0) // PAL
             .audio(0, 1, 0, *b"en")

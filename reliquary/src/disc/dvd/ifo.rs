@@ -927,7 +927,7 @@ pub(crate) mod tests {
 
     #[test]
     fn dvd_time_ntsc() {
-        // a DVD title: 0x01 0x36 0x50 0xC8 → 1h36m50s + 8 frames @ 29.97fps
+        // NTSC sample: 0x01 0x36 0x50 0xC8 → 1h36m50s + 8 frames @ 29.97fps
         let data = [0x01, 0x36, 0x50, 0xC8];
         let mut r = Reader::new(&data);
         let t = parse_dvd_time(&mut r).expect("should parse NTSC time");
@@ -950,7 +950,7 @@ pub(crate) mod tests {
 
     #[test]
     fn dvd_time_pal() {
-        // a PAL DVD title: 0x00 0x00 0x31 0x43 → 0h0m31s + 3 frames @ 25fps
+        // PAL sample: 0x00 0x00 0x31 0x43 → 0h0m31s + 3 frames @ 25fps
         let data = [0x00, 0x00, 0x31, 0x43];
         let mut r = Reader::new(&data);
         let t = parse_dvd_time(&mut r).expect("should parse PAL time");
@@ -986,10 +986,10 @@ pub(crate) mod tests {
 
     #[test]
     fn dvd_time_ntsc_short() {
-        // a TV-series DVD S1 VTS1: 0x00 0x00 0x13 0xD4 → 0h0m13s + 14 frames @ 29.97fps
+        // NTSC short sample: 0x00 0x00 0x13 0xD4 → 0h0m13s + 14 frames @ 29.97fps
         let data = [0x00, 0x00, 0x13, 0xD4];
         let mut r = Reader::new(&data);
-        let t = parse_dvd_time(&mut r).expect("should parse a TV-series DVD time");
+        let t = parse_dvd_time(&mut r).expect("should parse NTSC time");
 
         assert_eq!(t.hours, 0, "hours");
         assert_eq!(t.minutes, 0, "minutes");

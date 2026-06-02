@@ -498,7 +498,7 @@ fn setup_dvd(vmg_data: &[u8], vts_files: &[(u8, Vec<u8>)]) -> TempDir {
 
 #[test]
 fn inspect_dvd_simple_movie() {
-    // Single VTS, 1 PGC, 7 chapters — a DVD title pattern
+    // Single VTS, 1 PGC, 7 chapters — simple movie pattern
     let time = bcd_time(1, 36, 50, 8, false);
     let mut ac = [0u16; 8];
     ac[0] = 0x8000;

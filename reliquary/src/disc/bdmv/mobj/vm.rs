@@ -280,7 +280,7 @@ pub fn seed_title_gprs(
     gprs.insert(PSR_FLAG | 0x1F, 0x0200); // player version
 
     // Starting MOBJs to try: MOBJ[0] first, then top menu MOBJ as fallback.
-    // On some discs (e.g. a Blu-ray series), MOBJ[0] plays a warning without
+    // On some discs (e.g. a WB animated series), MOBJ[0] plays a warning without
     // jumping to the menu title. The top menu MOBJ runs when the player
     // enters the menu — we simulate that transition by trying it directly.
     // GPR state accumulates across attempts: the top menu MOBJ inherits
@@ -1410,7 +1410,7 @@ mod tests {
 
     #[test]
     fn register_computed_set_button_page() {
-        // WB Special Features button command program (a WB Blu-ray title btn[4]):
+        // WB Special Features button command program (WB action title btn[4]):
         //   1. GPR[4075] = 5              (nav bar offset, immediate)
         //   2. GPR[4076] = 0xFFFF          (mask, immediate)
         //   3. GPR[4077] = PSR[10]         (selected button ID, reg-to-reg)

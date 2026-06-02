@@ -119,7 +119,7 @@ fn count_handler_play_pls(instrs: &[Instruction]) -> usize {
 /// Scans for the case pattern (SET, SET, CMP + GOTO chain) in two
 /// variants:
 ///
-/// **7-instruction pattern** (a WB Blu-ray title, a WB Blu-ray title):
+/// **7-instruction pattern** (WB action title, WB adventure title):
 /// ```text
 /// SET GPR[R1] = GPR[R2]     // load dispatch register
 /// SET GPR[R3] = N            // case value (immediate)
@@ -1063,7 +1063,7 @@ fn trace_button(
 }
 
 /// Static resolution: scans a MOBJ for an immediate `PlayPl` matching
-/// a GPR value (`GotoMobj` pattern — a Blu-ray series style).
+/// a GPR value (`GotoMobj` pattern — WB animated series style).
 fn resolve_in_mobj_static(mobj: &MovieObject, register: u32, value: u32) -> Option<u16> {
     let instrs = &mobj.instructions;
 
