@@ -145,6 +145,7 @@ impl PgsFramer {
                 return Some(Frame {
                     pts,
                     dts: None,
+                    duration: None,
                     data,
                     keyframe: true,
                 });

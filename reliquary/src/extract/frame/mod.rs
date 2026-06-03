@@ -11,6 +11,7 @@
 pub mod ac3;
 pub mod mpeg2;
 pub mod pgs;
+pub mod vobsub;
 
 /// A framed access unit ready for the Matroska muxer.
 #[derive(Debug, Clone)]
@@ -19,6 +20,14 @@ pub struct Frame {
     pub pts: u64,
     /// Decode timestamp, if different from PTS.
     pub dts: Option<u64>,
+    /// Display duration in 90 kHz ticks, when the codec specifies one.
+    ///
+    /// Bitmap subtitle formats (`VobSub`) carry an explicit on-screen
+    /// duration in their control data; the muxer writes these as a
+    /// `BlockGroup` with `BlockDuration`. Audio and video leave this
+    /// `None` — their duration is implicit (sample rate / frame rate) and
+    /// derived downstream from timestamp deltas.
+    pub duration: Option<u64>,
     /// Frame payload (one complete access unit).
     pub data: Vec<u8>,
     /// Whether this frame is a random access point.

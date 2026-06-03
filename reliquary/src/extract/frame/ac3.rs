@@ -305,6 +305,7 @@ impl Ac3Framer {
                 return Some(Frame {
                     pts: self.last_pts,
                     dts: None,
+                    duration: None,
                     data,
                     keyframe: true,
                 });

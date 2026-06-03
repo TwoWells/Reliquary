@@ -149,6 +149,7 @@ impl Mpeg2Framer {
                 frames.push(Frame {
                     pts: self.last_pts,
                     dts: self.last_dts,
+                    duration: None,
                     data,
                     keyframe: self.current_keyframe,
                 });
@@ -213,6 +214,7 @@ impl Mpeg2Framer {
                         return Some(Frame {
                             pts: self.last_pts,
                             dts: self.last_dts,
+                            duration: None,
                             data,
                             keyframe,
                         });
