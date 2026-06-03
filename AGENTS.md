@@ -44,6 +44,13 @@ Rust workspace. The library crate produces data. CLI/TUI/web crates own presenta
 - **Documentation:** All public APIs must have documentation comments.
 - **Testing:** All new features must include tests.
 
+## Sensitive Data
+
+This is a **public** repository. Two classes of data must never appear in it — not in code, comments, tests, or commit messages:
+
+- **AACS VUKs and disc IDs.** These are decryption keys/identifiers. Never hardcode a real VUK (32 hex chars, optionally `0x`-prefixed) or disc ID; pass keys at runtime (`--vuk`) or via a gitignored file. A pre-commit hook blocks VUK-shaped values — for synthetic test vectors use the all-zero placeholder or mark the line `vuk-allow`.
+- **Real disc / movie titles.** They reveal a private physical collection. Use generic descriptors instead — e.g. "a WB Blu-ray title", "a DVD title", "WB animated series". Name test fixtures and comments by what they exercise (codec, structure), not by the source disc.
+
 ## Setup
 
 - **First time:** `make setup` — configures git hooks and checks for required cargo tools.
