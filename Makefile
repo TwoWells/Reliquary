@@ -7,7 +7,7 @@
 #   make release-major   # 0.1.0 -> 1.0.0
 #   make release V=0.2.0 # explicit version
 
-.PHONY: bench build-release check deny mutants run setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
+.PHONY: build-release check deny mutants run setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
 
 # Get current version from workspace Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -17,6 +17,12 @@ CARGO_TOOLS := cargo-deny cargo-machete cargo-nextest cargo-semver-checks cargo-
 
 # Run #[ignore] tests locally (external tools present), skip in CI.
 NEXTEST_IGNORED := $(if $(CI),,--run-ignored all)
+
+# Hard per-process address-space cap (KiB) applied to test runs, so a runaway
+# allocation (e.g. a pathological parser input) aborts that single process at
+# the limit instead of exhausting system RAM. Override with MEMLIMIT_KB=<kib>,
+# or MEMLIMIT_KB=unlimited to disable.
+MEMLIMIT_KB ?= 8388608
 
 # --- Setup ---
 
@@ -80,7 +86,8 @@ check: setup-tools
 	 done
 	@cargo machete
 	@cargo clippy --workspace --tests --quiet -- -D warnings
-	@cargo nextest run --workspace $(NEXTEST_IGNORED) --no-fail-fast --no-tests=pass --status-level fail --final-status-level fail --cargo-quiet --show-progress only
+	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
+	 cargo nextest run --workspace $(NEXTEST_IGNORED) --no-fail-fast --no-tests=pass --status-level fail --final-status-level fail --cargo-quiet --show-progress only
 
 deny:
 	@cargo deny --log-level error check
@@ -102,7 +109,8 @@ mutants:
 # Run tests. Pass T= to filter, N= to repeat, I=1 to include ignored.
 CLEAN_T = $(subst \,,$(subst !,,$(T)))
 test:
-	@cargo nextest run --workspace --status-level fail --final-status-level slow --cargo-quiet $(if $(I),--run-ignored all,) $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
+	@if [ "$(MEMLIMIT_KB)" != unlimited ]; then ulimit -v $(MEMLIMIT_KB); fi; \
+	 cargo nextest run --workspace --status-level fail --final-status-level slow --cargo-quiet $(if $(I),--run-ignored all,) $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
 
 # --- Release ---
 
