@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Pre-commit hook: enforce SPDX copyright headers on staged .rs files.
+# Pre-commit hook: SPDX copyright headers + AACS VUK leak guard.
 set -euo pipefail
 
+# SPDX copyright headers on staged .rs files.
 files=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs' | grep -v '^tests/assets/' || true)
-[ -z "$files" ] && exit 0
-exec .githooks/check-copyright.sh $files
+[ -n "$files" ] && .githooks/check-copyright.sh $files
+
+# AACS VUK leak guard on all staged files.
+.githooks/check-vuks.sh
