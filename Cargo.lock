@@ -1394,13 +1394,9 @@ dependencies = [
 name = "reliquary-cli"
 version = "0.1.0"
 dependencies = [
- "aes",
- "cbc",
- "cipher",
  "clap",
  "reliquary",
  "serde_json",
- "sha1",
  "tempfile",
 ]
 
