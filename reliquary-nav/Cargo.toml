@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Interactive disc menu navigator — renders IG menus at full resolution for visual validation"
+description = "Disc menu navigator for Reliquary — name reservation for the planned libbluray navigator"
 keywords = ["media", "archive", "bluray", "menu"]
 categories = ["multimedia", "visualization"]
 
@@ -12,7 +12,3 @@ categories = ["multimedia", "visualization"]
 workspace = true
 
 [dependencies]
-reliquary = { version = "0.1.0", path = "../reliquary" }
-clap = { workspace = true }
-softbuffer = "0.4"
-winit = "0.30"
