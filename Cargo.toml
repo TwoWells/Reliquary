@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "reliquary",
+    "reliquary-bluray",
     "reliquary-cli",
     "reliquary-nav",
     "reliquary-tui",

@@ -1,0 +1,62 @@
+[package]
+name = "reliquary-bluray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Safe libbluray FFI boundary for Reliquary — the workspace's sole unsafe-code exception, wrapping disc lifecycle behind a 100% safe API"
+keywords = ["media", "archive", "bluray", "ffi", "libbluray"]
+categories = ["multimedia", "external-ffi-bindings"]
+links = "bluray"
+build = "build.rs"
+
+# NOTE: This crate does NOT inherit `[lints] workspace = true`.
+#
+# The workspace sets `unsafe_code = "forbid"`, which `forbid` makes impossible
+# to relax with a local `#[allow(unsafe_code, ...)]` (forbid hard-errors the
+# compiler). This crate is the sole FFI boundary in the workspace and must call
+# `unsafe` C functions, so it mirrors every workspace lint verbatim EXCEPT it
+# sets `unsafe_code = "deny"` — still strict, but locally overridable by a
+# single justified `#[allow(unsafe_code, reason = "...")]` on the FFI module.
+# Every other crate in the workspace stays `forbid(unsafe_code)`.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+# Lint groups
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Hard denials — no agent should produce these
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+wildcard_imports = "deny"
+missing_assert_message = "deny"
+
+# Force agents to justify exceptions
+allow_attributes_without_reason = "deny"
+
+# Dependencies
+multiple_crate_versions = "allow"
+
+# Publishing metadata — not a code quality concern
+cargo_common_metadata = "allow"
+
+# Documentation
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+missing_safety_doc = "warn"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

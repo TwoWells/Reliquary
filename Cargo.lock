@@ -294,6 +294,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "reliquary-bluray"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "reliquary-cli"
 version = "0.1.0"
 dependencies = [
