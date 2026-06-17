@@ -57,6 +57,7 @@ missing_safety_doc = "warn"
 
 [dependencies]
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

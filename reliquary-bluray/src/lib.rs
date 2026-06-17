@@ -28,6 +28,7 @@
 //! `None` defers to libaacs' KEYDB.
 
 mod ffi;
+mod overlay;
 
 use std::ffi::{CString, NulError};
 use std::path::Path;
@@ -72,6 +73,76 @@ pub struct Disc {
     /// Non-null `BLURAY*`. Invariant: valid and owned for the lifetime of this
     /// `Disc`, freed exactly once in [`Drop`].
     handle: NonNull<ffi::Bluray>,
+
+    /// The software IG-plane overlay state, heap-allocated so its address is
+    /// stable. Its raw pointer is handed to libbluray via
+    /// `bd_register_overlay_proc` in [`Disc::play`]; the overlay trampoline
+    /// writes composited frames into it. Boxing guarantees the address libbluray
+    /// holds stays valid even as the `Disc` itself is moved, and the box is
+    /// dropped only after the proc is unregistered in [`Drop`].
+    overlay: Box<overlay::OverlayCtx>,
+
+    /// Whether the overlay proc is currently registered with libbluray. Guards
+    /// [`Drop`] so we unregister exactly when we registered.
+    overlay_registered: bool,
+
+    /// Scratch buffer reused across [`Disc::pump`] so each pump does not
+    /// reallocate. libbluray's navigation reads are 6144-byte aligned units; in
+    /// overlay-only mode we never inspect the bytes, only the events and the
+    /// overlay callback's side effects.
+    read_buf: Vec<u8>,
+}
+
+/// A key the user can send to the disc menu.
+///
+/// Each variant maps to a libbluray `BD_VK_*` code. Keeping this an enum
+/// (rather than exposing raw key integers) keeps the safe API closed:
+/// `reliquary-nav` cannot pass an arbitrary FFI value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    /// Move the highlight up.
+    Up,
+    /// Move the highlight down.
+    Down,
+    /// Move the highlight left.
+    Left,
+    /// Move the highlight right.
+    Right,
+    /// Activate the selected button.
+    Enter,
+}
+
+impl Key {
+    /// The libbluray `BD_VK_*` code for this key.
+    const fn to_vk(self) -> u32 {
+        match self {
+            Self::Up => ffi::BD_VK_UP,
+            Self::Down => ffi::BD_VK_DOWN,
+            Self::Left => ffi::BD_VK_LEFT,
+            Self::Right => ffi::BD_VK_RIGHT,
+            Self::Enter => ffi::BD_VK_ENTER,
+        }
+    }
+}
+
+/// One observable outcome of pumping the navigation loop.
+///
+/// Surfaced from the libbluray event queue. Overlay-only: this is the subset
+/// the render loop reacts to; activation/playlist handling for the join lands
+/// in a later stage, but [`PumpEvent::Playlist`] is already surfaced so callers
+/// can observe it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpEvent {
+    /// A playlist became current (`BD_EVENT_PLAYLIST`); the parameter is the
+    /// mpls number. Fired on activation — the future "join" trigger.
+    Playlist(u32),
+    /// Interactive-menu visibility changed (`BD_EVENT_MENU`): `true` visible.
+    MenuVisible(bool),
+    /// Playback parked on a still (`BD_EVENT_STILL_TIME`); the parameter is the
+    /// still duration in seconds (`0` = infinite). Menus commonly park here.
+    StillTime(u32),
+    /// A fatal libbluray error (`BD_EVENT_ERROR`); playback cannot continue.
+    Error,
 }
 
 impl Disc {
@@ -112,16 +183,122 @@ impl Disc {
         drop(device);
         drop(keyfile);
 
-        NonNull::new(raw).map_or(Err(OpenError::OpenFailed), |handle| Ok(Self { handle }))
+        NonNull::new(raw).map_or(Err(OpenError::OpenFailed), |handle| {
+            Ok(Self {
+                handle,
+                overlay: Box::new(overlay::OverlayCtx::new()),
+                overlay_registered: false,
+                // 6144 bytes = one aligned BD navigation read unit.
+                read_buf: vec![0u8; 6144],
+            })
+        })
+    }
+
+    /// Begin menu playback: register the overlay handler and start the disc
+    /// with on-disc menus (`bd_play`).
+    ///
+    /// Call once after [`Disc::open`] and before [`Disc::pump`]. Registering the
+    /// overlay proc before `bd_play` ensures the very first IG-plane commands
+    /// are composited. Returns `false` if `bd_play` reported failure (e.g. the
+    /// disc has no playable menu).
+    pub fn play(&mut self) -> bool {
+        if !self.overlay_registered {
+            // The boxed `OverlayCtx` has a stable heap address; hand its raw
+            // pointer to libbluray, which only stores it and passes it back to
+            // the trampoline. We unregister in `Drop` before the box is freed.
+            let ctx_ptr: *mut overlay::OverlayCtx = std::ptr::from_mut(self.overlay.as_mut());
+            ffi::register_overlay(self.handle.as_ptr(), ctx_ptr);
+            self.overlay_registered = true;
+        }
+        ffi::play(self.handle.as_ptr())
+    }
+
+    /// Jump to the disc Top Menu (`bd_menu_call`).
+    ///
+    /// Returns `false` if libbluray reported failure (e.g. the menu call is UO-
+    /// masked at the current position).
+    pub fn jump_to_menu(&mut self) -> bool {
+        ffi::menu_call(self.handle.as_ptr())
+    }
+
+    /// Send a navigation [`Key`] to the menu (`bd_user_input`).
+    ///
+    /// Returns `true` if libbluray reported that the selection or activation
+    /// changed (its `> 0` result), `false` for "no change" or a (non-fatal)
+    /// rejection such as a UO-masked key.
+    pub fn send_key(&mut self, key: Key) -> bool {
+        ffi::user_input(self.handle.as_ptr(), key.to_vk()) > 0
+    }
+
+    /// Advance the navigation loop by up to `max_iterations` `bd_read_ext`
+    /// pumps, returning the events observed (in order).
+    ///
+    /// Each pump advances the HDMV VM and may fire the overlay callback
+    /// (compositing into the plane this `Disc` owns). The loop stops early when
+    /// `bd_read_ext` reports an error or there is nothing left to do for this
+    /// burst; `max_iterations` bounds the work per call so a UI frame is never
+    /// blocked indefinitely. Call [`Disc::frame`] afterwards to fetch the
+    /// latest composited menu image.
+    pub fn pump(&mut self, max_iterations: u32) -> Vec<PumpEvent> {
+        let mut events = Vec::new();
+        for _ in 0..max_iterations {
+            let (rc, ev) = ffi::read_ext(self.handle.as_ptr(), &mut self.read_buf);
+            match ev.event {
+                ffi::BD_EVENT_PLAYLIST => events.push(PumpEvent::Playlist(ev.param)),
+                ffi::BD_EVENT_MENU => events.push(PumpEvent::MenuVisible(ev.param != 0)),
+                ffi::BD_EVENT_STILL_TIME => events.push(PumpEvent::StillTime(ev.param)),
+                ffi::BD_EVENT_ERROR => {
+                    events.push(PumpEvent::Error);
+                    break;
+                }
+                // BD_EVENT_NONE and the many events we do not model are ignored.
+                _ => {}
+            }
+            // A negative read result is a hard error; stop pumping this burst.
+            if rc < 0 {
+                break;
+            }
+        }
+        events
+    }
+
+    /// The current overlay frame generation. Increments once per overlay
+    /// `FLUSH`; a change since the caller's last observation means a new
+    /// composited menu image is available from [`Disc::frame`]. Cheap to poll
+    /// every UI repaint to avoid re-uploading an unchanged texture.
+    #[must_use]
+    pub fn frame_generation(&self) -> u64 {
+        self.overlay.generation()
+    }
+
+    /// Snapshot the latest composited menu frame as `(rgba, width, height)`,
+    /// where `rgba` is `width * height * 4` bytes in `[R, G, B, A]` order.
+    ///
+    /// Returns `None` if no overlay plane has been initialised yet (no menu
+    /// drawn). The buffer is copied out, so the returned `Vec` is independent of
+    /// the disc's internal plane.
+    #[must_use]
+    pub fn frame(&self) -> Option<(Vec<u8>, u32, u32)> {
+        self.overlay.snapshot()
     }
 }
 
 impl Drop for Disc {
     fn drop(&mut self) {
+        // Unregister the overlay proc first, so libbluray cannot call back into
+        // the `OverlayCtx` after this `Disc` (and its boxed context) is gone.
+        // Closing the disc also tears down callbacks, but unregistering
+        // explicitly first removes any window between close and box-free.
+        if self.overlay_registered {
+            ffi::unregister_overlay(self.handle.as_ptr());
+            self.overlay_registered = false;
+        }
         // `self.handle` is a non-null pointer obtained from `bd_open` and not
         // yet closed; `Drop` runs at most once, so `bd_close` is called exactly
         // once for it.
         ffi::close(self.handle.as_ptr());
+        // `self.overlay` (the Box) is freed after this returns — only now that
+        // the proc is unregistered and the disc closed.
     }
 }
 
@@ -160,7 +337,7 @@ fn path_to_cstring(path: &Path) -> Result<CString, OpenError> {
     reason = "tests use expect() for assertions per project rules"
 )]
 mod tests {
-    use super::{Disc, OpenError, version};
+    use super::{Disc, Key, OpenError, version};
     use std::path::Path;
 
     #[test]
@@ -237,5 +414,59 @@ mod tests {
             "opening the disc at RELIQUARY_TEST_DISC should succeed, got {disc:?}"
         );
         // `disc` drops here, exercising bd_close.
+    }
+
+    /// Manual end-to-end render loop against a real disc.
+    ///
+    /// Opens the disc at `RELIQUARY_TEST_DISC`, registers the overlay handler,
+    /// starts menu playback, jumps to the top menu, pumps the navigation loop a
+    /// bounded number of times, sends an arrow key, and pumps again — exercising
+    /// the full `play → pump → send_key → frame` path including the overlay
+    /// trampoline. Ignored by default and a no-op when the env var is unset
+    /// (public repo: no real disc ships).
+    ///
+    /// This cannot assert a *specific* menu rendered (that is disc-dependent and
+    /// not visually verifiable here); it asserts the loop runs without error and
+    /// that, once a menu has drawn, a frame snapshot is well-formed
+    /// (`rgba.len() == w * h * 4`).
+    #[test]
+    #[ignore = "requires a real decrypted disc image; path supplied via RELIQUARY_TEST_DISC"]
+    fn render_loop_smoke_real_disc() {
+        let Ok(path) = std::env::var("RELIQUARY_TEST_DISC") else {
+            // No disc configured — nothing to exercise.
+            return;
+        };
+        let mut disc =
+            Disc::open(Path::new(&path), None).expect("opening RELIQUARY_TEST_DISC should succeed");
+
+        let played = disc.play();
+        assert!(
+            played,
+            "bd_play should start menu playback on a disc with on-disc menus"
+        );
+        disc.jump_to_menu();
+
+        // Pump a generous bounded amount so menus that park on a still settle.
+        for _ in 0..32 {
+            disc.pump(256);
+        }
+        // Nudge the highlight and pump again so a lone-draw/redraw can fire.
+        disc.send_key(Key::Right);
+        for _ in 0..32 {
+            disc.pump(256);
+        }
+
+        // If a menu has been composited, the snapshot must be internally
+        // consistent. (A disc that never drew a menu yields None, which we
+        // tolerate rather than fail — some discs autostart playback.)
+        if let Some((rgba, w, h)) = disc.frame() {
+            assert_eq!(
+                rgba.len(),
+                (w as usize) * (h as usize) * 4,
+                "a composited frame's RGBA length must equal width * height * 4, got {} for {w}x{h}",
+                rgba.len()
+            );
+        }
+        // `disc` drops here, exercising unregister + bd_close.
     }
 }

@@ -53,10 +53,13 @@ missing_safety_doc = "warn"
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
+tracing = "0.1"
 
 [profile.release]
 panic = "abort"

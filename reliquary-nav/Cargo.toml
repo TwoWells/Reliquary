@@ -12,3 +12,7 @@ categories = ["multimedia", "visualization"]
 workspace = true
 
 [dependencies]
+reliquary-bluray = { path = "../reliquary-bluray" }
+eframe = { workspace = true }
+egui = { workspace = true }
+tracing = { workspace = true }
