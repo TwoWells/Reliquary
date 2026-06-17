@@ -159,6 +159,77 @@ pub fn decode_rle_indices(img: &[RleElem], w: u16, h: u16) -> Vec<u16> {
     out
 }
 
+/// An axis-aligned rectangle in plane coordinates: the top-left corner plus
+/// width and height, all in pixels.
+///
+/// This is the bounding box of a single overlay `DRAW` — and, for a clean
+/// lone-draw (a `FLUSH` preceded by exactly one IG `DRAW`), the bounding box of
+/// the currently-selected menu button. It is exposed on the safe API so callers
+/// can crop the composited frame to just that button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    /// Top-left x in plane coordinates.
+    pub x: u16,
+    /// Top-left y in plane coordinates.
+    pub y: u16,
+    /// Width in pixels.
+    pub w: u16,
+    /// Height in pixels.
+    pub h: u16,
+}
+
+/// Crop a row-major RGBA buffer to `rect`, returning a tight
+/// `out_w * out_h * 4` RGBA sub-buffer plus its dimensions, or `None` if the
+/// rect does not overlap the source at all (or has zero area after clipping).
+///
+/// The source is `plane_w * plane_h` pixels, `[R, G, B, A]` per pixel. `rect`
+/// is clipped to the source bounds first, so a rect that runs off the right or
+/// bottom edge yields the in-bounds portion rather than panicking; the returned
+/// dimensions are the clipped ones. A zero-area rect (or one entirely outside
+/// the source) yields `None`.
+///
+/// This is the pure crop the recognizer needs: a single-button image carved out
+/// of the full menu canvas with no color cue or layout assumption.
+#[must_use]
+pub fn crop_rgba(
+    rgba: &[u8],
+    plane_w: u32,
+    plane_h: u32,
+    rect: Rect,
+) -> Option<(Vec<u8>, u32, u32)> {
+    // Clip the rect to the source bounds (exclusive end), mirroring how the
+    // plane clips a WIPE: a draw rect from a previous, differently-sized page
+    // must never index out of range.
+    let x0 = u32::from(rect.x).min(plane_w);
+    let y0 = u32::from(rect.y).min(plane_h);
+    let x1 = (u32::from(rect.x) + u32::from(rect.w)).min(plane_w);
+    let y1 = (u32::from(rect.y) + u32::from(rect.h)).min(plane_h);
+
+    // Empty after clipping (zero area, or fully off-canvas): nothing to crop.
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+
+    let out_w = x1 - x0;
+    let out_h = y1 - y0;
+    let row_bytes = (out_w as usize) * 4;
+    let mut out = vec![0u8; row_bytes * (out_h as usize)];
+
+    // The source row stride must match the declared geometry; if it does not
+    // (a truncated buffer) we refuse rather than read past the end.
+    let src_stride = (plane_w as usize) * 4;
+    if rgba.len() < (plane_h as usize) * src_stride {
+        return None;
+    }
+
+    for row in 0..out_h {
+        let src_base = ((y0 + row) as usize) * src_stride + (x0 as usize) * 4;
+        let dst_base = (row as usize) * row_bytes;
+        out[dst_base..dst_base + row_bytes].copy_from_slice(&rgba[src_base..src_base + row_bytes]);
+    }
+    Some((out, out_w, out_h))
+}
+
 /// An ARGB plane: a flat, row-major RGBA byte buffer of fixed dimensions.
 ///
 /// One byte order is used throughout: `[R, G, B, A]` per pixel, which is what
@@ -355,6 +426,16 @@ pub struct OverlayCtx {
     plane: core::cell::RefCell<Option<Plane>>,
     /// Incremented on every `FLUSH`. Lets the UI cheaply detect "new frame".
     generation: core::cell::Cell<u64>,
+    /// Number of `DRAW` commands seen since the last `FLUSH`. A `FLUSH` with a
+    /// count of exactly `1` is a clean lone-draw (see [`Self::selected_button_rect`]).
+    draws_this_frame: core::cell::Cell<u32>,
+    /// The rect of the most recent `DRAW` since the last `FLUSH`. Only meaningful
+    /// when `draws_this_frame == 1` at `FLUSH` time; otherwise discarded.
+    last_draw_rect: core::cell::Cell<Option<Rect>>,
+    /// The currently-selected button's bounding box, recorded from the most
+    /// recent clean lone-draw. `None` until one is observed, and reset to `None`
+    /// on a full-plane `CLEAR`/`HIDE` to avoid pointing at a stale page.
+    selected_button_rect: core::cell::Cell<Option<Rect>>,
 }
 
 impl OverlayCtx {
@@ -386,6 +467,17 @@ impl OverlayCtx {
                 palette,
                 img,
             } => {
+                // Track per-frame draws for lone-draw detection regardless of
+                // whether a plane is allocated, so the count reflects the actual
+                // command stream the disc emitted this frame.
+                self.draws_this_frame
+                    .set(self.draws_this_frame.get().saturating_add(1));
+                self.last_draw_rect.set(Some(Rect {
+                    x: *x,
+                    y: *y,
+                    w: *w,
+                    h: *h,
+                }));
                 if let Some(plane) = self.plane.borrow_mut().as_mut() {
                     plane.draw(&DrawCommand {
                         x: *x,
@@ -399,8 +491,13 @@ impl OverlayCtx {
             }
             // CLEAR empties the plane; HIDE signals the plane is empty and may
             // be hidden — for our single-plane UI both mean "show nothing", so
-            // they share a body (clear the plane, leaving it allocated).
+            // they share a body (clear the plane, leaving it allocated). A clear
+            // also invalidates the recorded selected-button rect: it precedes a
+            // full page redraw, and the old rect's coordinates would point into
+            // a now-different page. A brief `None` until the new page's
+            // lone-draw lands is preferable to cropping the wrong region.
             OverlayEvent::Clear | OverlayEvent::Hide => {
+                self.selected_button_rect.set(None);
                 if let Some(plane) = self.plane.borrow_mut().as_mut() {
                     plane.clear();
                 }
@@ -411,6 +508,22 @@ impl OverlayCtx {
                 }
             }
             OverlayEvent::Flush => {
+                // A lone-draw — exactly one DRAW since the previous FLUSH — is
+                // the highlight redraw of the selected button: that single
+                // DRAW's rect is the button's bounding box. A full page redraw
+                // (many draws) or the top menu's deselect-old + select-new
+                // pattern (two draws) is not a clean lone-draw, so the recorded
+                // rect is left untouched. Because we always take the *latest*
+                // clean lone-draw, the main-bar highlight (which lone-draws at a
+                // different y) is naturally superseded by the actual item.
+                if self.draws_this_frame.get() == 1
+                    && let Some(rect) = self.last_draw_rect.get()
+                {
+                    self.selected_button_rect.set(Some(rect));
+                }
+                // Reset per-frame draw tracking for the next frame.
+                self.draws_this_frame.set(0);
+                self.last_draw_rect.set(None);
                 self.generation.set(self.generation.get().wrapping_add(1));
             }
             OverlayEvent::Close => {
@@ -437,6 +550,38 @@ impl OverlayCtx {
             .as_ref()
             .map(|p| (p.pixels().to_vec(), p.width(), p.height()))
     }
+
+    /// The currently-selected button's bounding box, derived from the most
+    /// recent clean **lone-draw** — a `FLUSH` preceded by exactly one IG
+    /// `DRAW`. `None` until one has been observed (or after a `CLEAR`/`HIDE`
+    /// invalidated it).
+    ///
+    /// # Known limitation
+    ///
+    /// The top menu redraws a selection with a **two-draw** pattern (deselect
+    /// the old button, then draw the new one) — that is not a lone-draw, so the
+    /// rect is not cleanly isolable there and the previous value (or `None`) is
+    /// retained. This is a deliberate consequence of the lone-draw rule observed
+    /// on real hardware, not a defect: the submenu, which uses the clean
+    /// single-draw highlight, is where this signal is reliable.
+    #[must_use]
+    pub const fn selected_button_rect(&self) -> Option<Rect> {
+        self.selected_button_rect.get()
+    }
+
+    /// Crop the current composited plane to the selected-button rect, returning
+    /// a tight `(rgba, width, height)` single-button image, or `None` if no
+    /// plane is allocated or no clean lone-draw rect is available yet.
+    ///
+    /// The rect is clipped to the plane bounds, so a rect carried over from a
+    /// differently-sized page can never index out of range.
+    #[must_use]
+    pub fn cropped_selection(&self) -> Option<(Vec<u8>, u32, u32)> {
+        let rect = self.selected_button_rect.get()?;
+        let plane = self.plane.borrow();
+        let plane = plane.as_ref()?;
+        crop_rgba(plane.pixels(), plane.width(), plane.height(), rect)
+    }
 }
 
 #[cfg(test)]
@@ -446,9 +591,31 @@ impl OverlayCtx {
 )]
 mod tests {
     use super::{
-        DrawCommand, OverlayCtx, OverlayEvent, PaletteEntry, Plane, RleElem, RleError,
-        decode_rle_indices, palette_entry_to_rgba,
+        DrawCommand, OverlayCtx, OverlayEvent, PaletteEntry, Plane, Rect, RleElem, RleError,
+        crop_rgba, decode_rle_indices, palette_entry_to_rgba,
     };
+
+    /// A `DRAW` event with a given rect; palette/img are minimal (a single
+    /// transparent run) since these tests only exercise the rect bookkeeping,
+    /// not the compositing already covered above.
+    fn draw_event(x: u16, y: u16, w: u16, h: u16) -> OverlayEvent {
+        OverlayEvent::Draw {
+            x,
+            y,
+            w,
+            h,
+            palette: vec![
+                PaletteEntry {
+                    y: 16,
+                    cr: 128,
+                    cb: 128,
+                    t: 0
+                };
+                256
+            ],
+            img: vec![RleElem { len: 0, color: 0 }; usize::from(h.max(1))],
+        }
+    }
 
     /// A 256-entry palette where entry 0 is transparent black and the given
     /// index/entry pairs are filled in. Keeps tests terse.
@@ -936,6 +1103,324 @@ mod tests {
         assert_eq!(
             rgba[3], 255,
             "the composited opaque pixel should be visible in the snapshot"
+        );
+    }
+
+    #[test]
+    fn lone_draw_records_the_selected_button_rect() {
+        // Init -> single Draw -> Flush is the clean lone-draw: that draw's rect
+        // becomes the selected-button rect.
+        let ctx = OverlayCtx::new();
+        assert!(
+            ctx.selected_button_rect().is_none(),
+            "a fresh context has no selected-button rect"
+        );
+        ctx.apply(&OverlayEvent::Init { w: 100, h: 100 })
+            .expect("INIT should not error");
+        ctx.apply(&draw_event(10, 20, 30, 8))
+            .expect("DRAW should not error");
+        ctx.apply(&OverlayEvent::Flush)
+            .expect("FLUSH should not error");
+        assert_eq!(
+            ctx.selected_button_rect(),
+            Some(Rect {
+                x: 10,
+                y: 20,
+                w: 30,
+                h: 8
+            }),
+            "a FLUSH preceded by exactly one DRAW should record that draw's rect"
+        );
+    }
+
+    #[test]
+    fn two_draws_before_flush_is_not_isolable() {
+        // The top-menu deselect-old + select-new pattern: two draws before the
+        // flush. Not a clean lone-draw, so the rect stays None (no prior value).
+        let ctx = OverlayCtx::new();
+        ctx.apply(&OverlayEvent::Init { w: 100, h: 100 })
+            .expect("INIT should not error");
+        ctx.apply(&draw_event(10, 20, 30, 8))
+            .expect("first DRAW should not error");
+        ctx.apply(&draw_event(10, 40, 30, 8))
+            .expect("second DRAW should not error");
+        ctx.apply(&OverlayEvent::Flush)
+            .expect("FLUSH should not error");
+        assert!(
+            ctx.selected_button_rect().is_none(),
+            "a two-draw frame is not a clean lone-draw, so no rect should be recorded"
+        );
+    }
+
+    #[test]
+    fn many_draw_redraw_leaves_the_rect_unchanged() {
+        // First establish a rect via a lone-draw, then a full page redraw (many
+        // draws) must NOT overwrite it — only a clean lone-draw updates it.
+        let ctx = OverlayCtx::new();
+        ctx.apply(&OverlayEvent::Init { w: 100, h: 100 })
+            .expect("INIT should not error");
+        ctx.apply(&draw_event(1, 2, 3, 4))
+            .expect("DRAW should not error");
+        ctx.apply(&OverlayEvent::Flush)
+            .expect("FLUSH should not error");
+        let established = ctx.selected_button_rect();
+        assert!(
+            established.is_some(),
+            "a lone-draw should establish a rect first"
+        );
+
+        // Now a five-draw frame (a page redraw). Note: no CLEAR here, so the
+        // prior rect is what must be preserved.
+        for i in 0..5u16 {
+            ctx.apply(&draw_event(i, i, 5, 5))
+                .expect("redraw DRAW should not error");
+        }
+        ctx.apply(&OverlayEvent::Flush)
+            .expect("FLUSH should not error");
+        assert_eq!(
+            ctx.selected_button_rect(),
+            established,
+            "a many-draw page redraw must leave the recorded lone-draw rect unchanged"
+        );
+    }
+
+    #[test]
+    fn last_clean_lone_draw_wins_across_frames() {
+        // Multiple lone-draw frames: the most recent one is the recorded rect.
+        let ctx = OverlayCtx::new();
+        ctx.apply(&OverlayEvent::Init { w: 200, h: 200 })
+            .expect("INIT should not error");
+        ctx.apply(&draw_event(5, 5, 10, 10))
+            .expect("DRAW should not error");
+        ctx.apply(&OverlayEvent::Flush)
+            .expect("FLUSH should not error");
+        ctx.apply(&draw_event(50, 60, 20, 12))
+            .expect("DRAW should not error");
+        ctx.apply(&OverlayEvent::Flush)
+            .expect("FLUSH should not error");
+        assert_eq!(
+            ctx.selected_button_rect(),
+            Some(Rect {
+                x: 50,
+                y: 60,
+                w: 20,
+                h: 12
+            }),
+            "the last clean lone-draw should win"
+        );
+    }
+
+    #[test]
+    fn clear_invalidates_the_recorded_rect() {
+        // Establish a rect, then a CLEAR (preceding a page redraw) must reset it
+        // to None so it never points at a stale page.
+        let ctx = OverlayCtx::new();
+        ctx.apply(&OverlayEvent::Init { w: 100, h: 100 })
+            .expect("INIT should not error");
+        ctx.apply(&draw_event(10, 20, 30, 8))
+            .expect("DRAW should not error");
+        ctx.apply(&OverlayEvent::Flush)
+            .expect("FLUSH should not error");
+        assert!(
+            ctx.selected_button_rect().is_some(),
+            "a lone-draw should establish a rect first"
+        );
+        ctx.apply(&OverlayEvent::Clear)
+            .expect("CLEAR should not error");
+        assert!(
+            ctx.selected_button_rect().is_none(),
+            "a CLEAR should invalidate the recorded rect to avoid a stale page reference"
+        );
+    }
+
+    #[test]
+    fn flush_resets_draw_count_between_frames() {
+        // A single draw across two separate frames each counts as a lone-draw —
+        // the per-frame counter must reset at each FLUSH. Frame 1: one draw.
+        // Frame 2: one draw at a new rect. The second frame must still register
+        // as lone (proving the counter reset rather than accumulating to two).
+        let ctx = OverlayCtx::new();
+        ctx.apply(&OverlayEvent::Init { w: 100, h: 100 })
+            .expect("INIT should not error");
+        ctx.apply(&draw_event(1, 1, 4, 4))
+            .expect("DRAW should not error");
+        ctx.apply(&OverlayEvent::Flush)
+            .expect("FLUSH should not error");
+        ctx.apply(&draw_event(9, 9, 4, 4))
+            .expect("DRAW should not error");
+        ctx.apply(&OverlayEvent::Flush)
+            .expect("FLUSH should not error");
+        assert_eq!(
+            ctx.selected_button_rect(),
+            Some(Rect {
+                x: 9,
+                y: 9,
+                w: 4,
+                h: 4
+            }),
+            "the second single-draw frame must register as a lone-draw, proving the counter reset"
+        );
+    }
+
+    #[test]
+    fn crop_extracts_the_expected_subrect() {
+        // A 4x4 plane with a unique value per pixel (encoded into the R channel)
+        // cropped to the inner 2x2 at (1,1) should yield exactly those pixels.
+        let plane_w = 4u32;
+        let plane_h = 4u32;
+        let mut rgba = vec![0u8; (plane_w * plane_h * 4) as usize];
+        for y in 0..plane_h {
+            for x in 0..plane_w {
+                let base = ((y * plane_w + x) * 4) as usize;
+                // Encode position so we can assert the exact pixels copied.
+                let pos = u8::try_from(y * plane_w + x).expect("position fits in u8");
+                rgba[base] = pos; // R
+                rgba[base + 3] = 255; // A
+            }
+        }
+        let (out, w, h) = crop_rgba(
+            &rgba,
+            plane_w,
+            plane_h,
+            Rect {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 2,
+            },
+        )
+        .expect("an in-bounds crop should succeed");
+        assert_eq!((w, h), (2, 2), "crop dimensions should match the rect");
+        // Expected R values: positions (1,1)=5, (2,1)=6, (1,2)=9, (2,2)=10.
+        assert_eq!(out[0], 5, "top-left of crop should be plane position 5");
+        assert_eq!(out[4], 6, "top-right of crop should be plane position 6");
+        assert_eq!(out[8], 9, "bottom-left of crop should be plane position 9");
+        assert_eq!(
+            out[12], 10,
+            "bottom-right of crop should be plane position 10"
+        );
+    }
+
+    #[test]
+    fn crop_clips_a_rect_running_off_the_edge() {
+        // A 3x3 plane; a rect at (2,2) with size 4x4 overruns the right/bottom
+        // edges. It must clip to the in-bounds 1x1 corner, not panic.
+        let plane_w = 3u32;
+        let plane_h = 3u32;
+        let rgba = vec![200u8; (plane_w * plane_h * 4) as usize];
+        let (out, w, h) = crop_rgba(
+            &rgba,
+            plane_w,
+            plane_h,
+            Rect {
+                x: 2,
+                y: 2,
+                w: 4,
+                h: 4,
+            },
+        )
+        .expect("an overrunning crop should clip rather than fail");
+        assert_eq!(
+            (w, h),
+            (1, 1),
+            "an overrunning rect should clip to the in-bounds portion"
+        );
+        assert_eq!(out.len(), 4, "a 1x1 crop should be exactly 4 RGBA bytes");
+    }
+
+    #[test]
+    fn crop_zero_area_rect_yields_none() {
+        let rgba = vec![0u8; 4 * 4 * 4];
+        let none = crop_rgba(
+            &rgba,
+            4,
+            4,
+            Rect {
+                x: 1,
+                y: 1,
+                w: 0,
+                h: 0,
+            },
+        );
+        assert!(none.is_none(), "a zero-area rect should yield None");
+    }
+
+    #[test]
+    fn crop_fully_out_of_bounds_rect_yields_none() {
+        let rgba = vec![0u8; 4 * 4 * 4];
+        let none = crop_rgba(
+            &rgba,
+            4,
+            4,
+            Rect {
+                x: 10,
+                y: 10,
+                w: 2,
+                h: 2,
+            },
+        );
+        assert!(
+            none.is_none(),
+            "a rect entirely outside the plane should yield None"
+        );
+    }
+
+    #[test]
+    fn cropped_selection_carves_the_lone_draw_region() {
+        // End-to-end on the context: init a plane, paint an opaque button via a
+        // real DRAW, flush (lone-draw), and confirm cropped_selection returns a
+        // tight buffer matching the draw's rect.
+        let ctx = OverlayCtx::new();
+        ctx.apply(&OverlayEvent::Init { w: 8, h: 8 })
+            .expect("INIT should not error");
+        let mut pal = vec![
+            PaletteEntry {
+                y: 16,
+                cr: 128,
+                cb: 128,
+                t: 0
+            };
+            256
+        ];
+        pal[1] = PaletteEntry {
+            y: 235,
+            cr: 128,
+            cb: 128,
+            t: 255,
+        };
+        // A 2x2 opaque region at (3,3).
+        ctx.apply(&OverlayEvent::Draw {
+            x: 3,
+            y: 3,
+            w: 2,
+            h: 2,
+            palette: pal,
+            img: vec![
+                RleElem { len: 2, color: 1 },
+                RleElem { len: 0, color: 0 },
+                RleElem { len: 2, color: 1 },
+                RleElem { len: 0, color: 0 },
+            ],
+        })
+        .expect("DRAW should not error");
+        ctx.apply(&OverlayEvent::Flush)
+            .expect("FLUSH should not error");
+        let (out, w, h) = ctx
+            .cropped_selection()
+            .expect("a lone-draw should make a crop available");
+        assert_eq!(
+            (w, h),
+            (2, 2),
+            "the crop should be the size of the lone-draw rect"
+        );
+        assert_eq!(
+            out.len(),
+            2 * 2 * 4,
+            "the crop buffer should be width*height*4 bytes"
+        );
+        assert_eq!(
+            out[3], 255,
+            "the cropped region should contain the opaque drawn pixel"
         );
     }
 }
