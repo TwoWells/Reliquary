@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use reliquary_bluray::Disc;
+use tracing_subscriber::EnvFilter;
 
 use crate::app::NavApp;
 
@@ -31,7 +32,31 @@ fn resolve_disc_path() -> Option<PathBuf> {
     std::env::var_os("RELIQUARY_TEST_DISC").map(PathBuf::from)
 }
 
+/// Install the process-wide tracing subscriber so the binary's diagnostics are
+/// visible on stderr.
+///
+/// Verbosity is controlled by `RUST_LOG`; when it is unset we default to `info`
+/// for our own crates and quiet the chatty GUI/windowing dependencies to `warn`
+/// so a stray `info` from them does not bury the app's own messages. The fmt
+/// layer writes to stderr (this is the `tracing` machinery, not the
+/// `eprintln!` macro).
+fn init_tracing() {
+    // `RUST_LOG` wins when set; otherwise default to `info` for our own crates
+    // and quiet the chatty GUI/windowing dependencies to `warn`. `EnvFilter`
+    // parses this directive string and ignores any individual directive it
+    // cannot understand, so it never fails here.
+    const DEFAULT_FILTER: &str = "info,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,winit=warn,eframe=warn,egui_glow=warn,calloop=warn,sctk=warn";
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 fn main() -> ExitCode {
+    init_tracing();
+
     let Some(path) = resolve_disc_path() else {
         tracing::error!(
             "no disc path given; pass one as the first argument or set RELIQUARY_TEST_DISC"
