@@ -2049,6 +2049,7 @@ dependencies = [
  "eframe",
  "egui",
  "reliquary-bluray",
+ "reliquary-makemkv",
  "tracing",
  "tracing-subscriber",
 ]

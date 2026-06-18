@@ -19,6 +19,9 @@
 
 use eframe::egui;
 use reliquary_bluray::{Disc, Key, PumpEvent, Rect};
+use reliquary_makemkv::TitleIndex;
+
+use crate::join::{ScanState, resolve};
 
 /// How many `bd_read_ext` pumps to run per UI frame. Enough to drain a burst of
 /// overlay commands after a key press without starving the repaint; the loop
@@ -30,6 +33,13 @@ const PUMP_ITERATIONS_PER_FRAME: u32 = 64;
 pub struct NavApp {
     /// The libbluray disc handle, driven entirely on this (UI) thread.
     disc: Disc,
+    /// The background makemkvcon title scan; the join's makemkvcon half. Polled
+    /// each frame until the index arrives (or the scan is reported
+    /// unavailable).
+    scan: ScanState,
+    /// The latest join outcome, surfaced as a short status line above the menu.
+    /// `None` until a content button has been activated.
+    join_status: Option<String>,
     /// The uploaded overlay texture, re-uploaded only when the frame generation
     /// changes. `None` until the first menu overlay has been composited.
     texture: Option<egui::TextureHandle>,
@@ -45,16 +55,67 @@ pub struct NavApp {
 }
 
 impl NavApp {
-    /// Build the app around an already-opened, already-`play()`ed [`Disc`].
+    /// Build the app around an already-opened, already-`play()`ed [`Disc`] and
+    /// the background makemkvcon title [`ScanState`].
     #[must_use]
-    pub const fn new(disc: Disc) -> Self {
+    pub const fn new(disc: Disc, scan: ScanState) -> Self {
         Self {
             disc,
+            scan,
+            join_status: None,
             texture: None,
             last_generation: 0,
             seen_frame: false,
             frame_size: None,
         }
+    }
+
+    /// Handle an activated playlist: resolve it to a makemkvcon title and update
+    /// the surfaced join status line.
+    ///
+    /// libbluray resolves the playlist to its clip ids; the makemkvcon index
+    /// (once the background scan has produced one) maps a clip to the output
+    /// `.mkv`. If the scan is still running the status reflects that; if no
+    /// title matches (or the join is unavailable) the status says so.
+    fn handle_playlist_activation(&mut self, mpls: u32) {
+        let clip_ids = self.disc.playlist_clips(mpls);
+        tracing::info!(mpls, ?clip_ids, "playlist activated");
+
+        let status = if self.scan.is_scanning() {
+            "scanning titles…".to_string()
+        } else if let Some(index) = self.scan.index() {
+            Self::resolved_status(mpls, &clip_ids, index)
+        } else {
+            "join unavailable (no makemkv scan)".to_string()
+        };
+        self.join_status = Some(status);
+    }
+
+    /// Run the pure join against a ready index and render the surfaced status
+    /// line, logging the outcome. `Some(title)` becomes
+    /// `Selected → <mkv> (<duration>)`; no match becomes `no makemkv match`.
+    fn resolved_status(mpls: u32, clip_ids: &[String], index: &TitleIndex) -> String {
+        resolve(clip_ids, index).map_or_else(
+            || {
+                tracing::info!(
+                    mpls,
+                    ?clip_ids,
+                    "no makemkv title matched the activated clip"
+                );
+                "no makemkv match".to_string()
+            },
+            |title| {
+                let output = title.output_file_name.as_deref().unwrap_or("(unnamed mkv)");
+                let duration = title.duration.as_deref().unwrap_or("?");
+                tracing::info!(
+                    mpls,
+                    output,
+                    duration,
+                    "join resolved playlist to output mkv"
+                );
+                format!("Selected → {output} ({duration})")
+            },
+        )
     }
 
     /// Translate egui key events into disc navigation keys and forward them.
@@ -163,9 +224,14 @@ impl eframe::App for NavApp {
         // 1. Forward any key presses to the disc.
         self.handle_input(ctx);
 
-        // 2. Advance navigation / fire overlay callbacks a bounded amount.
+        // 2. Poll the background makemkvcon scan; store the index once ready.
+        self.scan.poll();
+
+        // 3. Advance navigation / fire overlay callbacks a bounded amount. A
+        // playlist activation is the join trigger.
         for event in self.disc.pump(PUMP_ITERATIONS_PER_FRAME) {
             match event {
+                PumpEvent::Playlist(mpls) => self.handle_playlist_activation(mpls),
                 PumpEvent::Error => {
                     tracing::error!("libbluray reported a fatal playback error");
                 }
@@ -173,10 +239,24 @@ impl eframe::App for NavApp {
             }
         }
 
-        // 3. Upload the composited menu if it changed.
+        // 4. Upload the composited menu if it changed.
         self.refresh_texture(ctx);
 
-        // 4. Draw the fullscreen menu image (or a placeholder while it loads).
+        // 5. Surface the join status (the activate → output-mkv mapping) as a
+        // thin top bar; absent until a content button has been activated.
+        if let Some(status) = &self.join_status {
+            egui::TopBottomPanel::top("join-status")
+                .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(20, 20, 20)))
+                .show(ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new(status)
+                            .color(egui::Color32::from_rgb(0, 200, 255))
+                            .strong(),
+                    );
+                });
+        }
+
+        // 6. Draw the fullscreen menu image (or a placeholder while it loads).
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
@@ -203,7 +283,7 @@ impl eframe::App for NavApp {
                 }
             });
 
-        // 5. Keep the loop live: menus animate and we must keep pumping even
+        // 7. Keep the loop live: menus animate and we must keep pumping even
         // without user input, so request another repaint unconditionally.
         ctx.request_repaint();
     }

@@ -311,6 +311,24 @@ impl Disc {
     pub fn cropped_selection(&self) -> Option<(Vec<u8>, u32, u32)> {
         self.overlay.cropped_selection()
     }
+
+    /// Resolve an activated playlist (mpls number, as surfaced by
+    /// [`PumpEvent::Playlist`]) to the clip ids it plays — the `.m2ts` base
+    /// names *without* extension, e.g. `["00292"]`.
+    ///
+    /// This is the libbluray half of the navigate join: a content button
+    /// activates a playlist, and this maps that playlist to its clip(s), whose
+    /// names the caller matches against the makemkvcon title index to recover
+    /// the output `.mkv`.
+    ///
+    /// Returns an empty `Vec` if libbluray does not know the playlist (its
+    /// `bd_get_playlist_info` returned NULL). The clip ids are owned `String`s;
+    /// no libbluray-owned memory escapes this call (the underlying
+    /// `BLURAY_TITLE_INFO` is freed before returning).
+    #[must_use]
+    pub fn playlist_clips(&self, playlist: u32) -> Vec<String> {
+        ffi::playlist_clips(self.handle.as_ptr(), playlist)
+    }
 }
 
 impl Drop for Disc {

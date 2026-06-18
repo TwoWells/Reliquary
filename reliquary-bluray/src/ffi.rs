@@ -134,6 +134,93 @@ pub struct BdOverlay {
     pub img: *const BdPgRleElem,
 }
 
+/// Mirror of `BLURAY_CLIP_INFO` (`bluray.h`): one clip of a playlist.
+///
+/// We dereference only `clip_id` (the `.m2ts` base name) from this struct; the
+/// rest of the fields exist purely to make the layout — and therefore the array
+/// stride for `clips[i]` — byte-exact. The six `BLURAY_STREAM_INFO *` fields are
+/// pointers we never follow, mirrored as opaque `*const c_void` so we do not
+/// have to model `BLURAY_STREAM_INFO` itself. The trailing `clip_id[6]` lands at
+/// offset 88 on LP64 (guarded by the ABI tests below); a wrong overall size here
+/// would silently read garbage `clip_id` for any clip past the first, so its
+/// `size_of` is the sharpest ABI assertion in this module.
+#[repr(C)]
+pub struct BluRayClipInfo {
+    /// Number of mpeg-ts packets.
+    pub pkt_count: u32,
+    /// Clip still mode (`bd_still_mode_e`).
+    pub still_mode: u8,
+    /// Still time (seconds) if `still_mode == BD_STILL_TIME`.
+    pub still_time: u16,
+    /// Number of video streams.
+    pub video_stream_count: u8,
+    /// Number of audio streams.
+    pub audio_stream_count: u8,
+    /// Number of PG (Presentation Graphics) streams.
+    pub pg_stream_count: u8,
+    /// Number of IG (Interactive Graphics) streams.
+    pub ig_stream_count: u8,
+    /// Number of secondary audio streams.
+    pub sec_audio_stream_count: u8,
+    /// Number of secondary video streams.
+    pub sec_video_stream_count: u8,
+    /// `BLURAY_STREAM_INFO *video_streams` — opaque; never followed.
+    pub video_streams: *const c_void,
+    /// `BLURAY_STREAM_INFO *audio_streams` — opaque; never followed.
+    pub audio_streams: *const c_void,
+    /// `BLURAY_STREAM_INFO *pg_streams` — opaque; never followed.
+    pub pg_streams: *const c_void,
+    /// `BLURAY_STREAM_INFO *ig_streams` — opaque; never followed.
+    pub ig_streams: *const c_void,
+    /// `BLURAY_STREAM_INFO *sec_audio_streams` — opaque; never followed.
+    pub sec_audio_streams: *const c_void,
+    /// `BLURAY_STREAM_INFO *sec_video_streams` — opaque; never followed.
+    pub sec_video_streams: *const c_void,
+    /// Start media time, 90 kHz ("playlist time").
+    pub start_time: u64,
+    /// Start timestamp, 90 kHz.
+    pub in_time: u64,
+    /// End timestamp, 90 kHz.
+    pub out_time: u64,
+    /// Clip identifier (`.m2ts` file name), NUL-padded ASCII. The one field we
+    /// read.
+    pub clip_id: [u8; 6],
+}
+
+/// Mirror of `BLURAY_TITLE_INFO` (`bluray.h`): a playlist's clip list and
+/// counts.
+///
+/// We dereference `clip_count` and the `clips` pointer (then stride into the
+/// `BluRayClipInfo` array). The `chapters`/`marks` pointers are mirrored as
+/// opaque `*const c_void` — we never follow them — so the layout stays exact
+/// without modelling the chapter/mark structs. `duration` (90 kHz) is read for
+/// the surfaced selection line.
+#[repr(C)]
+pub struct BluRayTitleInfo {
+    /// Playlist index number (filled only by `bd_get_title_info`).
+    pub idx: u32,
+    /// Playlist ID (mpls file name).
+    pub playlist: u32,
+    /// Playlist duration, 90 kHz.
+    pub duration: u64,
+    /// Number of clips — the bound for iterating `clips`.
+    pub clip_count: u32,
+    /// Number of angles.
+    pub angle_count: u8,
+    /// Number of chapters.
+    pub chapter_count: u32,
+    /// Number of playmarks.
+    pub mark_count: u32,
+    /// `BLURAY_CLIP_INFO *clips` — the clip array we stride into.
+    pub clips: *const BluRayClipInfo,
+    /// `BLURAY_TITLE_CHAPTER *chapters` — opaque; never followed.
+    pub chapters: *const c_void,
+    /// `BLURAY_TITLE_MARK *marks` — opaque; never followed.
+    pub marks: *const c_void,
+    /// MVC base view (0 = left, 1 = right).
+    pub mvc_base_view_r_flag: u8,
+}
+
 // --- Constants (transcribed from keys.h / overlay.h / bluray.h) ---
 
 /// `BD_OVERLAY_IG` — the Interactive Graphics plane (HDMV menus).
@@ -236,6 +323,24 @@ unsafe extern "C" {
     /// Register the compressed-YUV (IG/PG) overlay handler. `handle` is passed
     /// back to `func` on every event. Pass a NULL `func` to unregister.
     fn bd_register_overlay_proc(bd: *mut Bluray, handle: *mut c_void, func: OverlayProc);
+
+    /// `BLURAY_TITLE_INFO* bd_get_playlist_info(BLURAY *bd, uint32_t playlist, unsigned angle);`
+    ///
+    /// Resolve a playlist (mpls) to its clip list. Returns a freshly allocated,
+    /// owned `BLURAY_TITLE_INFO*` whose `clips[i].clip_id` is the `.m2ts` base
+    /// name — the join's match key — or `NULL` on error. The caller must release
+    /// a non-null result exactly once with [`bd_free_title_info`].
+    fn bd_get_playlist_info(
+        bd: *mut Bluray,
+        playlist: u32,
+        angle: core::ffi::c_uint,
+    ) -> *mut BluRayTitleInfo;
+
+    /// `void bd_free_title_info(BLURAY_TITLE_INFO *title_info);`
+    ///
+    /// Free a `BLURAY_TITLE_INFO*` returned by [`bd_get_playlist_info`] (or
+    /// `bd_get_title_info`). Safe to call exactly once per non-null result.
+    fn bd_free_title_info(title_info: *mut BluRayTitleInfo);
 }
 
 // Thin safe-to-call wrappers. Every `unsafe` block in the crate lives here,
@@ -353,6 +458,65 @@ pub fn unregister_overlay(bd: *mut Bluray) {
     // SAFETY: the caller guarantees `bd` is a live, non-null `BLURAY*`. A NULL
     // func unregisters the handler; the `handle` is then irrelevant.
     unsafe { bd_register_overlay_proc(bd, core::ptr::null_mut(), None) };
+}
+
+/// Resolve a playlist (mpls) to the list of its clip ids (the `.m2ts` base
+/// names, without extension), e.g. `["00292"]`.
+///
+/// Calls `bd_get_playlist_info`, reads `clip_count` and each `clips[i].clip_id`
+/// into an owned `Vec<String>`, then frees the `BLURAY_TITLE_INFO` — no raw
+/// pointer escapes the call. Returns an empty `Vec` if `bd_get_playlist_info`
+/// returns NULL (unknown playlist or error).
+///
+/// `bd` must be a live, non-null handle from [`open`].
+pub fn playlist_clips(bd: *mut Bluray, playlist: u32) -> Vec<String> {
+    // SAFETY: the caller guarantees `bd` is a live, non-null `BLURAY*`. Angle 0
+    // is always valid. `bd_get_playlist_info` returns either NULL or a freshly
+    // allocated, owned `BLURAY_TITLE_INFO*` we are responsible for freeing.
+    let info = unsafe { bd_get_playlist_info(bd, playlist, 0) };
+    let Some(info) = core::ptr::NonNull::new(info) else {
+        return Vec::new();
+    };
+
+    // SAFETY: `info` is a non-null, freshly allocated `BLURAY_TITLE_INFO` owned
+    // by us until `bd_free_title_info`. We only read its scalar fields and the
+    // `clips` pointer; the struct layout is guarded by the ABI tests below.
+    let title = unsafe { info.as_ref() };
+    let clip_count = title.clip_count as usize;
+
+    let mut clips = Vec::with_capacity(clip_count);
+    if !title.clips.is_null() {
+        for i in 0..clip_count {
+            // SAFETY: `clips` points to `clip_count` valid `BluRayClipInfo`
+            // elements (libbluray's invariant for a non-null clip array); `i`
+            // stays in `0..clip_count`. The element's stride is `BluRayClipInfo`'s
+            // size, asserted exact by the ABI tests, so `add(i)` addresses the
+            // i-th clip and not garbage.
+            let clip = unsafe { &*title.clips.add(i) };
+            clips.push(clip_id_to_string(clip.clip_id));
+        }
+    }
+
+    // SAFETY: `info` is the non-null result of `bd_get_playlist_info`, not yet
+    // freed and not used after this call; `bd_free_title_info` releases it
+    // exactly once. All data we needed is already copied into owned `String`s.
+    unsafe { bd_free_title_info(info.as_ptr()) };
+
+    clips
+}
+
+/// Decode a libbluray `clip_id` (`[u8; 6]`, NUL-padded ASCII like `b"00292\0"`)
+/// into an owned `String` with no extension, e.g. `"00292"`.
+///
+/// Stops at the first NUL; bytes are interpreted as Latin-1 so a (never-expected)
+/// non-ASCII byte cannot panic or be lost. clip ids are always ASCII digits in
+/// practice.
+fn clip_id_to_string(clip_id: [u8; 6]) -> String {
+    clip_id
+        .into_iter()
+        .take_while(|&b| b != 0)
+        .map(char::from)
+        .collect()
 }
 
 /// The `extern "C"` overlay callback libbluray invokes for each IG/PG command.
@@ -522,7 +686,9 @@ mod abi_tests {
     //! `BD_OVERLAY`. Offsets are the standard System V layout for the field
     //! sequence transcribed from `overlay.h` / `bluray.h`.
 
-    use super::{BdEvent, BdOverlay, BdPgPaletteEntry, BdPgRleElem};
+    use super::{
+        BdEvent, BdOverlay, BdPgPaletteEntry, BdPgRleElem, BluRayClipInfo, BluRayTitleInfo,
+    };
     use core::mem::{align_of, offset_of, size_of};
 
     #[test]
@@ -667,6 +833,125 @@ mod abi_tests {
         assert_eq!(
             copied[3].len, 0,
             "the last copied element should be the row-1 terminator"
+        );
+    }
+
+    #[test]
+    fn bd_clip_info_layout() {
+        // BLURAY_CLIP_INFO (LP64):
+        //   uint32_t pkt_count;                 // 0
+        //   uint8_t  still_mode;                // 4
+        //   (1 byte pad)                        // 5
+        //   uint16_t still_time;                // 6
+        //   uint8_t  {video,audio,pg,ig,sec_audio,sec_video}_stream_count; // 8..14
+        //   (2 bytes pad to 8-align pointers)   // 14
+        //   BLURAY_STREAM_INFO *x6;             // 16,24,32,40,48,56
+        //   uint64_t start_time, in_time, out_time; // 64,72,80
+        //   char     clip_id[6];                // 88
+        //   (2 bytes pad to 8-align struct)     // 94
+        // total: 96 bytes, 8-aligned. The size is load-bearing: it is the
+        // array stride for clips[i], so a wrong size reads garbage clip_id.
+        assert_eq!(
+            size_of::<BluRayClipInfo>(),
+            96,
+            "BLURAY_CLIP_INFO should be 96 bytes on LP64 (the clips[i] array stride)"
+        );
+        assert_eq!(
+            align_of::<BluRayClipInfo>(),
+            8,
+            "BLURAY_CLIP_INFO should be 8-aligned"
+        );
+        assert_eq!(
+            offset_of!(BluRayClipInfo, pkt_count),
+            0,
+            "pkt_count should be at offset 0"
+        );
+        assert_eq!(
+            offset_of!(BluRayClipInfo, still_time),
+            6,
+            "still_time should be at offset 6"
+        );
+        assert_eq!(
+            offset_of!(BluRayClipInfo, video_streams),
+            16,
+            "the first stream pointer should be at offset 16"
+        );
+        assert_eq!(
+            offset_of!(BluRayClipInfo, start_time),
+            64,
+            "start_time should be at offset 64"
+        );
+        assert_eq!(
+            offset_of!(BluRayClipInfo, clip_id),
+            88,
+            "clip_id should be at offset 88 — the field the join reads"
+        );
+    }
+
+    #[test]
+    fn bd_title_info_layout() {
+        // BLURAY_TITLE_INFO (LP64):
+        //   uint32_t idx;            // 0
+        //   uint32_t playlist;       // 4
+        //   uint64_t duration;       // 8
+        //   uint32_t clip_count;     // 16
+        //   uint8_t  angle_count;    // 20
+        //   (3 bytes pad)            // 21
+        //   uint32_t chapter_count;  // 24
+        //   uint32_t mark_count;     // 28
+        //   BLURAY_CLIP_INFO *clips; // 32
+        //   BLURAY_TITLE_CHAPTER *chapters; // 40
+        //   BLURAY_TITLE_MARK *marks;       // 48
+        //   uint8_t  mvc_base_view_r_flag;  // 56
+        //   (7 bytes pad)            // 57
+        // total: 64 bytes, 8-aligned.
+        assert_eq!(
+            size_of::<BluRayTitleInfo>(),
+            64,
+            "BLURAY_TITLE_INFO should be 64 bytes on LP64"
+        );
+        assert_eq!(
+            align_of::<BluRayTitleInfo>(),
+            8,
+            "BLURAY_TITLE_INFO should be 8-aligned"
+        );
+        assert_eq!(
+            offset_of!(BluRayTitleInfo, duration),
+            8,
+            "duration should be at offset 8"
+        );
+        assert_eq!(
+            offset_of!(BluRayTitleInfo, clip_count),
+            16,
+            "clip_count should be at offset 16 — the iteration bound"
+        );
+        assert_eq!(
+            offset_of!(BluRayTitleInfo, clips),
+            32,
+            "clips pointer should be at offset 32 — the array we stride into"
+        );
+    }
+
+    #[test]
+    fn clip_id_to_string_stops_at_nul() {
+        // A typical 5-digit clip id NUL-padded to 6 bytes decodes without the
+        // padding or any extension.
+        let id = *b"00292\0";
+        assert_eq!(
+            super::clip_id_to_string(id),
+            "00292",
+            "a NUL-padded clip id should decode to its digits with no extension"
+        );
+    }
+
+    #[test]
+    fn clip_id_to_string_full_six_chars() {
+        // A clip id that fills all six bytes (no NUL) is decoded in full.
+        let id = *b"123456";
+        assert_eq!(
+            super::clip_id_to_string(id),
+            "123456",
+            "a full six-byte clip id should decode all six characters"
         );
     }
 }

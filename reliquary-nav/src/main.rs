@@ -13,6 +13,7 @@
 //! supplied entirely at runtime.
 
 mod app;
+mod join;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,6 +22,7 @@ use reliquary_bluray::Disc;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::NavApp;
+use crate::join::ScanState;
 
 /// Resolve the disc path from the first CLI argument, falling back to the
 /// `RELIQUARY_TEST_DISC` environment variable. Returns `None` if neither is
@@ -84,6 +86,11 @@ fn main() -> ExitCode {
     // Jump straight to the top menu so the user lands on it immediately.
     disc.jump_to_menu();
 
+    // Kick off the makemkvcon title scan on a background thread; the worker
+    // touches only the source MRL (never the !Send disc, which stays here on
+    // the UI thread). The join becomes available once the index arrives.
+    let scan = ScanState::start(&path);
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_fullscreen(true)
@@ -94,7 +101,7 @@ fn main() -> ExitCode {
     match eframe::run_native(
         "Reliquary Nav",
         native_options,
-        Box::new(|_cc| Ok(Box::new(NavApp::new(disc)))),
+        Box::new(|_cc| Ok(Box::new(NavApp::new(disc, scan)))),
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
