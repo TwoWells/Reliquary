@@ -1,0 +1,16 @@
+[package]
+name = "reliquary-makemkv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "makemkvcon robot-mode title index for Reliquary — drives the external tool and parses its machine-readable output into a source-filename-keyed index"
+keywords = ["media", "archive", "bluray", "makemkv"]
+categories = ["multimedia", "parser-implementations"]
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -3,6 +3,7 @@ members = [
     "reliquary",
     "reliquary-bluray",
     "reliquary-cli",
+    "reliquary-makemkv",
     "reliquary-nav",
     "reliquary-tui",
     "reliquary-web",

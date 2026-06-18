@@ -42,6 +42,7 @@ exceptions = [
     { name = "reliquary", allow = ["AGPL-3.0-or-later"] },
     { name = "reliquary-bluray", allow = ["AGPL-3.0-or-later"] },
     { name = "reliquary-cli", allow = ["AGPL-3.0-or-later"] },
+    { name = "reliquary-makemkv", allow = ["AGPL-3.0-or-later"] },
     { name = "reliquary-nav", allow = ["AGPL-3.0-or-later"] },
     { name = "reliquary-tui", allow = ["AGPL-3.0-or-later"] },
     { name = "reliquary-web", allow = ["AGPL-3.0-or-later"] },

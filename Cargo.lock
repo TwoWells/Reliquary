@@ -2035,6 +2035,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "reliquary-makemkv"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "reliquary-nav"
 version = "0.1.0"
 dependencies = [
