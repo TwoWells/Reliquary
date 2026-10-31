@@ -7,7 +7,7 @@
 #   make release-major   # 0.1.0 -> 1.0.0
 #   make release V=0.2.0 # explicit version
 
-.PHONY: build-release check deny mutants run setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
+.PHONY: build-release check deny mutants update run setup setup-hooks setup-tools test release release-patch release-minor release-major publish tag-current
 
 # Get current version from workspace Cargo.toml
 CURRENT_VERSION := $(shell grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -77,7 +77,6 @@ check: setup-tools
 	 if [ -n "$$LATEST" ] && [ "$$PINNED" != "$$LATEST" ]; then \
 	   printf '\033[33mNote: rust-toolchain.toml pins %s, latest stable is %s\033[0m\n' "$$PINNED" "$$LATEST"; \
 	 fi
-	@cargo update --quiet
 	@cargo fmt -- -l | sed 's/^/fmt: formatted /'
 	@tries=0; while true; do \
 	   cargo deny --log-level error check; rc=$$?; \
@@ -91,7 +90,7 @@ check: setup-tools
 	 done
 	@cargo machete
 	@cargo clippy --workspace --tests --quiet -- -D warnings
-	@cargo nextest run --workspace $(NEXTEST_IGNORED) --no-fail-fast --no-tests=pass --status-level fail --final-status-level fail --cargo-quiet --show-progress only
+	@cargo nextest run --locked --workspace $(NEXTEST_IGNORED) --no-fail-fast --no-tests=pass --status-level fail --final-status-level fail --cargo-quiet --show-progress only
 
 deny:
 	@cargo deny --log-level error check
@@ -107,6 +106,15 @@ nav:
 # --- Test ---
 
 # Run mutation tests (scoped to parser-heavy library crate)
+# Take the latest semver-compatible dependencies, then gate them. This is the
+# only routine place the lockfile moves: `check` now resolves `--locked`, so a
+# run cannot rewrite Cargo.lock underneath you and the gate does not depend on
+# what crates.io published today. (`release` bumps deps too, but guarded -- it
+# rolls Cargo.toml/Cargo.lock back if the checks fail.)
+update:
+	@cargo update
+	@$(MAKE) check
+
 mutants:
 	@if [ "$(MUTANTS_MEMORY_MAX)" != unlimited ] && command -v systemd-run >/dev/null 2>&1; then \
 	   systemd-run --user --scope --quiet \
@@ -122,7 +130,7 @@ mutants:
 # Run tests. Pass T= to filter, N= to repeat, I=1 to include ignored.
 CLEAN_T = $(subst \,,$(subst !,,$(T)))
 test:
-	@cargo nextest run --workspace --status-level fail --final-status-level slow --cargo-quiet $(if $(I),--run-ignored all,) $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
+	@cargo nextest run --locked --workspace --status-level fail --final-status-level slow --cargo-quiet $(if $(I),--run-ignored all,) $(if $(N),--stress-count $(N),) $(if $(T),$(if $(findstring !,$(T)),-E 'not test($(CLEAN_T))',-E 'test($(T))'),)
 
 # --- Release ---
 
