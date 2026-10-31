@@ -3,7 +3,34 @@
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # Quadratic run time in quick-xml's duplicate-attribute check. Reached only
+    # through wayland-scanner, which is a *proc-macro*: quick-xml runs at build
+    # time over the Wayland protocol XML that ships inside the wayland crates --
+    # fixed, local, trusted input. Exploiting this would mean feeding malicious
+    # protocol XML into the build, which requires already controlling the build.
+    #
+    # Not fixable here: the fix is quick-xml >= 0.41, and wayland-scanner 0.31
+    # pins `quick-xml ^0.39`, so `cargo update -p quick-xml` resolves nothing.
+    # It has to arrive as wayland-rs -> winit -> eframe releases.
+    #
+    # Remove both entries once `cargo tree -i quick-xml` shows >= 0.41.
+    { id = "RUSTSEC-2026-0194", reason = "build-time proc-macro parsing trusted protocol XML; upstream pin blocks the fix" },
+    # Unbounded namespace-declaration allocation in the same quick-xml, reached
+    # by the same build-time path, so the same reasoning and the same blocker.
+    { id = "RUSTSEC-2026-0195", reason = "build-time proc-macro parsing trusted protocol XML; upstream pin blocks the fix" },
+
+    # ttf-parser is unmaintained -- an absent upstream, not a known defect, and
+    # the advisory itself says no safe upgrade exists. It arrives under egui's
+    # text rasterisation (ttf-parser <- owned_ttf_parser <- ab_glyph <- epaint
+    # <- egui), so it only ever parses the fonts this app hands it, and we hand
+    # it none: there is no FontDefinitions/add_font call anywhere here, so egui
+    # rasterises its own bundled faces. Nothing user-supplied reaches it.
+    #
+    # Drop this entry when egui moves off ttf-parser, or if a maintained fork
+    # is adopted upstream.
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained, not a vulnerability; parses only egui's bundled fonts; no upgrade exists" },
+]
 
 [licenses]
 version = 2
